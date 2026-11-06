@@ -1520,6 +1520,7 @@ impl Session {
         }
         // Pixel commands follow the Channels panel target unless the caller names one.
         let run_params = self.admit(id, spec, &params)?;
+        let local_context = self.begin_local_replay(id, &run_params)?;
         // This UI-only disclosure preference applies to both `execute` and `start`:
         // desktop UI normally calls `start`, even for synchronous Layer Style commands.
         // The layer the command will change, named as the command accepts it (id or name), else the
@@ -1558,7 +1559,7 @@ impl Session {
         // error instead of taking the app down. `edit` only commits a document after its closure
         // returns, so the documents are unchanged.
         self.live_commit = live_commit.filter(|live| live.cmd == id);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &run_params)))
+        let mut r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &run_params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("`{id}` failed with an internal error (logged); the document is unchanged"))));
         self.live_commit = None;
         if self.actions.recording.is_none() {
@@ -1573,6 +1574,9 @@ impl Session {
             self.hint_before = None;
         }
         let pending = self.jobs.pending.take();
+        if let Err(error) = self.end_local_replay(local_context, r.is_ok()) {
+            r = Err(error);
+        }
         let out = match (r, pending) {
             (Err(e), Some(job)) => {
                 job.ctx.cancel();
@@ -1785,10 +1789,22 @@ impl Session {
         // contract as synchronous dispatch without truncating work done while the worker ran.
         let nested_from = self.journal.len();
         let recording = if *journal && crate::actions_cmds::replayable(command) { self.actions.recording.take() } else { None };
-        let r = match apply {
-            Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, payload)))
-                .unwrap_or_else(|_| Err(EngineError::Other(format!("`{label}` failed with an internal error (logged); the document is unchanged")))),
-            None => Err(EngineError::Other("internal error: job applied twice".into())),
+        let r = match self.begin_local_replay(command, params) {
+            Ok(context) => {
+                let result = if let Some(reason) = self.room_edit_refusal(command) {
+                    Err(EngineError::Other(reason))
+                } else {
+                    match apply {
+                        Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, payload))).unwrap_or_else(|_| {
+                            Err(EngineError::Other(format!("`{label}` failed with an internal error (logged); the document is unchanged")))
+                        }),
+                        None => Err(EngineError::Other("internal error: job applied twice".into())),
+                    }
+                };
+                let capture = self.end_local_replay(context, result.is_ok());
+                result.and_then(|value| capture.map(|()| value))
+            }
+            Err(error) => Err(error),
         };
         if self.actions.recording.is_none() {
             self.actions.recording = recording;

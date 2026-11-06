@@ -24,6 +24,47 @@ use resvg::usvg;
 
 use crate::{ImportResult, IoError};
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static SVG_STACK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// usvg/resvg recurse through several native frames per XML element, including while
+/// destroying their trees. Keep each complete native operation on a bounded 8 MiB stack:
+/// Windows callers may have only 1 MiB even though the accepted XML depth is still 512.
+/// Embedded images reuse this boundary rather than starting a thread at every level.
+/// Only the converted document or pixels leave it; parser trees are dropped inside it.
+fn with_svg_stack<T: Send>(work: impl FnOnce() -> Result<T, IoError> + Send) -> Result<T, IoError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        work()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if SVG_STACK_ACTIVE.get() {
+            return work();
+        }
+        std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("komaphone-svg".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    struct Reset;
+                    impl Drop for Reset {
+                        fn drop(&mut self) {
+                            SVG_STACK_ACTIVE.set(false);
+                        }
+                    }
+                    SVG_STACK_ACTIVE.set(true);
+                    let _reset = Reset;
+                    work()
+                })
+                .map_err(|error| IoError::Svg(format!("could not start the SVG worker: {error}")))?;
+            worker.join().map_err(|_| IoError::Svg("the SVG worker failed while parsing or rendering the drawing".into()))?
+        })
+    }
+}
+
 /// Largest canvas side an SVG opens at; a larger drawing is scaled down to fit.
 pub const MAX_SIDE: u32 = 16_384;
 /// A rasterised fallback layer or a smart-object render never exceeds this many pixels.
@@ -893,6 +934,10 @@ pub fn import_svg_preview_with_work(name: &str, bytes: &[u8], max_work: u64) -> 
 }
 
 fn import_svg_bounded_with_work_mode(name: &str, bytes: &[u8], max_work: u64, strict: bool) -> Result<(ImportResult, u64), IoError> {
+    with_svg_stack(|| import_svg_bounded_with_work_on_stack(name, bytes, max_work, strict))
+}
+
+fn import_svg_bounded_with_work_on_stack(name: &str, bytes: &[u8], max_work: u64, strict: bool) -> Result<(ImportResult, u64), IoError> {
     if max_work == 0 {
         return Err(IoError::Svg("SVG preview validation work budget is exhausted".into()));
     }
@@ -940,7 +985,7 @@ pub fn import_svg_bounded_layers(name: &str, bytes: &[u8], max_cached_pixels: u6
 /// `max_decoded_pixels` (capped at 24 MP) in all, nested SVG images get the same budget, and
 /// compressed data inflates to at most 16 MiB.
 pub fn import_svg_bounded_images(name: &str, bytes: &[u8], max_decoded_pixels: u64) -> Result<ImportResult, IoError> {
-    import_parsed(name, parse_bounded(bytes, max_decoded_pixels)?, MAX_GROUP_DEPTH, None, false)
+    with_svg_stack(|| import_parsed(name, parse_bounded(bytes, max_decoded_pixels)?, MAX_GROUP_DEPTH, None, false))
 }
 
 /// The pixel bounds [`import_svg_bounded`] gives the drawing, found without rendering any layer
@@ -949,6 +994,10 @@ pub fn import_svg_bounded_images(name: &str, bytes: &[u8], max_decoded_pixels: u
 /// pixel does not. A smart object's warp frame needs only these bounds, so an SVG whose editable
 /// layer caches exceed the budget (rejected by [`import_svg_bounded_layers`]) still has one.
 pub fn bounded_canvas_bounds(bytes: &[u8], max_cached_pixels: u64) -> Result<Rect, IoError> {
+    with_svg_stack(|| bounded_canvas_bounds_on_stack(bytes, max_cached_pixels))
+}
+
+fn bounded_canvas_bounds_on_stack(bytes: &[u8], max_cached_pixels: u64) -> Result<Rect, IoError> {
     let parsed = parse_bounded(bytes, max_cached_pixels)?;
     let cv = canvas(&parsed.tree, &mut Vec::new());
     let limit = max_cached_pixels.min(MAX_RASTER_PIXELS);
@@ -960,6 +1009,16 @@ pub fn bounded_canvas_bounds(bytes: &[u8], max_cached_pixels: u64) -> Result<Rec
 
 /// Parse (bounded when `max_cached_pixels` is set) and convert to layers; see [`import_parsed_with_limits`].
 fn import_svg_inner(
+    name: &str,
+    bytes: &[u8],
+    max_group_depth: usize,
+    max_cached_pixels: Option<u64>,
+    reject_cache_overflow: bool,
+) -> Result<ImportResult, IoError> {
+    with_svg_stack(|| import_svg_on_stack(name, bytes, max_group_depth, max_cached_pixels, reject_cache_overflow))
+}
+
+fn import_svg_on_stack(
     name: &str,
     bytes: &[u8],
     max_group_depth: usize,
@@ -1055,12 +1114,18 @@ fn import_parsed_with_limits(
 /// The whole drawing rendered at `scale` (1 = its own size), as a straight-alpha RGBA buffer at
 /// the origin. Smart objects use it to stay sharp at any placement.
 pub fn rasterize(bytes: &[u8], scale: f32) -> Result<photocraft_compose::Buffer, IoError> {
-    let tree = parse(bytes)?.tree;
-    rasterize_tree(&tree, scale)
+    with_svg_stack(|| {
+        let tree = parse(bytes)?.tree;
+        rasterize_tree(&tree, scale)
+    })
 }
 
 /// Render untrusted embedded SVG with intrinsic raster-image and aggregate decode budgets.
 pub fn rasterize_bounded(bytes: &[u8], scale: f32, max_decoded_pixels: u64) -> Result<photocraft_compose::Buffer, IoError> {
+    with_svg_stack(|| rasterize_bounded_on_stack(bytes, scale, max_decoded_pixels))
+}
+
+fn rasterize_bounded_on_stack(bytes: &[u8], scale: f32, max_decoded_pixels: u64) -> Result<photocraft_compose::Buffer, IoError> {
     let (parsed, chain) = parse_bounded_inner(bytes, max_decoded_pixels)?;
     let tree = parsed.tree;
     if chain != 0 {
@@ -1088,6 +1153,10 @@ fn rasterize_tree(tree: &usvg::Tree, scale: f32) -> Result<photocraft_compose::B
 /// [`MAX_RASTER_PIXELS`] in all: its width, height and straight-alpha RGBA8 pixels. Paste uses it
 /// for a drawing copied as SVG markup.
 pub fn rasterize_rgba8(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), IoError> {
+    with_svg_stack(|| rasterize_rgba8_on_stack(bytes))
+}
+
+fn rasterize_rgba8_on_stack(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), IoError> {
     let tree = parse(bytes)?.tree;
     let cv = canvas(&tree, &mut Vec::new());
     let (w, h) = (f64::from(tree.size().width() * cv.scale), f64::from(tree.size().height() * cv.scale));

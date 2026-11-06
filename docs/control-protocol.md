@@ -1,5 +1,45 @@
 # Control protocol
 
+Komaphone's drawing workspace is selectable with `ui.set {"komaphone":true}`
+(or `false` for Advanced). `ui.inspect` includes its serialized `komaphone` view
+state. Local draft commands and acknowledgment semantics are documented in the
+[K1 local drawing guide](komaphone/k1-local-drafts.md#engine-and-automation-seam).
+
+K2 private rooms use a separate authenticated HTTP service. The editor's control port
+is never the multiplayer endpoint. `ui.set {"roomsOpen":true}` opens the private-room
+window; `ui.inspect` exposes safe `rooms`, room status and rendered `roomControls`
+rectangles. Invite secrets are omitted from ordinary inspection, saved UI state,
+Debug output and drawing replay/Actions.
+
+All room actions dispatch through `engine.execute` with these stable command IDs:
+
+| Command suffix after `komaphone.room.` | Parameters / behavior |
+|---|---|
+| `connect` | `{endpoint, display_name}`; pairs a local device credential |
+| `create`, `options` | `{mode, timer_ms?}`; mode is `{kind:"animation", rotations:1..4}` or `{kind:"exquisite_corpse"}`; null timer is untimed |
+| `join` | `{room, invitation}`; invitation is a capability, handle explicitly |
+| `invite`, `invitation`, `revoke` | `{expires_in_ms,uses}`, `{}`, `{invitation_id}`; only `invitation` deliberately returns the sharing secret |
+| `ready` | `{ready:true|false}` |
+| `start`, `pause`, `resume`, `claim`, `archive`, `leave`, `next`, `disconnect` | `{}`; authority/phase rules apply |
+| `skip`, `end` | `{participant,reason}`, `{reason}`; preserve explicit missing/incomplete results |
+| `openDraft`, `submit` | `{}`, `{note?}`; actual assigned local project and acknowledged revision |
+| `status`, `retry`, `retainRejected` | `{}`; inspect, retry exact durable work, or retain rejected requests locally and refresh |
+
+A queued result is not service acceptance. Poll `status` for pending/blocked/connected
+state and the authorized room projection; local durability is reported independently
+by `komaphone.project.status`. Deadline pins and freeze reports are internal durable
+worker operations. Read [the K2 runbook](komaphone/k2-private-rooms.md) for setup,
+limits, recovery and remaining mode/release gates.
+
+K3 adds `komaphone.animation.copyPrevious`, `komaphone.room.setNote`,
+`komaphone.room.mediaStatus`, `komaphone.reveal.position` and
+`komaphone.reveal.notes`; their parameters and local acknowledgment rules are in
+[the party-mode runbook](komaphone/k3-party-modes.md#command-seam). The current
+assignment and earlier own turns in the same game enforce their edit/freeze rules
+through the engine, including background-job application. `roomImageCache` in UI
+inspection lists actual cached texture hashes; `mediaStatus` separately exposes
+authorized and decoded image hashes. Neither is permission to fetch a hidden asset.
+
 Shape stroke defaults are drivable with `ui.set {shapeStroke: {width, align, cap, join,
 miterLimit, dashes, dashOffset, opacity}}`; partial fields merge, null disables the stroke.
 Values use the existing `shape.edit` names and units. Colour uses `tools.setColors`.

@@ -1,0 +1,29 @@
+[package]
+name = "photocraft-local-store"
+description = "Permanent transactional local Komaphone drafts and replay checkpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+photocraft-doc = { workspace = true }
+photocraft-format = { workspace = true }
+photocraft-party = { path = "../party" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+getrandom = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"
+photocraft-color = { workspace = true }
+photocraft-raster = { workspace = true }

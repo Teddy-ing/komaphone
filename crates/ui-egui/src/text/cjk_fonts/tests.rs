@@ -1368,10 +1368,7 @@ fn pending_scan_recovers_through_real_layout_and_the_lazy_reload() {
 
 #[test]
 fn strict_policy_first_frame_after_the_scan_is_accepted() {
-    if craft_fonts::CRAFT_FONTS.is_empty() {
-        eprintln!("skipping: the eager provider is only installed with craft-fonts");
-        return;
-    }
+    // The first frame must resolve installed fonts even when the optional craft input is empty.
     let ctx = egui::Context::default();
     ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Panic);
     let sources = Sources {

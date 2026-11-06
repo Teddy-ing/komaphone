@@ -49,6 +49,7 @@ pub const TABLE: &[(&str, Class)] = &[
     // Pen tablet input (the one isolated `unsafe` helper: AppKit interop on macOS).
     ("tablet", Class::Standalone),
     ("doc", Class::Layer(1)),
+    ("party", Class::Layer(2)),
     ("ops", Class::Layer(2)),
     ("paint", Class::Layer(2)),
     ("algo", Class::Layer(2)),
@@ -58,6 +59,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("gpu", Class::Layer(3)),
     ("format", Class::Layer(3)),
     ("io", Class::Layer(4)),
+    ("local-store", Class::Layer(4)),
+    ("room-client", Class::Layer(4)),
     ("tools", Class::Layer(4)),
     ("viewport", Class::Layer(4)),
     ("ml", Class::Layer(4)),
@@ -69,6 +72,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("testkit", Class::Testkit),
     // L7 apps and tooling
     ("photocraft", Class::Exempt),
+    ("sync", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
     ("web-boot", Class::Exempt),

@@ -224,6 +224,10 @@ impl PhotocraftApp {
 
 impl eframe::App for PhotocraftApp {
     fn on_exit(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(error) = self.session.flush_local_projects(std::time::Duration::from_secs(30)) {
+            log::error!("Komaphone local save did not finish: {error}");
+        }
         if let Err(err) = tool_memory::save_on_exit(self) {
             log::warn!("Preferences: could not save the final tool selection: {err}");
         }

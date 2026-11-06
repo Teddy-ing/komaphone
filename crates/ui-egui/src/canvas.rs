@@ -610,7 +610,7 @@ fn update_canvas_navigation(app: &mut PhotocraftApp, view: &mut View, input: Can
     let touch_gestures = app.session.prefs().enhanced_controls.touch_gestures;
     let wheel = crate::wheel_nav::read_with(
         input.ctx,
-        app.session.prefs().general.zoom_with_scroll_wheel,
+        app.ui.komaphone.enabled || app.session.prefs().general.zoom_with_scroll_wheel,
         app.session.prefs().enhanced_controls.zoom_with_trackpad_pinch,
         app.session.prefs().general.animated_zoom,
         input.wheel_owner,
@@ -1838,7 +1838,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         || (hover_here
             && crate::wheel_nav::read_with(
                 &ctx,
-                app.session.prefs().general.zoom_with_scroll_wheel,
+                app.ui.komaphone.enabled || app.session.prefs().general.zoom_with_scroll_wheel,
                 app.session.prefs().enhanced_controls.zoom_with_trackpad_pinch,
                 app.session.prefs().general.animated_zoom,
                 wheel_owner,
@@ -2054,6 +2054,9 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         xf
     };
     let (beyond, layer_edges, edge_rect, ants) = painted.unwrap_or_else(|| paint_canvas(app, ui, &display_view, xf, &paint_input));
+    if primary {
+        crate::komaphone_game_view::overlay(app, &painter, &xf);
+    }
     // A Hand drag (the tool, Space or the middle button) keeps every overlay on screen, as in
     // Photoshop: the Pen path being drawn, paths, guides, grid, transform box (#6592). Only the
     // tool cursors below give way to the fist.

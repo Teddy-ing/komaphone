@@ -137,6 +137,9 @@ impl Session {
 
     /// The command's own precondition for a call with `params` (their target filled in).
     fn precondition(&self, spec: &commands::CommandSpec, params: &Value) -> std::result::Result<(), String> {
+        if let Some(reason) = self.room_edit_refusal(spec.id) {
+            return Err(reason);
+        }
         if let Some(why) = color_channels::refusal(self, spec.id, params) {
             return Err(why);
         }
@@ -243,6 +246,8 @@ impl Session {
     /// [`Self::edit`], recording a history state only when `record` is set. An unrecorded change
     /// still marks the document modified and leaves the redo states alone.
     pub(crate) fn edit_with<R>(&mut self, label: &str, record: bool, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
+        self.check_local_replay_capacity()?;
+        let assigned_size = self.room_canvas_size();
         if record {
             crate::actions_cmds::before_action_edit(self);
         }
@@ -256,6 +261,7 @@ impl Session {
         let filter_mask_layer = self.filter_mask_layer;
         let sampler_map = self.sampler_map.take();
         let symmetry_map = self.symmetry_map.take();
+        let local_managed = self.active().is_some_and(|state| self.local_replay.is_managed(state.doc.id));
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let before = st.doc.clone();
         // Only this document's pixels gate its edits: an unreadable tile elsewhere (another
@@ -268,6 +274,9 @@ impl Session {
         let mut doc = (*before).clone();
         let mut active = st.active_layer;
         let r = f(&mut doc, &mut active)?;
+        if assigned_size.is_some_and(|size| doc.size != size) {
+            return Err(EngineError::Other("This party assignment has a fixed canvas size. Transform layers within the assigned frame or band.".into()));
+        }
         if let Some(restrict) = restrict {
             channel_cmds::restrict_to_color(&before, &mut doc, restrict.layer, restrict.colors)?;
         }
@@ -278,6 +287,9 @@ impl Session {
         {
             st.active_layer = previous_active_layer;
             return Err(EngineError::Other(error));
+        }
+        if local_managed {
+            crate::local_replay::validate_local_document(&doc)?;
         }
         st.doc = Arc::new(doc);
         st.active_layer = active;
@@ -345,6 +357,7 @@ impl Session {
             self.subject_cache = Default::default();
             self.object_finder = Default::default();
         }
+        self.capture_local_edit(label)?;
         Ok(r)
     }
 

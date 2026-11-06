@@ -12,6 +12,10 @@ workspace = true
 corpus = []
 
 [dependencies]
+photocraft-room-client = { path = "../room-client" }
+photocraft-local-store = { path = "../local-store" }
+photocraft-party = { path = "../party" }
+web-time = { workspace = true }
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-cms = { workspace = true }
@@ -44,6 +48,9 @@ roxmltree = "0.21"
 semver = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+image = { workspace = true, features = ["png"] }
+sha2 = "0.10"
+getrandom = { workspace = true }
 tempfile = "3"
 chrono = { workspace = true }
 

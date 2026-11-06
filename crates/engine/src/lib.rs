@@ -30,6 +30,10 @@ pub mod kys;
 pub mod layer_place;
 pub mod layer_style;
 pub mod link_watch;
+pub mod local_projects;
+pub mod rooms;
+pub use photocraft_party as party;
+pub mod local_replay;
 pub mod malloc_tuning;
 pub mod memory;
 pub mod new_layer;
@@ -189,6 +193,9 @@ pub(crate) fn active_layer_of(s: &Session) -> std::result::Result<&photocraft_do
 
 #[derive(Default)]
 pub struct Session {
+    pub rooms: rooms::Rooms,
+    pub local_projects: local_projects::LocalProjects,
+    pub local_replay: local_replay::Recorder,
     docs: Vec<DocState>,
     /// Admitted document identities in opening order, independent of visual-tab reordering.
     open_document_order: Vec<photocraft_doc::DocId>,

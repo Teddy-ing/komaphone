@@ -134,7 +134,7 @@ impl Session {
     /// Identity-dependent callers must read the admitted document at the returned index.
     pub fn add_document(&mut self, mut doc: Document, path: Option<String>) -> usize {
         // Persisted IDs can overlap the allocator, so check every replacement too.
-        while self.docs.iter().any(|st| st.doc.id == doc.id) {
+        while self.docs.iter().any(|st| st.doc.id == doc.id) || self.local_projects.owns_document(doc.id) {
             doc.id = photocraft_doc::DocId::fresh();
         }
         self.open_document_order.push(doc.id);
@@ -146,6 +146,9 @@ impl Session {
         let i = self.docs.len() - 1;
         self.active = Some(i);
         self.note_active_change();
+        if let Err(error) = self.capture_local_replay_baseline() {
+            self.local_projects.error = Some(error.to_string());
+        }
         i
     }
 

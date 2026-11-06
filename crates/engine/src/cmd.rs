@@ -95,6 +95,9 @@ pub mod history_options_cmds;
 pub mod history_select_cmds;
 pub mod history_source_cmds;
 pub mod image_cmds;
+pub mod komaphone_game_cmds;
+pub mod komaphone_project_cmds;
+pub mod komaphone_room_cmds;
 pub mod layer_copy_cmds;
 pub mod layer_label_cmds;
 pub mod layer_list_cmds;
@@ -320,7 +323,8 @@ fn build() -> Vec<CommandSpec> {
                 let i = p.get("document").and_then(Value::as_u64).map(|v| v as usize).or(s.active_index()).ok_or(EngineError::NoDocument)?;
                 match p.get("save").filter(|v| !v.is_null()) {
                     Some(v) if v == "ask" => {
-                        if s.documents().get(i).ok_or(EngineError::NoDocument)?.is_dirty() {
+                        let dirty = s.documents().get(i).ok_or(EngineError::NoDocument)?.is_dirty();
+                        if dirty {
                             return Err(bad("file.close", "the document has unsaved changes; save it or explicitly discard them"));
                         }
                     }
@@ -1342,6 +1346,9 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::layer_copy_cmds::specs());
     v.extend(crate::prefs::specs());
     v.extend(crate::updates_cmds::specs());
+    v.extend(komaphone_project_cmds::specs());
+    v.extend(komaphone_room_cmds::specs());
+    v.extend(komaphone_game_cmds::specs());
     v.extend(crate::edit_menu_cmds::specs());
     v.extend(crate::fill_key_cmds::specs());
     v.extend(crate::sample_cmds::specs());

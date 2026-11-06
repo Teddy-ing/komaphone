@@ -6,6 +6,12 @@ code and original assets are MIT OR Apache-2.0 (see [`LICENSE-MIT`](LICENSE-MIT)
 in the same change; third-party assets must be permissively licensed and keep their license file
 next to them.
 
+## Komaphone validation fixtures
+
+| Path | Title | Author | Source | License |
+|---|---|---|---|---|
+| `docs/komaphone/k0-editor-fixture.json`, `docs/komaphone/k1-workspace-fixture.json` | Synthetic three-stroke drawing for workspace verification | OpenAI Codex | Original scripted geometry; K1 adapts the K0 fixture | MIT OR Apache-2.0 |
+
 ## Bundled in the app
 
 | Path | Title | Author | Source | License |

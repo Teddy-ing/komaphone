@@ -310,7 +310,8 @@ pub fn drop_floating(s: &mut Session) -> Result<Value> {
         st.floating = None;
         return Ok(json!({"dropped": false}));
     };
-    st.floating = None;
+    // Keep the preview until the edit commits. A full local-save queue, invalid candidate,
+    // or rendering failure must leave the pending move available for retry.
     let (dx, dy) = f.offset;
     if (dx, dy) == (0, 0) {
         // Back where it was cut: the pixels are as they were. A piece that never moved (a click)
@@ -322,14 +323,17 @@ pub fn drop_floating(s: &mut Session) -> Result<Value> {
                 Ok(())
             })?;
         }
-        return Ok(json!({"dropped": true, "offset": [0, 0]}));
+    } else {
+        s.edit("Move", |doc, _| {
+            f.parts.place(doc, dx, dy)?;
+            let sel = f.parts.outline().or(doc.selection.as_ref());
+            doc.selection = sel.map(|sel| photocraft_algo::resample::translate_surface(sel, dx, dy));
+            Ok(())
+        })?;
     }
-    s.edit("Move", |doc, _| {
-        f.parts.place(doc, dx, dy)?;
-        let sel = f.parts.outline().or(doc.selection.as_ref());
-        doc.selection = sel.map(|sel| photocraft_algo::resample::translate_surface(sel, dx, dy));
-        Ok(())
-    })?;
+    if let Some(st) = s.active_mut() {
+        st.floating = None;
+    }
     Ok(json!({"dropped": true, "offset": [dx, dy]}))
 }
 

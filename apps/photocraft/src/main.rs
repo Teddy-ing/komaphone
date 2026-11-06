@@ -151,7 +151,7 @@ fn native_options(custom_titlebar: bool) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: viewport
             .with_app_id(APP_ID)
-            .with_title("PhotoCraft")
+            .with_title("Komaphone")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([760.0, 480.0])
             .with_drag_and_drop(true)
@@ -346,14 +346,8 @@ fn main() -> eframe::Result {
     // Then, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
     crash_guard::install_hook();
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(done) = craft_update::self_update::finish(&photocraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        if let Err(e) = done {
-            eprintln!("PhotoCraft update helper failed: {e}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
+    // Komaphone has no release/update channel yet. In particular, never finish an
+    // upstream PhotoCraft self-update that could replace this independent app.
 
     // The system font scan can take seconds (minutes on some Macs): run it off the UI thread.
     photocraft_ui_egui::type_tool::warm_fonts();
@@ -524,6 +518,21 @@ fn main() -> eframe::Result {
             let session = Session::new();
             PhotocraftApp::install_type_reset_hooks(&cc.egui_ctx);
             let mut app = PhotocraftApp::new(session, services);
+            app.ui.komaphone.enabled = true;
+            app.ui.tool = photocraft_ui_egui::Tool::Brush;
+            let local_data = std::env::var_os("KOMAPHONE_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("LOCALAPPDATA").map(|base| std::path::PathBuf::from(base).join("Komaphone")));
+            if let Some(root) = local_data {
+                if let Err(error) = app.session.enable_rooms(root.join("rooms.sqlite3"), Default::default()) {
+                    app.session.rooms.status.error = Some(error.to_string());
+                }
+                if let Err(error) = app.session.enable_local_projects(root.join("drafts.sqlite3"), Default::default()) {
+                    app.session.local_projects.error = Some(error.to_string());
+                }
+            } else {
+                app.session.local_projects.error = Some("Set KOMAPHONE_DATA_DIR to a local folder to enable permanent drafts".into());
+            }
             app.min_frame_ms = uncapped.then_some(1000.0 / 240.0);
             app.integrated_titlebar = cfg!(target_os = "macos");
             app.custom_titlebar = custom_titlebar;

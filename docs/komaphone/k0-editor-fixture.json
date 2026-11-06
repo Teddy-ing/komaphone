@@ -1,0 +1,7 @@
+[
+  ["engine.execute", {"command":"file.new", "params":{"width":1536,"height":1024,"background":"white"}}],
+  ["engine.execute", {"command":"paint.stroke", "params":{"points":[[200,640],[430,280],[660,640]],"size":36,"hardness":1,"color":"#204080"}}],
+  ["engine.execute", {"command":"paint.stroke", "params":{"points":[[300,500],[560,500]],"size":24,"hardness":1,"color":"#208060"}}],
+  ["engine.execute", {"command":"paint.stroke", "params":{"points":[[790,300],[790,640],[1100,640]],"size":36,"hardness":1,"color":"#b05030"}}],
+  ["ui.set", {"tool":"brush"}]
+]

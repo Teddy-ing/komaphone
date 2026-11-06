@@ -23,6 +23,15 @@ impl PhotocraftApp {
 impl PhotocraftApp {
     /// Shared logic body. A wrapping host owns the final reset tail after its own work.
     pub fn logic_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.session.poll_local_projects();
+        self.session.poll_rooms();
+        crate::komaphone_game_view::sync(self, ctx);
+        if self.session.rooms.available() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.session.local_projects.has_pending() || self.session.local_replay.pending_len() > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(25));
+        }
         self.cap_frame_rate();
         i18n::set_current(i18n::Lang::from_pref(&self.session.prefs().interface.language));
         // Caps Lock state read from the OS once per frame (see `Services::caps_lock`): the canvas
@@ -276,29 +285,49 @@ impl PhotocraftApp {
         }
         // In Full Screen Mode, Tab shows the menu bar, options bar, toolbar and dock (#6760).
         let tabbed_in = !chrome && self.ui.panels.full_screen_chrome;
-        if (chrome || tabbed_in) && self.ui.panels.menu_bar {
-            panels::title_bar(self, ui);
-        }
-        if (chrome && self.ui.panels.options_bar) || tabbed_in {
-            panels::options_bar(self, ui);
-        }
-        if chrome && self.ui.panels.status_bar {
-            panels::status_bar(self, ui);
-        }
-        if (chrome && self.ui.panels.toolbar) || tabbed_in {
-            panels::toolbar(self, ui);
-        }
-        // craft-ui's layout holds the canvas as its protected `canvas` panel.
-        let docking = (chrome && self.ui.panels.dock) || tabbed_in;
-        if docking {
-            panels::dock_area(self, ui);
-        } else {
+        if self.ui.komaphone.enabled && (chrome || tabbed_in) {
+            crate::komaphone_workspace::chrome(self, ui);
+            if !crate::komaphone_game_view::has_reveal(self) {
+                crate::komaphone_game_view::reference_panel(self, ui);
+            }
             let t = theme::Tokens::get(&ctx);
-            let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
-            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
-                canvas::document_area(self, ui);
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
+                if crate::komaphone_game_view::has_reveal(self) {
+                    crate::komaphone_game_view::reveal(self, ui);
+                } else if self.session.documents().is_empty() {
+                    crate::komaphone_workspace::home(self, ui);
+                } else {
+                    canvas::document_area(self, ui);
+                }
             });
-            panels::properties_window(self, &ctx);
+        } else {
+            if !self.ui.komaphone.enabled && self.session.local_projects.available() && chrome {
+                crate::komaphone_workspace::advanced_return(self, ui);
+            }
+            if (chrome || tabbed_in) && self.ui.panels.menu_bar {
+                panels::title_bar(self, ui);
+            }
+            if (chrome && self.ui.panels.options_bar) || tabbed_in {
+                panels::options_bar(self, ui);
+            }
+            if chrome && self.ui.panels.status_bar {
+                panels::status_bar(self, ui);
+            }
+            if (chrome && self.ui.panels.toolbar) || tabbed_in {
+                panels::toolbar(self, ui);
+            }
+            // craft-ui's layout holds the canvas as its protected `canvas` panel.
+            let docking = (chrome && self.ui.panels.dock) || tabbed_in;
+            if docking {
+                panels::dock_area(self, ui);
+            } else {
+                let t = theme::Tokens::get(&ctx);
+                let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };
+                egui::CentralPanel::default().frame(egui::Frame::NONE.fill(backdrop)).show(ui, |ui| {
+                    canvas::document_area(self, ui);
+                });
+                panels::properties_window(self, &ctx);
+            }
         }
         brush_panel::window(self, &ctx);
         preset_panels::windows(self, &ctx);

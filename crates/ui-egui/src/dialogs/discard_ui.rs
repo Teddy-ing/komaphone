@@ -50,6 +50,37 @@ fn reach(id: &str) -> Option<Reach> {
     DISCARDING.iter().find(|(c, _)| *c == id).map(|(_, r)| *r)
 }
 
+/// External files keep their existing Save/Don't Save contract. Native local drawings close
+/// against their exact durable draft acknowledgment instead of asking for an unrelated path.
+fn local_draft(app: &PhotocraftApp, command: &str, doc: DocId) -> bool {
+    command != "file.revert"
+        && app.session.local_projects.available()
+        && app.session.local_replay.excluded_reason(doc).is_none()
+        && index_of(app, doc).is_some_and(|i| app.session.documents()[i].path.is_none())
+}
+
+fn local_edit_in_progress(app: &PhotocraftApp, doc: DocId) -> bool {
+    app.session.active().is_some_and(|state| state.doc.id == doc) && crate::komaphone_workspace::editing_in_progress(app)
+}
+
+/// Inspect the same current edit state the close modal guards, rather than presenting an
+/// acknowledgment of an earlier snapshot as a save of the still-active preview.
+fn local_status(app: &PhotocraftApp, doc: DocId) -> String {
+    if local_edit_in_progress(app, doc) && app.session.local_projects.status(doc).error.is_none() && app.session.local_projects.error.is_none() {
+        "Drawing · Unsaved".into()
+    } else {
+        app.session.local_projects.status_text(doc)
+    }
+}
+
+fn needs_confirmation(app: &PhotocraftApp, command: &str, doc: DocId) -> bool {
+    if local_draft(app, command, doc) {
+        local_edit_in_progress(app, doc) || !app.session.local_document_saved(doc)
+    } else {
+        index_of(app, doc).is_some_and(|i| app.session.documents()[i].is_dirty())
+    }
+}
+
 /// The command's target document and the unsaved documents it would discard (empty for commands
 /// that discard nothing).
 fn discarded(app: &PhotocraftApp, id: &str, params: &Value) -> (Option<DocId>, Vec<DocId>) {
@@ -61,7 +92,7 @@ fn discarded(app: &PhotocraftApp, id: &str, params: &Value) -> (Option<DocId>, V
         Some(Reach::All) => (0..docs.len()).collect(),
         None => Vec::new(),
     };
-    let dirty = affected.into_iter().filter_map(|i| docs.get(i)).filter(|d| d.is_dirty()).map(|d| d.doc.id).collect();
+    let dirty = affected.into_iter().filter_map(|i| docs.get(i)).filter(|d| needs_confirmation(app, id, d.doc.id)).map(|d| d.doc.id).collect();
     (target.and_then(|i| docs.get(i)).map(|d| d.doc.id), dirty)
 }
 
@@ -96,8 +127,17 @@ pub fn intercept(app: &mut PhotocraftApp, id: &str, params: &Value) -> bool {
 
 /// Puts up `prompt`. One over several documents shows the document it asks about first; each
 /// later one is shown as it comes up (see [`advance`]).
-fn ask(app: &mut PhotocraftApp, prompt: Prompt) {
+fn ask(app: &mut PhotocraftApp, mut prompt: Prompt) {
     if !matches!(reach(&prompt.id), Some(Reach::Target)) {
+        // Keep an unfinished canvas gesture on its originating tab until it is answered.
+        // Otherwise a multi-document quit could make its preview appear to belong to the
+        // first unsaved tab merely by activating that tab for the question.
+        if crate::komaphone_workspace::editing_in_progress(app)
+            && let Some(active) = app.session.active().map(|state| state.doc.id)
+            && let Some(index) = prompt.docs.iter().position(|doc| *doc == active)
+        {
+            prompt.docs.swap(0, index);
+        }
         show_tab(app, prompt.docs.first().copied());
     }
     app.discard = Some(prompt);
@@ -114,7 +154,7 @@ impl PhotocraftApp {
     /// Whether closing now would lose work: a document has unsaved changes and closing wasn't
     /// confirmed. The web build has the browser ask before leaving the page while this holds (#1380).
     pub fn has_unsaved_work(&self) -> bool {
-        !self.allow_close && self.session.documents().iter().any(|d| d.is_dirty())
+        !self.allow_close && self.session.documents().iter().any(|d| needs_confirmation(self, EXIT, d.doc.id))
     }
 }
 
@@ -173,7 +213,7 @@ fn advance(app: &mut PhotocraftApp, ctx: &egui::Context) {
             .session
             .documents()
             .iter()
-            .filter(|d| d.is_dirty() && (matches!(reach(&id), Some(Reach::All)) || Some(d.doc.id) != target))
+            .filter(|d| needs_confirmation(app, &id, d.doc.id) && (matches!(reach(&id), Some(Reach::All)) || Some(d.doc.id) != target))
             .map(|d| d.doc.id)
             .collect();
         if !rest.is_empty() {
@@ -274,6 +314,10 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         advance(app, ctx);
         return;
     };
+    if local_draft(app, &p.id, doc) {
+        show_local(app, ctx, doc, &name);
+        return;
+    }
     let (title, message) = if reverts {
         ("Revert", crate::i18n::fmt(tl!("Revert “{name}” to the last saved version? Your changes will be lost."), &[("name", &name)]))
     } else {
@@ -339,11 +383,79 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
+/// The worker runs independently. Keep the window responsive until its current snapshot is
+/// acknowledged, and leave failed writes visible until the user retries, cancels, or explicitly
+/// closes without waiting. Nothing here deletes a previous draft or blocks the UI on disk I/O.
+fn show_local(app: &mut PhotocraftApp, ctx: &egui::Context, doc: DocId, name: &str) {
+    let editing = local_edit_in_progress(app, doc);
+    if !editing && app.session.local_document_saved(doc) {
+        advance(app, ctx);
+        return;
+    }
+    let error = app.session.local_projects.status(doc).error.or_else(|| app.session.local_projects.error.clone());
+    let title = if error.is_some() {
+        "Local save failed"
+    } else if editing {
+        "Finish your edit"
+    } else {
+        "Saving local drawing"
+    };
+    let mut answer = None;
+    let modal = egui::Modal::new(egui::Id::unique("discard-prompt")).show(ctx, |ui| {
+        ui.set_max_width(480.0);
+        ui.label(egui::RichText::new(title).font(crate::theme::semibold(15.0)));
+        ui.add_space(4.0);
+        crate::widgets::hairline(ui);
+        ui.add_space(8.0);
+        ui.label(format!("“{name}” will close when its completed edits are saved locally."));
+        if let Some(error) = &error {
+            ui.label(error);
+        } else if editing {
+            ui.label("Keep drawing to finish or cancel the active edit first.");
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Waiting for local storage…");
+            });
+        }
+        ui.label("Closing without waiting may lose unsaved changes. Your last saved local revision is kept.");
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Keep drawing").clicked() {
+                answer = Some(Answer::Cancel);
+            }
+            if error.is_some() && ui.button("Retry local save").clicked() {
+                answer = Some(Answer::Save);
+            }
+            if ui.button("Close without waiting").clicked() {
+                answer = Some(Answer::Discard);
+            }
+        });
+    });
+    if modal.should_close() || ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+        answer = Some(Answer::Cancel);
+    }
+    if error.is_none() && !editing {
+        ctx.request_repaint_after(std::time::Duration::from_millis(25));
+    }
+    if let Some(answer) = answer {
+        apply(app, ctx, doc, answer);
+    }
+}
+
 /// Acts on the answer about `doc`, the document the prompt is asking about.
 fn apply(app: &mut PhotocraftApp, ctx: &egui::Context, doc: DocId, answer: Answer) {
+    let local = app.discard.as_ref().is_some_and(|p| local_draft(app, &p.id, doc));
     match answer {
         Answer::Cancel => app.discard = None,
         Answer::Discard => advance(app, ctx),
+        Answer::Save if local => {
+            show_tab(app, Some(doc));
+            if let Err(error) = app.run("komaphone.project.retry", json!({})) {
+                app.ui.status = error;
+                app.ui.status_error = true;
+            }
+        }
         Answer::Save if save(app, ctx, doc) => advance(app, ctx),
         Answer::Save => {}
     }
@@ -360,12 +472,15 @@ pub fn inspect(app: &PhotocraftApp) -> Option<Value> {
     let doc = *p.docs.first()?;
     let name = index_of(app, doc).and_then(|i| app.session.documents().get(i)).map(|d| d.doc.name.clone())?;
     let reverts = p.id == "file.revert";
-    let (choices, default): (&[&str], _) = if reverts { (&["dontSave", "cancel"], "dontSave") } else { (&["save", "dontSave", "cancel"], "save") };
+    let local = local_draft(app, &p.id, doc);
+    let (choices, default): (&[&str], _) =
+        if reverts { (&["dontSave", "cancel"], "dontSave") } else { (&["save", "dontSave", "cancel"], if local { "cancel" } else { "save" }) };
     Some(json!({
         "id": CONTROL_ID,
         "kind": "unsavedChanges",
-        "title": if reverts { "Revert" } else { "Unsaved changes" },
-        "fields": {"command": p.id, "document": name, "remaining": p.docs.len(), "choices": choices, "default": default},
+        "title": if reverts { "Revert" } else if local { "Saving local drawing" } else { "Unsaved changes" },
+        "fields": {"command": p.id, "document": name, "remaining": p.docs.len(), "choices": choices, "default": default,
+            "localSave": local, "localStatus": local.then(|| local_status(app, doc))},
     }))
 }
 
@@ -434,3 +549,6 @@ fn button_labels(mac: bool, buttons: &[(&str, Option<Key>)]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod local_tests;

@@ -241,6 +241,8 @@ fn ui_set(app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) -> Outcome {
 }
 
 struct UiSet {
+    komaphone: Option<bool>,
+    rooms_open: Option<bool>,
     tools: ToolSet,
     crop: CropSet,
     panels: PanelSet,
@@ -261,11 +263,17 @@ impl UiSet {
         let bridge_pro = matches!(theme.unwrap_or(app.ui.theme), crate::theme::ThemeKind::Pro | crate::theme::ThemeKind::ProMedium);
         let legacy_update =
             crate::panel_docking::prepare_legacy_update(app, p, panels.panels.as_ref(), panels.dock_tabs.as_ref(), panels.dock.as_ref(), bridge_pro)?;
-        Ok(Self { tools, crop, panels, view, theme, brush, legacy_update })
+        Ok(Self { komaphone: bool_field(p, "komaphone")?, rooms_open: bool_field(p, "roomsOpen")?, tools, crop, panels, view, theme, brush, legacy_update })
     }
 
     /// Apply (nothing but the final `brushSize` command can fail).
     fn apply(mut self, app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) -> std::result::Result<Value, String> {
+        if let Some(enabled) = self.komaphone {
+            app.ui.komaphone.enabled = enabled;
+        }
+        if let Some(open) = self.rooms_open {
+            app.ui.rooms.open = open;
+        }
         self.tools.apply(app);
         self.crop.apply(app);
         self.panels.apply_options(app);

@@ -1,5 +1,7 @@
 # Roadmap
 
+> **Komaphone direction:** This is retained upstream engineering history. Use the [Komaphone delivery plan](komaphone/delivery-plan.md) and [status](komaphone/status.md) for current product priorities and next work.
+
 > **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-11 · **Change:** minor (adaptive Unsharp Mask performance evidence linked; Photomerge status correction retained; alpha gate, focus and estimates unchanged) · **Target:** Adobe Photoshop 2026
 
 - UI.5: Panels can detach, join other tab groups, split, resize and redock through shared docking transactions. Custom layouts persist with workspaces, respect workspace locking, and retain collapse flags for intact native groups.

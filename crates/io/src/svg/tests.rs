@@ -1,5 +1,31 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn nested_svg_operations_share_one_worker_and_preserve_errors() {
+    let caller = std::thread::current().id();
+    let worker = with_svg_stack(|| {
+        let outer = std::thread::current().id();
+        assert_ne!(outer, caller);
+        let inner = with_svg_stack(|| Ok(std::thread::current().id()))?;
+        assert_eq!(inner, outer, "nested operations must not allocate another worker stack");
+        let error = with_svg_stack(|| Err::<(), _>(IoError::Svg("nested rejection".into()))).unwrap_err();
+        assert!(matches!(error, IoError::Svg(message) if message == "nested rejection"));
+        Ok(outer)
+    })
+    .unwrap();
+    assert_ne!(worker, caller);
+    assert!(!SVG_STACK_ACTIVE.get(), "the caller is never marked as owning a worker stack");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn svg_worker_panic_returns_an_error_without_unwinding_the_caller() {
+    let error = with_svg_stack(|| -> Result<(), IoError> { panic!("synthetic dependency panic") }).unwrap_err();
+    assert!(matches!(error, IoError::Svg(message) if message.contains("worker failed")));
+    assert_eq!(with_svg_stack(|| Ok(7)).unwrap(), 7, "a failed operation leaves subsequent imports usable");
+}
+
 fn embedded_image(mime: &str, bytes: &[u8]) -> String {
     let data = bytes.iter().map(|byte| format!("%{byte:02X}")).collect::<String>();
     format!("<image width=\"1\" height=\"1\" href=\"data:{mime},{data}\"/>")

@@ -217,8 +217,13 @@ fn open_filters_keep_literal_extensions_on_windows_and_macos() {
 }
 
 #[test]
-fn native_services_provide_update_transport() {
-    assert!(native(None).check_updates.is_some());
+fn native_komaphone_services_do_not_expose_the_upstream_update_route() {
+    let services = native(None);
+    assert!(services.check_updates.is_none());
+    let mut app = PhotocraftApp::new(Session::new(), services);
+    let status = app.run("updates.status", json!({})).unwrap();
+    assert_eq!(status["supported"], false, "the installed app must not advertise an upstream release channel");
+    assert!(app.run("help.checkForUpdates", json!({})).is_err(), "manual update checks must remain unavailable too");
 }
 
 #[test]

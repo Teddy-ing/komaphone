@@ -168,6 +168,9 @@ pub fn system_title_bar(app: &PhotocraftApp) -> bool {
 /// document open. With Preferences › Interface › Show File Name In Title off, the file name
 /// drops out and only the app name (and the `*`) remains (#5037).
 pub fn window_title(app: &PhotocraftApp) -> String {
+    if app.ui.komaphone.enabled || app.session.local_projects.available() {
+        return app.session.active().map(|d| format!("{} — Komaphone", d.doc.name)).unwrap_or_else(|| "Komaphone".into());
+    }
     if !app.session.prefs().interface.show_file_name_in_title {
         return format!("{}PhotoCraft", if app.session.active().is_some_and(|d| d.is_dirty()) { "*" } else { "" });
     }

@@ -1,5 +1,7 @@
 # PhotoCraft roadmap
 
+> **Komaphone direction:** This is retained upstream Photoshop-parity reference material. Current product scope and work order are in the [Komaphone specification](docs/komaphone/product-spec.md), [delivery plan](docs/komaphone/delivery-plan.md), and [status](docs/komaphone/status.md). Do not use the upstream estimates below as Komaphone delivery estimates.
+
 **Stage: alpha** · next: beta, ~30 points (ready for real work ~45% → ~75%, with reliable PSD) and ~1,100–1,800 h away
 
 > **Last reviewed:** 2026-10-17 · **Last updated:** 2026-10-17 · **Change:** minor (Object Finder retains large enclosed foregrounds (#6548); Russian catalog covers every dynamic label; previously minor: oracle floor 145 of 258 and 953 open issues, as in gaps.md and on GitHub; toolbox count 56 of 68, 12 missing) · **Target:** Adobe Photoshop 2026

@@ -4,6 +4,9 @@ use super::{Arc, DocState, Document, LayerId, LayerTarget, Session, channel_cmds
 impl Session {
     /// Undo a document step or restore Clear History's rows and source without editing pixels.
     pub fn undo(&mut self) -> bool {
+        if self.check_local_replay_capacity().is_err() {
+            return false;
+        }
         // A background job is computing from the current state: it must not move under it.
         if self.active_job().is_some() {
             return false;
@@ -18,7 +21,7 @@ impl Session {
         st.coalesce = None;
         // The step being undone: the layers whose visibility it changed get it back.
         let changed = st.history.current_visibility().to_vec();
-        match st.history.undo(st.doc.clone()) {
+        let changed = match st.history.undo(st.doc.clone()) {
             // Undo Clear History: the list comes back, the document is the same one. Not an
             // edit: keep a clean document clean (the revision still moves for the panels).
             Some((d, layers)) if Arc::ptr_eq(&d, &st.doc) => {
@@ -50,11 +53,18 @@ impl Session {
                 true
             }
             None => false,
+        };
+        if changed {
+            let _ = self.capture_local_edit("edit.undo");
         }
+        changed
     }
 
     /// Restore the next document state and its selection/visibility bookkeeping through the ordinary history path.
     pub fn redo(&mut self) -> bool {
+        if self.check_local_replay_capacity().is_err() {
+            return false;
+        }
         if self.active_job().is_some() {
             return false;
         }
@@ -62,7 +72,7 @@ impl Session {
         let keep_visibility = !self.visibility_undoable();
         let Some(st) = self.active_mut() else { return false };
         st.coalesce = None;
-        match st.history.redo(st.doc.clone()) {
+        let changed = match st.history.redo(st.doc.clone()) {
             Some((mut d, layers)) => {
                 if d.name != st.doc.name {
                     Arc::make_mut(&mut d).name.clone_from(&st.doc.name);
@@ -81,7 +91,11 @@ impl Session {
                 true
             }
             None => false,
+        };
+        if changed {
+            let _ = self.capture_local_edit("edit.redo");
         }
+        changed
     }
 }
 

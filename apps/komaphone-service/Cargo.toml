@@ -1,0 +1,34 @@
+[package]
+name = "photocraft-sync"
+description = "Komaphone private durable room service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+photocraft-party = { path = "../../crates/party" }
+photocraft-format = { workspace = true }
+photocraft-compose = { workspace = true }
+photocraft-doc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+getrandom = { workspace = true }
+clap = { workspace = true }
+sha2 = "0.10"
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "blob", "backup"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+image = { workspace = true, features = ["png"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
+photocraft-color = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-cms = { workspace = true }
