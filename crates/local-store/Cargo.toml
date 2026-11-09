@@ -16,7 +16,7 @@ photocraft-party = { path = "../party" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
