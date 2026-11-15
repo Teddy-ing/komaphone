@@ -22,6 +22,12 @@ fn context_entries(app: &PhotocraftApp, menu: &crate::canvas_tool_menu::CanvasTo
 
 /// Snapshot of everything on screen, addressable by id.
 pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
+    with_world_hash(app, ctx, true)
+}
+
+/// Frame probes may omit the full retained-history digest. This never changes
+/// the scene or the default inspection response's exact canonical hash.
+pub(super) fn with_world_hash(app: &PhotocraftApp, ctx: &egui::Context, world_hash: bool) -> Value {
     let screen = ctx.content_rect();
     let mut dialogs: Vec<Value> =
         app.ui.dialogs.iter().map(|d| json!({"id": d.id, "kind": d.kind, "title": crate::dialogs::title(d), "fields": d.fields})).collect();
@@ -29,8 +35,140 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         dialogs.push(json!({"id": SHELL_DIALOG, "kind": kind, "title": crate::workspace_ui::title(kind), "fields": fields}));
     }
     dialogs.extend(crate::discard_ui::inspect(app));
-    let room_controls = [
+    let mut room_controls = [
         "workspace.room",
+        "workspace.gallery",
+        "home.gallery",
+        "home.canvases",
+        "workspace.canvases",
+        "home.worlds",
+        "workspace.worlds",
+        "world.local",
+        "world.return",
+        "world.name",
+        "world.invitation",
+        "world.invitation.copy",
+        "world.invitation.accept",
+        "world.section.accept",
+        "world.section.people",
+        "world.people.refresh",
+        "world.section.review",
+        "world.section.tours",
+        "world.section.media",
+        "world.section.restore",
+        "world.restore.path",
+        "komaphone.world.restore",
+        "world.section.bookmarks",
+        "world.section.recovery",
+        "world.section.trash",
+        "komaphone.world.trash",
+        "komaphone.world.delete",
+        "komaphone.world.stroke.paste",
+        "world.export.path",
+        "world.export.png",
+        "world.export.gif",
+        "world.export.sequence",
+        "world.export.archive",
+        "gallery.world",
+        "gallery.worldStill",
+        "world.tool.brush",
+        "world.tool.eraser",
+        "world.tool.pan",
+        "world.width",
+        "world.drawing",
+        "world.review.scrub",
+        "world.review.speed",
+        "komaphone.world.create",
+        "komaphone.world.list",
+        "komaphone.world.rename",
+        "komaphone.world.invite",
+        "komaphone.world.remove",
+        "komaphone.world.leave",
+        "komaphone.world.home",
+        "komaphone.world.undo",
+        "komaphone.world.redo",
+        "komaphone.world.bookmark",
+        "komaphone.world.go",
+        "komaphone.world.bookmark.remove",
+        "komaphone.world.review.begin",
+        "komaphone.world.review.control",
+        "komaphone.world.review.markSeen",
+        "komaphone.world.tour.put",
+        "komaphone.world.tour.play",
+        "komaphone.world.tour.remove",
+        "komaphone.world.tour.control",
+        "komaphone.world.export",
+        "komaphone.world.export.cancel",
+        "komaphone.world.remix.prepare",
+        "komaphone.world.remix.place",
+        "komaphone.world.remix.copy",
+        "komaphone.world.remix.paste",
+        "canvas.return",
+        "canvas.shared",
+        "canvas.name",
+        "canvas.rename",
+        "canvas.bookmarkName",
+        "canvas.tool.brush",
+        "canvas.tool.eraser",
+        "canvas.tool.pan",
+        "canvas.width",
+        "canvas.lockWidth",
+        "canvas.drawing",
+        "canvas.retryStroke",
+        "canvas.close.keep",
+        "canvas.close.discard",
+        "canvas.close.retry",
+        "canvas.recoverStroke",
+        "canvas.color",
+        "canvas.flight.pause",
+        "canvas.flight.resume",
+        "canvas.flight.cancel",
+        "komaphone.canvas.create",
+        "komaphone.canvas.rename",
+        "komaphone.canvas.bookmark",
+        "komaphone.canvas.home",
+        "komaphone.canvas.undo",
+        "komaphone.canvas.redo",
+        "komaphone.canvas.retry",
+        "gallery.finishedMode",
+        "gallery.storage",
+        "gallery.storagePath",
+        "gallery.restoreDestination",
+        "gallery.draw",
+        "gallery.rename",
+        "gallery.trash",
+        "gallery.remixStill",
+        "gallery.favorites",
+        "gallery.filter",
+        "gallery.trashFilter",
+        "gallery.source",
+        "gallery.continue",
+        "gallery.kind",
+        "gallery.notes",
+        "gallery.gifPreview",
+        "gallery.replaySpeed",
+        "komaphone.gallery.import",
+        "komaphone.gallery.list",
+        "komaphone.gallery.update",
+        "komaphone.gallery.history",
+        "komaphone.gallery.cancelDownload",
+        "komaphone.gallery.backup",
+        "komaphone.gallery.restore",
+        "komaphone.gallery.download",
+        "gallery.replayMode",
+        "gallery.animationPlay",
+        "gallery.replayPlay",
+        "gallery.replayStep",
+        "gallery.frame",
+        "gallery.fps",
+        "gallery.loop",
+        "gallery.path",
+        "gallery.name",
+        "gallery.export.gif",
+        "gallery.export.png",
+        "gallery.export.sequence",
+        "gallery.export.archive",
+        "komaphone.gallery.remix",
         "komaphone.room.connect",
         "komaphone.room.create",
         "komaphone.room.ready",
@@ -67,12 +205,85 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
     .into_iter()
     .filter_map(|id| crate::komaphone_workspace::control_rect(ctx, id).map(|rect| (id.to_owned(), json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]))))
     .collect::<serde_json::Map<String, Value>>();
+    for item in &app.session.gallery.items {
+        for id in [format!("gallery.item.{}", item.id.as_str()), format!("gallery.item.{}.{}", item.id.as_str(), if item.draft { "draft" } else { "original" })]
+        {
+            if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+                room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+            }
+        }
+    }
+    for game in &app.session.gallery.remote {
+        let id = format!("gallery.remote.{}", game.game.as_str());
+        if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+            room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+        }
+    }
+    let canvas_ids = app.session.canvases.items.iter().map(|item| format!("canvas.open.{}", item.id.as_str())).chain(
+        app.session
+            .canvases
+            .active
+            .iter()
+            .flat_map(|a| a.bookmarks.iter().enumerate().flat_map(|(i, _)| [format!("canvas.bookmark.{i}.go"), format!("canvas.bookmark.{i}.play")])),
+    );
+    for id in canvas_ids {
+        if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+            room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+        }
+    }
+    for item in &app.session.worlds.items {
+        for id in [format!("world.open.{}", item.canvas.as_str()), format!("world.thumbnail.{}", item.canvas.as_str())] {
+            if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+                room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+            }
+        }
+    }
+    for item in &app.session.worlds.trash {
+        let id = format!("world.undelete.{}", item.canvas.as_str());
+        if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+            room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+        }
+    }
+    if let Some(active) = &app.session.worlds.active {
+        for stroke in active.canonical.strokes.keys() {
+            let id = format!("world.stroke.copy.{}", stroke.as_str());
+            if let Some(rect) = crate::komaphone_workspace::control_rect(ctx, &id) {
+                room_controls.insert(id, json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]));
+            }
+        }
+    }
+    // Explicit inspection only, never the paint loop. Keep sampled metadata bounded;
+    // invitation capabilities and local credential material are deliberately absent.
+    let world_scene = app.session.worlds.active.as_ref().map(|active| {
+        json!({
+            "canvas":active.info.canvas,"revision":active.canonical.revision,
+            "canonicalHash":world_hash.then(|| active.canonical.canonical_hash().ok()).flatten(),
+            "hashIncluded":world_hash,"strokeCount":active.display.strokes.len(),
+            "sampleLimit":128,"strokes":active.display.strokes.values().take(128).map(|stroke|json!({
+                "id":stroke.stroke.id,"owner":stroke.stroke.owner,"device":stroke.device,"samples":stroke.stroke.points.len(),
+                "visible":stroke.visible,"createdRevision":stroke.created_revision,"changedRevision":stroke.changed_revision,
+                "erase":stroke.stroke.erase,"provenance":stroke.provenance
+            })).collect::<Vec<_>>()
+        })
+    });
+    let mut world_ui = json!(app.ui.world);
+    world_ui["frameSamples"] = json!(app.ui.world.tools.frame_samples);
+    #[cfg(not(target_arch = "wasm32"))]
+    let world_render = json!({"render_ms":app.world_render.render_ms,"preparing":app.world_render.preparing,"rendered_revision":app.world_render.rendered_revision,"stats":app.world_render.stats});
+    #[cfg(target_arch = "wasm32")]
+    let world_render = Value::Null;
     json!({
         "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
         "scratch": photocraft_raster::spill::stats(),
         "memory": photocraft_raster::memory::stats(),
         "tool": app.ui.tool,
         "komaphone": app.ui.komaphone,
+        "gallery": app.ui.gallery,
+        "canvases": app.ui.canvas,
+        "world": world_ui,
+        "worldRender": world_render,
+        "worldScene": world_scene,
+        "canvasFrameSamples": app.ui.canvas.frame_samples,
         "rooms": app.ui.rooms,
         "roomStatus": app.session.rooms.status,
         "roomImageCache": crate::komaphone_game_view::cached_hashes(ctx),

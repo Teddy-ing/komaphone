@@ -1,0 +1,30 @@
+{
+  "admin": { "disabled": true },
+  "storage": {
+    "module": "file_system",
+    "root": "/tmp/komaphone-k65-acme-staging-PREPARED-ONLY/data"
+  },
+  "apps": {
+    "tls": {
+      "certificates": { "automate": ["komaphone.tedsoftware.org"] },
+      "automation": {
+        "renew_interval": "1h",
+        "policies": [{
+          "subjects": ["komaphone.tedsoftware.org"],
+          "renewal_window_ratio": 0.3333333333333333,
+          "issuers": [{
+            "module": "acme",
+            "ca": "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "test_ca": "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "acme_timeout": "120s",
+            "challenges": {
+              "bind_host": "127.0.0.1",
+              "http": { "alternate_port": 49080 },
+              "tls-alpn": { "disabled": true }
+            }
+          }]
+        }]
+      }
+    }
+  }
+}

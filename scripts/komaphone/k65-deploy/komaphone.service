@@ -1,0 +1,47 @@
+[Unit]
+Description=Komaphone hosted private sync service
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/komaphone
+ConditionPathIsMountPoint=/var/lib/komaphone
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=komaphone
+Group=komaphone
+WorkingDirectory=/var/lib/komaphone
+EnvironmentFile=/etc/komaphone/service.env
+ExecStart=/opt/komaphone/current/photocraft-sync --bind 127.0.0.1:43127 --data-dir /var/lib/komaphone --quota-mib 2048 --canvas-member-limit 4096 --canvas-presence-limit 256 --google-client-id ${KOMAPHONE_GOOGLE_CLIENT_ID}
+ExecStartPost=/usr/bin/python3 /opt/komaphone/current/hosted-probe.py --wait-seconds 30
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/komaphone
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+TasksMax=128
+MemoryHigh=768M
+MemoryMax=1G
+LimitNOFILE=4096
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

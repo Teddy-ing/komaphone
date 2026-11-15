@@ -1,0 +1,26 @@
+{
+	# Supply the administrator-controlled DNS hostname, with A/AAAA pointing here.
+	# No access log: bearer headers, invitation payloads and user data are private.
+	admin localhost:2019
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 30s
+			idle 60s
+		}
+	}
+}
+
+{$KOMAPHONE_HOSTNAME} {
+	encode gzip
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy 127.0.0.1:43127 {
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 30s
+		}
+	}
+}

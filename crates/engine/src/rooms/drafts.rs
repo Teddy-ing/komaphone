@@ -170,12 +170,12 @@ fn add_bounded(objects: &mut BTreeMap<AssetHash, Vec<u8>>, bytes: Vec<u8>, manif
     }
     Ok(asset)
 }
-fn checkpoint(objects: &mut BTreeMap<AssetHash, Vec<u8>>, doc: &Document) -> std::result::Result<CheckpointRef, String> {
+pub(crate) fn checkpoint(objects: &mut BTreeMap<AssetHash, Vec<u8>>, doc: &Document) -> std::result::Result<CheckpointRef, String> {
     let bytes = photocraft_format::save_to_bytes(doc, &Default::default()).map_err(|e| e.to_string())?;
     let id = CheckpointId::new(&short_hash(&bytes)?).map_err(|e| e.to_string())?;
     Ok(CheckpointRef { id, asset: add_bounded(objects, bytes, false)? })
 }
-fn pack_history(objects: &mut BTreeMap<AssetHash, Vec<u8>>, keep: [AssetHash; 2]) -> std::result::Result<Vec<AssetRef>, String> {
+pub(crate) fn pack_history(objects: &mut BTreeMap<AssetHash, Vec<u8>>, keep: [AssetHash; 2]) -> std::result::Result<Vec<AssetRef>, String> {
     let history = std::mem::take(objects);
     let mut group = Vec::new();
     let mut size = 10u64;

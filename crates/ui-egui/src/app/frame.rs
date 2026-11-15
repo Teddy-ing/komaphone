@@ -25,11 +25,30 @@ impl PhotocraftApp {
     pub fn logic_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.session.poll_local_projects();
         self.session.poll_rooms();
+        if let Some(url) = self.session.rooms.take_browser_url() {
+            crate::account_browser::open(self, &url);
+        }
+        self.session.poll_gallery();
+        self.session.poll_canvases();
+        self.session.poll_worlds();
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::world_probe::drain(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::komaphone_world::prune(self, ctx);
+        crate::komaphone_gallery::prune_textures(self, ctx);
         crate::komaphone_game_view::sync(self, ctx);
         if self.session.rooms.available() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if self.session.local_projects.has_pending() || self.session.local_replay.pending_len() > 0 {
+        if self.session.local_projects.has_pending()
+            || self.session.local_replay.pending_len() > 0
+            || self.session.gallery.busy()
+            || self.session.gallery.downloading
+            || self.session.canvases.has_pending()
+            || self.session.canvases.flight.is_some()
+            || self.session.worlds.busy()
+            || (self.ui.world.open && self.session.worlds.active.is_some())
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(25));
         }
         self.cap_frame_rate();
@@ -47,6 +66,7 @@ impl PhotocraftApp {
         self.frame += 1;
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame_time) as f32;
+        self.session.tick_canvas_flight(f64::from(dt));
         if dt > 0.0 {
             self.fps = self.fps * 0.9 + (1.0 / dt).min(240.0) * 0.1;
         }
@@ -62,6 +82,7 @@ impl PhotocraftApp {
         // sees their released budget.
         self.drain_captures(ctx);
         self.drain_control(ctx);
+        self.cancel_stale_canvas_pass(ctx);
         native_menu::run(self, ctx);
         view_cmds::leave_full_screen_without_document(self, ctx);
         // Switching tools commits, also between the Type and Type Mask tools.
@@ -95,7 +116,13 @@ impl PhotocraftApp {
             crate::dialogs::filter_preview_worker::discard_closed(self);
             if type_tool::in_ui_pass(ctx) {
                 if self.fonts_ready {
-                    shortcuts::handle(self, ctx);
+                    if self.ui.world.open {
+                        crate::komaphone_world::shortcuts(self, ctx);
+                    } else if self.ui.canvas.open {
+                        crate::komaphone_canvas::shortcuts(self, ctx);
+                    } else {
+                        shortcuts::handle(self, ctx);
+                    }
                 } else {
                     type_tool::controls_only(self, ctx);
                 }
@@ -147,6 +174,13 @@ impl PhotocraftApp {
     /// including when this body returns early without drawing an editor.
     pub fn ui_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.world_probe.begin_pass();
+        if self.cancel_stale_canvas_pass(&ctx) {
+            self.canvas_input_cancelled = false;
+            self.finish_frame(0.0);
+            return;
+        }
         // One control owner even when this callback cannot draw the custom editor.
         if !self.fonts_ready
             || !self.ui.dialogs.is_empty()
@@ -185,6 +219,16 @@ impl PhotocraftApp {
         }
         let t0 = gpu_canvas::now_ms();
         self.perf.stage.ui_start(t0, frame.info().cpu_usage);
+        if self.ui.canvas.open
+            && let Some(seconds) = frame.info().cpu_usage
+        {
+            self.ui.canvas.record_frame(self.frame, f64::from(seconds) * 1000.0, ctx.input(|i| i.time));
+        }
+        if self.ui.world.open
+            && let Some(seconds) = frame.info().cpu_usage
+        {
+            self.ui.world.tools.record_frame(self.frame, f64::from(seconds) * 1000.0, ctx.input(|input| input.time));
+        }
         // A software adapter or CPU mode chosen at startup is every document's reason.
         crate::render_path::frame(self);
         // Every frame that started its stage record closes it, whichever way `ui_body` returns.
@@ -232,6 +276,8 @@ impl PhotocraftApp {
         // Issue any due `ui.screenshot` now that this pass's state is settled: a queued request
         // that has waited its passes and animation delay captures exactly this frame.
         self.issue_captures(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::world_probe::issue(self, &ctx);
         // Last, after everything drawn this frame: a lost window device can't draw it (#3438).
         gpu_status::check_window(self, &ctx);
     }
@@ -285,14 +331,20 @@ impl PhotocraftApp {
         }
         // In Full Screen Mode, Tab shows the menu bar, options bar, toolbar and dock (#6760).
         let tabbed_in = !chrome && self.ui.panels.full_screen_chrome;
-        if self.ui.komaphone.enabled && (chrome || tabbed_in) {
+        if self.ui.world.open {
+            crate::komaphone_world::show(self, ui);
+        } else if self.ui.canvas.open {
+            crate::komaphone_canvas::show(self, ui);
+        } else if self.ui.komaphone.enabled && (chrome || tabbed_in) {
             crate::komaphone_workspace::chrome(self, ui);
-            if !crate::komaphone_game_view::has_reveal(self) {
+            if !self.ui.gallery.open && !crate::komaphone_game_view::has_reveal(self) {
                 crate::komaphone_game_view::reference_panel(self, ui);
             }
             let t = theme::Tokens::get(&ctx);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
-                if crate::komaphone_game_view::has_reveal(self) {
+                if self.ui.gallery.open {
+                    crate::komaphone_gallery::show(self, ui);
+                } else if crate::komaphone_game_view::has_reveal(self) {
                     crate::komaphone_game_view::reveal(self, ui);
                 } else if self.session.documents().is_empty() {
                     crate::komaphone_workspace::home(self, ui);

@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod canonical_color;
 pub mod contracts;
+pub mod gallery;
 pub mod protocol;
 pub mod replay_artifact;
 pub mod room;

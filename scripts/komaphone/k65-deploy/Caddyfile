@@ -1,0 +1,25 @@
+{
+	admin localhost:2019
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 30s
+			idle 60s
+		}
+	}
+}
+
+komaphone.tedsoftware.org {
+	# Never enable access/body/header logging for login or invitation requests.
+	encode gzip
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy 127.0.0.1:43127 {
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 30s
+		}
+	}
+}

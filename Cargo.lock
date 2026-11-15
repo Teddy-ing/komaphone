@@ -3446,7 +3446,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3608,6 +3608,22 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "11.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -4971,6 +4987,7 @@ version = "5.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d8c8b8e725ad26404d6896eb2f064294a0a7b4f1d9120210d85544684c4ca95"
 dependencies = [
+ "dunce",
  "is-wsl",
  "libc",
 ]
@@ -5308,9 +5325,12 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "wgpu",
+ "winsafe",
+ "winx",
 ]
 
 [[package]]
@@ -5433,11 +5453,13 @@ dependencies = [
  "photocraft-raster",
  "photocraft-raw",
  "photocraft-room-client",
+ "photocraft-scene",
  "photocraft-testkit",
  "photocraft-text",
  "photocraft-vector",
  "rayon",
  "roxmltree 0.21.1",
+ "rusqlite",
  "same-file",
  "semver",
  "serde",
@@ -5562,6 +5584,7 @@ dependencies = [
  "photocraft-format",
  "photocraft-party",
  "photocraft-raster",
+ "photocraft-scene",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5665,15 +5688,29 @@ dependencies = [
 name = "photocraft-room-client"
 version = "0.20.1"
 dependencies = [
+ "base64 0.22.1",
+ "chrono",
  "getrandom 0.3.4",
  "keyring",
+ "open",
  "photocraft-party",
+ "photocraft-scene",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "photocraft-scene"
+version = "0.20.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 
@@ -5686,6 +5723,7 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "image",
+ "jsonwebtoken",
  "photocraft-cms",
  "photocraft-color",
  "photocraft-compose",
@@ -5693,6 +5731,7 @@ dependencies = [
  "photocraft-format",
  "photocraft-party",
  "photocraft-raster",
+ "photocraft-scene",
  "reqwest",
  "rusqlite",
  "serde",
@@ -5701,6 +5740,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -6310,6 +6350,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"

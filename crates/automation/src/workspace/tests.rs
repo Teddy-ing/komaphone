@@ -1054,3 +1054,12 @@ fn absolute_paths_are_checked_against_the_authority_s_own_root() {
     let none = AuthorizedWorkspace::default();
     assert!(none.read(&target.to_string_lossy()).is_err());
 }
+
+#[test]
+fn gallery_file_actions_cannot_bypass_ambient_path_authority() {
+    for command in ["komaphone.gallery.export", "komaphone.gallery.import", "komaphone.gallery.backup", "komaphone.gallery.restore"] {
+        assert!(authorize_engine_command(command, &serde_json::json!({"path":"private.bin","destination":"other"})).is_err());
+    }
+    assert!(authorize_engine_command("komaphone.gallery.list", &serde_json::json!({})).is_ok());
+    assert!(authorize_engine_command("komaphone.gallery.remix", &serde_json::json!({"chain":0})).is_ok());
+}

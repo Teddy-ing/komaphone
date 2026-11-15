@@ -1,5 +1,50 @@
 use super::*;
 
+#[test]
+fn world_frame_inspection_can_omit_hash_without_changing_scene_or_default_evidence() {
+    use photocraft_engine::{scene, worlds};
+    use std::sync::Arc;
+    let canvas = scene::CanvasId::new("00000000000000000000000000000001").unwrap();
+    let owner = scene::OwnerId::new("00000000000000000000000000000002").unwrap();
+    let state = Arc::new(scene::shared::WorldState::new(canvas, owner, "Hash probe".into()).unwrap());
+    let expected = state.canonical_hash().unwrap();
+    let mut session = photocraft_engine::Session::new();
+    session.worlds.active = Some(worlds::Canvas {
+        info: scene::world_protocol::CanvasSummary {
+            canvas,
+            owner,
+            name: "Hash probe".into(),
+            initial_name: "Hash probe".into(),
+            revision: 0,
+            epoch: 1,
+            import_origin: None,
+        },
+        canonical: Arc::clone(&state),
+        display: Arc::clone(&state),
+        pending: 0,
+        viewer: worlds::Viewer { camera: scene::coordinates::home(canvas), bookmarks: vec![], review: None },
+        notice: None,
+    });
+    let mut app = PhotocraftApp::new(session, crate::Services::default());
+    let ctx = egui::Context::default();
+    let full = call(&mut app, &ctx, "ui.inspect", json!({}));
+    let fast = call(&mut app, &ctx, "ui.inspect", json!({"worldHash":false}));
+    assert_eq!(full["result"]["worldScene"]["canonicalHash"], expected);
+    assert_eq!(full["result"]["worldScene"]["hashIncluded"], true);
+    assert!(fast["result"]["worldScene"]["canonicalHash"].is_null());
+    assert_eq!(fast["result"]["worldScene"]["hashIncluded"], false);
+    let mut full_scene = full["result"]["worldScene"].as_object().unwrap().clone();
+    let mut fast_scene = fast["result"]["worldScene"].as_object().unwrap().clone();
+    for key in ["canonicalHash", "hashIncluded"] {
+        full_scene.remove(key);
+        fast_scene.remove(key);
+    }
+    assert_eq!(full_scene, fast_scene);
+    assert_eq!(app.session.worlds.active.as_ref().unwrap().canonical.canonical_hash().unwrap(), expected);
+    assert_eq!(call(&mut app, &ctx, "ui.inspect", Value::Null)["result"]["worldScene"]["canonicalHash"], expected);
+    assert_eq!(call(&mut app, &ctx, "ui.inspect", json!({"worldHash":"false"}))["ok"], false);
+}
+
 fn call(app: &mut PhotocraftApp, ctx: &egui::Context, method: &str, params: Value) -> Value {
     let (req, _rx) = ControlRequest::new(method, params);
     match handle(app, ctx, &req) {
@@ -2178,13 +2223,22 @@ fn ui_key_rejects_bad_params_before_queueing_input() {
 fn ui_screenshot_rejects_bad_params_before_capturing() {
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
     let ctx = egui::Context::default();
-    for (params, names) in [(json!({"focus": "yes"}), "focus"), (json!({"path": 5}), "path"), (json!({"pth": "shot.png"}), "pth")] {
+    for (params, names) in
+        [(json!({"focus": "yes"}), "focus"), (json!({"settle": 0}), "settle"), (json!({"path": 5}), "path"), (json!({"pth": "shot.png"}), "pth")]
+    {
         rejected(&mut app, &ctx, "ui.screenshot", params, names);
     }
-    for (params, path) in [(json!({}), None), (Value::Null, None), (json!({"path": "shot.png", "focus": false}), Some("shot.png"))] {
+    for (params, path, expected_settle) in [
+        (json!({}), None, true),
+        (Value::Null, None, true),
+        (json!({"settle": null}), None, true),
+        (json!({"path": "shot.png", "focus": false}), Some("shot.png"), true),
+        (json!({"settle": false}), None, false),
+    ] {
         let (req, _rx) = ControlRequest::new("ui.screenshot", params.clone());
-        let Outcome::Screenshot { path: queued, .. } = handle(&mut app, &ctx, &req) else { panic!("{params}: expected a capture") };
+        let Outcome::Screenshot { path: queued, settle, .. } = handle(&mut app, &ctx, &req) else { panic!("{params}: expected a capture") };
         assert_eq!(queued.as_deref(), path, "{params}");
+        assert_eq!(settle, expected_settle, "{params}");
     }
 }
 

@@ -7,11 +7,14 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod account_cmds;
 mod actions_record;
 pub mod adjust_params;
 mod allocation;
 pub mod build_info;
 mod canvas_geom;
+pub mod canvas_link_cmds;
+pub mod canvases;
 mod channel_clip;
 mod clip_group;
 pub mod color_channels;
@@ -20,6 +23,13 @@ pub mod display_color;
 pub mod doc_path;
 pub mod filters;
 pub mod filters_ext;
+pub mod gallery;
+pub mod world_cmds;
+mod world_recovery;
+pub mod world_thumbnails;
+pub mod worlds;
+pub use photocraft_scene as scene;
+pub mod gallery_media;
 mod group_options;
 pub mod guide_layout;
 pub mod hidden_target;
@@ -32,6 +42,8 @@ pub mod layer_style;
 pub mod link_watch;
 pub mod local_projects;
 pub mod rooms;
+pub mod world_assets;
+pub mod world_media;
 pub use photocraft_party as party;
 pub mod local_replay;
 pub mod malloc_tuning;
@@ -193,6 +205,10 @@ pub(crate) fn active_layer_of(s: &Session) -> std::result::Result<&photocraft_do
 
 #[derive(Default)]
 pub struct Session {
+    pub gallery: gallery::Gallery,
+    pub canvases: canvases::Canvases,
+    /// Keep optional collaborative state off the stack when constructing or moving a session.
+    pub worlds: Box<worlds::Worlds>,
     pub rooms: rooms::Rooms,
     pub local_projects: local_projects::LocalProjects,
     pub local_replay: local_replay::Recorder,

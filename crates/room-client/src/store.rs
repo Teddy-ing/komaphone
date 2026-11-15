@@ -9,11 +9,12 @@ use std::path::Path;
 use std::time::Duration;
 
 const APPLICATION_ID: u32 = 0x4b524f4d;
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const MAX_PENDING: usize = 8192;
 const MAX_PENDING_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_STATE_BYTES: usize = 5 * 1024 * 1024;
 
+mod hosted;
 #[path = "store_notes.rs"]
 mod notes;
 
@@ -27,6 +28,20 @@ struct SavedState {
     last_invitation: Option<(RoomId, RequestId, u64)>,
     #[serde(default)]
     frozen: Option<(RoomId, photocraft_party::AssignmentId, u64)>,
+    #[serde(default)]
+    slot: String,
+    #[serde(default)]
+    hosted_device: Option<DeviceId>,
+    #[serde(default)]
+    session_expires_at_ms: u64,
+    #[serde(default)]
+    legacy_unscoped_credential: bool,
+    #[serde(default)]
+    linking_legacy: bool,
+    #[serde(default)]
+    relocation: Option<crate::AccountRelocation>,
+    #[serde(default)]
+    relocation_session: Option<hosted::relocation::StagedSession>,
 }
 
 /// SQLite owns a durable client identity, last authorized room view and exact outbox.
@@ -36,6 +51,7 @@ pub struct Outbox {
     db: Connection,
     state: SavedState,
     credentials: Box<dyn CredentialStore>,
+    accounts: Vec<crate::AccountSlot>,
 }
 
 pub(crate) fn random_hex(bytes: usize) -> Result<String> {
@@ -65,11 +81,11 @@ impl Outbox {
         if let Some(parent) = path.as_ref().parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| Error::Storage(e.to_string()))?;
         }
-        let mut db = Connection::open(path).map_err(sql)?;
+        let mut db = Connection::open(path.as_ref()).map_err(sql)?;
         db.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(sql)?;
         let app: u32 = db.pragma_query_value(None, "application_id", |row| row.get(0)).map_err(sql)?;
-        if (version != 0 && (version != SCHEMA || app != APPLICATION_ID)) || (app != 0 && app != APPLICATION_ID) {
+        if (version != 0 && (!matches!(version, 1 | SCHEMA) || app != APPLICATION_ID)) || (app != 0 && app != APPLICATION_ID) {
             return Err(Error::Storage("Unsupported room database; preserve it and upgrade".into()));
         }
         if version == 0 {
@@ -92,6 +108,9 @@ impl Outbox {
             return Err(Error::Storage("Invalid database page size".into()));
         }
         db.pragma_update(None, "max_page_count", 512 * 1024 * 1024i64 / page_size).map_err(sql)?;
+        if version == 1 {
+            hosted::backup_v1(&db, path.as_ref())?;
+        }
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         transaction
             .execute_batch(
@@ -105,6 +124,7 @@ impl Outbox {
                 body BLOB NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(endpoint,room,game,chain,round));",
             )
             .map_err(sql)?;
+        hosted::initialize(&transaction)?;
         transaction.pragma_update(None, "application_id", APPLICATION_ID).map_err(sql)?;
         transaction.pragma_update(None, "user_version", SCHEMA).map_err(sql)?;
         transaction.commit().map_err(sql)?;
@@ -119,7 +139,7 @@ impl Outbox {
                 }
                 let mut saved: SavedState =
                     serde_json::from_slice(&body).map_err(|_| Error::Storage("Invalid room metadata; preserve this database for recovery".into()))?;
-                if saved.schema != SCHEMA {
+                if !matches!(saved.schema, 1 | SCHEMA) {
                     return Err(Error::Storage("Unsupported room metadata schema".into()));
                 }
                 if let Some(endpoint) = &saved.status.endpoint {
@@ -129,6 +149,24 @@ impl Outbox {
                     profile.validate().map_err(|e| Error::Storage(e.to_string()))?;
                 }
                 saved.status.connected = false;
+                if saved.schema == 1 {
+                    saved.legacy_unscoped_credential = true;
+                }
+                saved.schema = SCHEMA;
+                if saved.slot.is_empty() {
+                    saved.slot = random_hex(16)?;
+                }
+                hosted::validate_saved(&saved)?;
+                if saved.status.signing_in && saved.linking_legacy {
+                    saved.status.hosted = false;
+                    saved.linking_legacy = false;
+                    saved.active = false;
+                }
+                saved.status.signing_in = false;
+                if saved.status.hosted && (!saved.status.signed_in || saved.session_expires_at_ms <= hosted::now_ms()?) {
+                    saved.status.signed_in = false;
+                    saved.active = false;
+                }
                 saved.status.remember_game_draft()?;
                 saved
             }
@@ -137,30 +175,52 @@ impl Outbox {
                 if exists {
                     return Err(Error::Storage("Room metadata exceeds its size limit".into()));
                 }
-                SavedState { schema: SCHEMA, namespace: random_hex(16)?, status: ClientStatus::default(), active: true, last_invitation: None, frozen: None }
+                SavedState {
+                    schema: SCHEMA,
+                    namespace: random_hex(16)?,
+                    status: ClientStatus::default(),
+                    active: true,
+                    last_invitation: None,
+                    frozen: None,
+                    slot: random_hex(16)?,
+                    hosted_device: None,
+                    session_expires_at_ms: 0,
+                    legacy_unscoped_credential: false,
+                    linking_legacy: false,
+                    relocation: None,
+                    relocation_session: None,
+                }
             }
         };
-        let mut store = Self { db, state, credentials };
+        let mut store = Self { db, state, credentials, accounts: Vec::new() };
+        if store.state.status.hosted && store.state.status.signed_in && store.hosted_credential().is_err() {
+            store.state.status.signed_in = false;
+            store.state.active = false;
+            store.state.status.notice = Some("Saved sign-in is unavailable; sign in again. Local artwork is retained".into());
+        }
         notes::migrate(&mut store.db, &store.state.status)?;
         store.rebuild_submission_index()?;
         store.refresh_counts()?;
         store.save_state()?;
+        store.refresh_accounts()?;
         Ok(store)
     }
 
     pub fn status(&self) -> ClientStatus {
-        self.state.status.clone()
+        self.hosted_status()
     }
     pub fn active(&self) -> bool {
-        self.state.active
+        self.state.relocation.is_none() && self.state.active && (!self.state.status.hosted || self.hosted_session_current())
     }
     /// Recover this device's latest locally saved note for an assignment, including
     /// skipped/incomplete games. This never fetches service notes or changes the
     /// current party projection; historical notes must stay outside active games.
     pub fn saved_note(&self, endpoint: &str, room: RoomId, assignment: photocraft_party::AssignmentId) -> Result<Option<crate::NoteDraft>> {
+        self.check_hosted_access()?;
         notes::read(&self.db, &normalize_endpoint(endpoint)?, room, assignment)
     }
     pub fn save_note(&mut self, draft: crate::NoteDraft) -> Result<()> {
+        self.check_hosted_access()?;
         photocraft_party::validate_label(&draft.note, photocraft_party::MAX_NOTE_BYTES, true).map_err(|e| Error::Invalid(e.to_string()))?;
         let room = self.state.status.room.as_ref().ok_or_else(|| Error::Invalid("No active assignment".into()))?;
         if room.phase != photocraft_party::room::Phase::Drawing
@@ -181,6 +241,7 @@ impl Outbox {
         Ok(())
     }
     pub fn save_reveal_position(&mut self, position: crate::RevealPosition) -> Result<()> {
+        self.check_hosted_access()?;
         let room = self.state.status.room.as_ref().ok_or_else(|| Error::Invalid("No revealed game".into()))?;
         let valid_game = room.reveal.iter().any(|entry| match entry {
             photocraft_party::room::RevealedEntry::Artwork { assignment, .. } | photocraft_party::room::RevealedEntry::Missing { assignment, .. } => {
@@ -209,15 +270,23 @@ impl Outbox {
         Ok(())
     }
     pub fn credential(&self) -> Result<String> {
+        self.ensure_no_relocation()?;
+        if self.state.status.hosted {
+            return self.hosted_credential();
+        }
         let endpoint = self.state.status.endpoint.as_deref().ok_or_else(|| Error::Invalid("Connect to a service first".into()))?;
         self.credentials
-            .get(&self.state.namespace, &credential_key(endpoint))?
+            .get(&self.state.namespace, &self.legacy_credential_key(endpoint))?
             .ok_or_else(|| Error::Credentials("Saved pairing credential is missing; preserve pending work".into()))
     }
 
     /// One stable device identity per data root. A changed address is allowed only when
     /// no request is pending; switching service clears the old room view, not local drafts.
     pub fn configure(&mut self, endpoint: &str, display_name: &str) -> Result<()> {
+        self.ensure_no_relocation()?;
+        if self.state.status.hosted {
+            return Err(Error::Invalid("This account uses Google sign-in; select a separate local account for legacy pairing".into()));
+        }
         let endpoint = normalize_endpoint(endpoint)?;
         photocraft_party::contracts::validate_label(display_name, 96, false).map_err(|e| Error::Invalid(e.to_string()))?;
         if self.state.status.pending > 0 {
@@ -235,7 +304,7 @@ impl Outbox {
                 display_name: display_name.into(),
             },
         };
-        let key = credential_key(&endpoint);
+        let key = self.legacy_credential_key(&endpoint);
         self.register_credential(&key)?;
         let credential = match self.credentials.get(&self.state.namespace, &key)? {
             Some(secret) => secret,
@@ -276,6 +345,10 @@ impl Outbox {
     /// All upload chunks and the final immutable submission enter one local transaction.
     /// A process kill can leave either the entire pending bundle or none of it.
     pub fn enqueue_batch(&mut self, operations: Vec<Operation>) -> Result<Vec<RequestId>> {
+        self.check_hosted_access()?;
+        if self.state.status.hosted && operations.iter().any(|operation| matches!(operation, Operation::Pair { .. })) {
+            return Err(Error::Invalid("Legacy pairing is not available for a hosted account".into()));
+        }
         if self.state.status.endpoint.is_none() {
             return Err(Error::Invalid("Connect to a service first".into()));
         }
@@ -290,7 +363,12 @@ impl Outbox {
         }
         let bytes = prepared.iter().map(|p| p.body.len() as u64).fold(0u64, u64::saturating_add);
         let count: i64 = self.db.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).map_err(sql)?;
-        let used: i64 = self.db.query_row("SELECT COALESCE(SUM(length(body)),0) FROM outbox", [], |r| r.get(0)).map_err(sql)?;
+        let used: i64 = self
+            .db
+            .query_row("SELECT (SELECT COALESCE(SUM(length(body)),0) FROM outbox) + (SELECT COALESCE(SUM(length(body)),0) FROM account_outbox)", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql)?;
         let count = usize::try_from(count).map_err(|_| Error::Storage("Invalid pending request count".into()))?;
         let used = u64::try_from(used).map_err(|_| Error::Storage("Invalid pending request size".into()))?;
         if count.saturating_add(prepared.len()) > MAX_PENDING || used.saturating_add(bytes) > MAX_PENDING_BYTES {
@@ -334,6 +412,12 @@ impl Outbox {
     }
 
     pub fn next(&self) -> Result<Option<RpcRequest>> {
+        if self.state.relocation.is_some() {
+            return Ok(None);
+        }
+        if self.state.status.hosted && !self.hosted_session_current() {
+            return Ok(None);
+        }
         let record: Option<(Vec<u8>, String, Option<String>)> = self.db.query_row(
             "SELECT CASE WHEN length(body)<=?1 THEN body ELSE NULL END,digest,secret_key FROM outbox WHERE retained=0 AND rejected IS NULL ORDER BY seq LIMIT 1", [MAX_MESSAGE_BYTES as i64],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(sql)?;
@@ -403,8 +487,15 @@ impl Outbox {
     }
 
     pub fn mark_error(&mut self, error: &Error, request: Option<RequestId>, permanent: bool) -> Result<()> {
+        let session_expired = self.state.status.hosted && matches!(error, Error::Rejected { code, .. } if code == "session");
+        if session_expired {
+            self.sign_out_local()?;
+        }
         let message = error.to_string();
-        if permanent && let Some(id) = request {
+        if permanent
+            && !session_expired
+            && let Some(id) = request
+        {
             self.db.execute("UPDATE outbox SET rejected=?1 WHERE request_id=?2", params![message, id.as_str()]).map_err(sql)?;
         }
         self.state.status.error = Some(message);
@@ -414,6 +505,7 @@ impl Outbox {
     }
 
     pub fn retry(&mut self) -> Result<()> {
+        self.check_hosted_access()?;
         self.db.execute("UPDATE outbox SET rejected=NULL WHERE retained=0", []).map_err(sql)?;
         self.state.status.error = None;
         self.state.active = true;
@@ -447,6 +539,7 @@ impl Outbox {
     }
 
     pub fn pin_freeze(&mut self, pin: FreezePin) -> Result<()> {
+        self.check_hosted_access()?;
         let valid = self.state.status.room.as_ref().is_some_and(|room| {
             room.id == pin.room
                 && room.epoch == pin.epoch
@@ -477,6 +570,12 @@ impl Outbox {
     }
 
     pub fn invitation(&self) -> Result<Option<Invitation>> {
+        if self.state.relocation.is_some() {
+            return Ok(None);
+        }
+        if self.state.status.hosted && !self.hosted_session_current() {
+            return Ok(None);
+        }
         let Some((room, id, expires_at_ms)) = self.state.last_invitation else { return Ok(None) };
         let secret = self.credentials.get(&self.state.namespace, &format!("request/{}", id.as_str()))?;
         Ok(secret.map(|secret| Invitation { room, id, secret, expires_at_ms }))
@@ -636,9 +735,6 @@ impl Outbox {
     }
 }
 
-fn credential_key(endpoint: &str) -> String {
-    format!("identity/{}", digest(endpoint.as_bytes()))
-}
 struct Prepared {
     id: RequestId,
     body: Vec<u8>,
@@ -675,6 +771,12 @@ fn write_state(transaction: &Transaction<'_>, state: &SavedState) -> Result<()> 
         return Err(Error::Storage("Room metadata exceeds 5 MiB".into()));
     }
     transaction.execute("INSERT OR REPLACE INTO state(id,body,digest) VALUES(1,?1,?2)", params![body, digest(&body)]).map_err(sql)?;
+    transaction
+        .execute(
+            "INSERT INTO account_slots(id,body,digest) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body,digest=excluded.digest",
+            params![state.slot, body, digest(&body)],
+        )
+        .map_err(sql)?;
     Ok(())
 }
 fn apply_response(state: &mut SavedState, request: &RpcRequest, response: &RpcResponse) -> Result<()> {
@@ -711,7 +813,10 @@ fn apply_response(state: &mut SavedState, request: &RpcRequest, response: &RpcRe
                 state.status.invitation_id = None;
             }
         }
-        (Operation::Disconnect { .. }, RpcResponse::Disconnected) => state.active = false,
+        // Disconnect pauses locally when requested. Its durable service update
+        // may be sent only after a later explicit Retry, so acknowledging that
+        // older update must preserve the current local polling intent.
+        (Operation::Disconnect { .. }, RpcResponse::Disconnected) => {}
         (Operation::Apply { room, action, .. }, RpcResponse::Disconnected) if matches!(action.as_ref(), photocraft_party::room::Action::Leave) => {
             leave_projection(state, *room)?;
         }

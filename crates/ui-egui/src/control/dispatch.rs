@@ -1,5 +1,4 @@
 use super::METHODS;
-use super::inspect::inspect;
 use super::params::{
     BUTTONS, KEY_MODIFIERS, MAX_CLICKS, POINTER_MODIFIERS, UI_SET_FIELDS, bool_field, err, f32_field, f32_range, input_choice, input_modifiers, input_number,
     input_object, merged_object, modifiers_from, num_field, ok, screen_point, uint_field, whole_object,
@@ -31,6 +30,8 @@ fn wait_param(p: &Value) -> bool {
 
 fn engine_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) -> Option<Outcome> {
     Some(match req.method.as_str() {
+        "app.galleryFile" => gallery_file_command(app, &req.params),
+        "app.worldFile" => world_file_command(app, &req.params),
         "ui.context.choose" => context_choose(app, ctx, &req.params),
         "engine.execute" | "ui.menu.invoke" => execute_command(app, ctx, req),
         "engine.commands" => wrap(app.run("command.list", json!({}))),
@@ -45,9 +46,58 @@ fn engine_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlReq
             }
             ok(serde_json::to_value(items).unwrap_or_default())
         }
-        "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.inspect" => {
+            let p = &req.params;
+            let choice =
+                if p.is_null() { Ok(true) } else { input_object(p, None, &["worldHash"]).and_then(|p| Ok(bool_field(&p, "worldHash")?.unwrap_or(true))) };
+            match choice {
+                Ok(world_hash) => ok(super::inspect::with_world_hash(app, ctx, world_hash)),
+                Err(error) => err(error),
+            }
+        }
         _ => return None,
     })
+}
+
+fn gallery_file_command(app: &mut PhotocraftApp, params: &Value) -> Outcome {
+    let Some(fields) = params.as_object() else { return err("gallery file request must be an object") };
+    if fields.keys().any(|key| !matches!(key.as_str(), "command" | "params")) {
+        return err("unknown gallery file request field");
+    }
+    let Some(id) = str_param(params, "command") else { return err("missing gallery file `command`") };
+    if !crate::menus::modal_allows(app, id) {
+        return err("command is unavailable while a modal dialog is open");
+    }
+    let Some(files) = app.services.automation_gallery_files.clone() else { return err("automation gallery filesystem access is not granted") };
+    let command_params = params.get("params").cloned().unwrap_or(json!({}));
+    wrap(app.session.gallery_file_command(id, &command_params, files).map_err(|error| error.to_string()))
+}
+
+fn world_file_command(app: &mut PhotocraftApp, params: &Value) -> Outcome {
+    let Some(fields) = params.as_object() else {
+        return err("world file request must be an object");
+    };
+    if fields.keys().any(|key| !matches!(key.as_str(), "command" | "params")) {
+        return err("unknown world file request field");
+    }
+    let Some(id) = str_param(params, "command") else {
+        return err("missing world file `command`");
+    };
+    if !matches!(id, "komaphone.world.export" | "komaphone.world.restore") {
+        return err("unsupported world file command");
+    }
+    if !crate::menus::modal_allows(app, id) {
+        return err("command is unavailable while a modal dialog is open");
+    }
+    let Some(files) = app.services.automation_world_files.clone() else {
+        return err("automation world filesystem access is not granted");
+    };
+    let parse = if id == "komaphone.world.restore" { photocraft_engine::world_cmds::parse_restore } else { photocraft_engine::world_cmds::parse_export };
+    let action = match parse(params.get("params").unwrap_or(&Value::Null)) {
+        Ok(action) => action,
+        Err(error) => return err(error.to_string()),
+    };
+    wrap(app.session.world_export_with_files(action, files).map(|()| json!({"pending":true,"exported":false})).map_err(|error| error.to_string()))
 }
 
 fn context_choose(app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) -> Outcome {
@@ -181,6 +231,16 @@ fn shell_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequ
             ok(Value::Null)
         }
         "ui.screenshot" => screenshot(app, ctx, p),
+        "ui.worldProbe" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                crate::world_probe::control(app, ctx, p, req.reply.clone())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                err("World pixel observation requires the native renderer")
+            }
+        }
         _ => return None,
     })
 }
@@ -210,9 +270,9 @@ fn simulate_gpu_loss(app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) ->
 }
 
 fn screenshot(app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) -> Outcome {
-    let parsed =
-        input_object(p, None, &["path", "focus"]).and_then(|p| Ok((input_choice(&p, "path", "path", &[])?.map(str::to_string), bool_field(&p, "focus")?)));
-    let (path, focus) = match parsed {
+    let parsed = input_object(p, None, &["path", "focus", "settle"])
+        .and_then(|p| Ok((input_choice(&p, "path", "path", &[])?.map(str::to_string), bool_field(&p, "focus")?, bool_field(&p, "settle")?.unwrap_or(true))));
+    let (path, focus, settle) = match parsed {
         Ok(parsed) => parsed,
         Err(e) => return err(e),
     };
@@ -225,7 +285,7 @@ fn screenshot(app: &mut PhotocraftApp, ctx: &egui::Context, p: &Value) -> Outcom
     // (modals, popups) have settled (see `screenshot.rs`).
     let token = app.ui.alloc_id();
     ctx.request_repaint();
-    Outcome::Screenshot { token, path }
+    Outcome::Screenshot { token, path, settle }
 }
 
 // ---- ui.set: every field is validated and materialized into a `UiSet` before the first one is applied ----
@@ -1085,6 +1145,14 @@ fn input_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequ
     let p = &req.params;
     Some(match req.method.as_str() {
         "ui.pointer" => pointer(app, ctx, p),
+        "ui.worldInput" => super::world_input::input(app, ctx, p),
+        "ui.canvasInput" => {
+            if !app.ui.canvas.open || app.session.canvases.active.is_none() {
+                err("Open a local canvas before sending canvas input")
+            } else {
+                super::canvas_input::input(app, ctx, p)
+            }
+        }
         "ui.click" | "ui.move" => click(app, ctx, p, req.method == "ui.click"),
         "ui.key" => key(app, ctx, p),
         "ui.type" => {

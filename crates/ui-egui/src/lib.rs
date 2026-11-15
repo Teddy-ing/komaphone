@@ -24,6 +24,7 @@ macro_rules! tl {
         $crate::i18n::t($s)
     };
 }
+mod account_browser;
 mod brush_mode_menu;
 pub mod canvas;
 pub mod control;
@@ -38,10 +39,15 @@ mod icon_data;
 pub mod icons;
 pub mod jobs_ui;
 pub mod komaphone_animation;
+pub mod komaphone_canvas;
 pub mod komaphone_corpse;
+pub mod komaphone_gallery;
 pub mod komaphone_game_view;
 pub mod komaphone_rooms;
 pub mod komaphone_workspace;
+pub mod komaphone_world;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod komaphone_world_gpu;
 pub(crate) mod last_brush;
 pub mod links;
 pub mod menu_catalog;
@@ -57,6 +63,8 @@ pub mod screenshot;
 pub mod state;
 pub mod texel_guard;
 pub mod theme;
+#[cfg(not(target_arch = "wasm32"))]
+mod world_probe;
 pub use titlebar::{Caption, CaptionFamily, CaptionIcon, CaptionIcons, CaptionStyle, RenderIconFn};
 pub(crate) mod tool_memory;
 pub mod updates_ui;
@@ -445,6 +453,8 @@ pub struct PhotocraftApp {
     /// `ui.screenshot` requests: bounded admission, a weak-slot callback per issuance, monotonic
     /// deadlines and a capture-time geometry epoch (see `screenshot.rs`).
     captures: screenshot::Captures,
+    #[cfg(not(target_arch = "wasm32"))]
+    world_probe: world_probe::State,
     /// The custom Type tool's IME owner/generation/receipt tracker (`type_tool::sync_ime`).
     pub(crate) type_ime: type_tool::ImeState,
     /// Control replies waiting for queued synthetic input to be processed.
@@ -540,6 +550,9 @@ pub struct PhotocraftApp {
     /// cancelled, not replayed, after the active document (including a switch away and back) or
     /// the focus changes; an edit in the same document does not cancel it.
     synthetic_snapshot: Option<SyntheticTarget>,
+    /// A canvas selection changed after raw input injection. Skip one real UI
+    /// pass, whose egui interaction snapshot may still contain the old click.
+    canvas_input_cancelled: bool,
     /// True only while a frame is processing synthetic automation input. It
     /// makes shortcut- and dialog-triggered commands pass the same policy as
     /// direct control calls.
@@ -661,6 +674,8 @@ pub struct PhotocraftApp {
     /// The render state the GPU canvas was built on, kept after it is dropped so Retry GPU can
     /// build a new one on the same device (see `gpu_status::choose_recovery`, #6577).
     gpu_render_state: Option<eframe::egui_wgpu::RenderState>,
+    #[cfg(not(target_arch = "wasm32"))]
+    world_render: crate::komaphone_world::Presentation,
     /// Why the GPU canvas was dropped (see `gpu_status::fall_back`).
     gpu_fault: Option<photocraft_gpu::Fault>,
     /// Out-of-memory errors this session after which the GPU canvas was rebuilt by itself (#6564).
@@ -732,6 +747,7 @@ pub struct PhotocraftApp {
 struct SyntheticTarget {
     document: Option<screenshot::DocumentId>,
     focus: Option<egui::Id>,
+    canvas: Option<(photocraft_engine::scene::CanvasId, u64)>,
 }
 
 impl SyntheticTarget {
@@ -739,6 +755,7 @@ impl SyntheticTarget {
     /// change); its revision is attribution only, so an edit does not cancel a queued step.
     fn matches(self, other: Self) -> bool {
         self.focus == other.focus
+            && self.canvas == other.canvas
             && match (self.document, other.document) {
                 (Some(a), Some(b)) => a.same_activation(b),
                 (None, None) => true,

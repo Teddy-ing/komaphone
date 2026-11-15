@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Komaphone verified backup
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=komaphone-backup.service
+
+[Install]
+WantedBy=timers.target

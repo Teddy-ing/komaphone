@@ -25,6 +25,34 @@ pub struct ClientStatus {
     pub note_draft: Option<NoteDraft>,
     pub reveal_position: Option<RevealPosition>,
     pub game_drafts: Option<GameDrafts>,
+    /// Hosted authentication state contains no credentials or provider tokens.
+    pub hosted: bool,
+    pub signing_in: bool,
+    pub signed_in: bool,
+    pub accounts: Vec<AccountSlot>,
+    pub account_slot: Option<String>,
+    pub relocation: Option<AccountRelocation>,
+}
+
+/// Locally remembered account labels only; private room/canvas views are excluded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSlot {
+    pub id: String,
+    pub profile: Option<Participant>,
+    pub endpoint: Option<String>,
+}
+
+/// A paused, explicit move to the same service authority at a new address.
+/// No token or provider identity is serialized in this recovery journal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRelocation {
+    pub id: RequestId,
+    pub from_endpoint: String,
+    pub to_endpoint: String,
+    pub profile: photocraft_party::ParticipantId,
+    pub device: photocraft_party::DeviceId,
 }
 
 /// Only this participant's authorized projects in the current game, never opponents' drafts.
@@ -89,6 +117,9 @@ pub struct RevealPosition {
 }
 
 pub mod media;
+pub mod world_replica;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod world_worker;
 
 /// The first observed deadline pins an acknowledged local revision before heavy packing.
 /// This is local durability, not a submission or service acceptance acknowledgment.
@@ -132,11 +163,17 @@ mod credentials;
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
 #[cfg(not(target_arch = "wasm32"))]
+mod gallery_download;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hosted_auth;
+#[cfg(not(target_arch = "wasm32"))]
 mod store;
 #[cfg(not(target_arch = "wasm32"))]
 mod transport;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod world_queue;
 #[cfg(not(target_arch = "wasm32"))]
 pub use credentials::{CredentialStore, WindowsCredentials};
 #[cfg(not(target_arch = "wasm32"))]

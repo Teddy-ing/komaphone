@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+photocraft-scene = { workspace = true }
 photocraft-doc = { workspace = true }
 photocraft-format = { workspace = true }
 photocraft-party = { path = "../party" }
@@ -19,7 +20,7 @@ thiserror = { workspace = true }
 sha2 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup"] }
 getrandom = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 

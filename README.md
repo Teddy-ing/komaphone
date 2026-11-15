@@ -11,10 +11,10 @@ Komaphone is a new party-game project built on [PhotoCraft](https://github.com/s
 3. Play **Animation**: start separate animations, pass frames around with a previous-frame reference and handoff notes, then reveal and export the results.
 4. Play **Exquisite Corpse**: draw heads, bodies, and legs while seeing only the joining strip from the preceding section, then reveal the assembled creatures.
 5. Keep drawings, frame replays, and finished games in a recoverable gallery.
-6. Later, build a persistent shared world with simultaneous drawing, ghost cursors, asynchronous updates, and nested deep zoom.
+6. Create multiple named canvases with continuous deep zoom, each solo or shared with any independently chosen group, with simultaneous drawing, ghost cursors, and asynchronous updates. Example groups are not presets or a four-person limit.
 7. Remix finished creations without changing originals, replay friends' additions since your last visit, and save/export guided zoom tours through the shared world.
 
-The agreed baseline is **Windows first**, **a small private sync service**, and **party modes before the shared world**. The earlier classic prompt/edit/guess proposal is deferred.
+The agreed baseline is **Windows first**, **a small private sync service**, and **party modes before the shared world**. Baseline 1.4 selects GCP hosting and Google sign-in, with a recurring target of USD $20/month or less and approximately $30 acceptable. K6 establishes identity/deployment foundations; K6.5 proves hosted play from separate households; K7 hardens the release. See the [hosting plan](docs/komaphone/hosting-plan.md). The earlier classic prompt/edit/guess proposal is deferred.
 
 Start with the [product specification](docs/komaphone/product-spec.md), [delivery plan](docs/komaphone/delivery-plan.md), and [copyable agent prompts](docs/komaphone/agent-prompts.md). [Implementation status](docs/komaphone/status.md) separates planned work from verified behavior.
 
@@ -22,7 +22,11 @@ Start with the [product specification](docs/komaphone/product-spec.md), [deliver
 
 The native app opens the Komaphone workspace with permanent local drafts, automatic saves, recovery, and durable replay recording. Private local rooms support invitations, two/three-player lobbies, accepted submissions, reconnect, host takeover and timers through a separate Rust service. Animation now includes previous-frame copy, adjustable onion skin, handoff notes and full-chain playback. Exquisite Corpse includes locked seam references and assembled three-part reveals. Full two/three-player games passed native UI and headless acceptance. The Advanced workspace retains the imported PhotoCraft editor. Use the [local drawing guide](docs/komaphone/k1-local-drafts.md) or [party-mode runbook](docs/komaphone/k3-party-modes.md); the [status ledger](docs/komaphone/status.md) records milestone gates, verified evidence and limitations.
 
-The current service is loopback-only, for isolated clients on one Windows computer. The drawing replay viewer/gallery, exports, local remix and a separate-machine friend-ready release are K4. The deep-zoom shared world and its required remix/tour/catch-up features follow later. Existing animation and GIF primitives remain available in Advanced. Machine names stay `photocraft-*`. Komaphone has no automatic update channel yet and does not offer upstream PhotoCraft releases.
+K4 adds the saved Gallery, drawing replay, exports and independent local remixes. Private HTTPS games passed on two Windows PCs; the owner accepted the unresolved laptop startup/export-path limitation recorded as K4-LAUNCH-01 for later hardening. See the [K4 guide](docs/komaphone/k4-second-pc.md) and status ledger for the tested route and remaining limits; no public service is deployed.
+
+The accepted [K5 local canvas prototype](docs/komaphone/k5-local-canvases.md) adds named independent canvases, continuous drawing at successive scales, bookmarks and automatic zoom. K6 adds [shared canvases](docs/komaphone/k6-shared-canvases.md) with independent invitations, simultaneous drawing, offline recovery, tours/export, catch-up playback and independent world remix. Native functional/recovery and performance acceptance, account-linking foundations and local Linux HTTPS feasibility passed; the guide includes instructions for the retained local build.
+
+K6.5 is next: real Google sign-in and a trusted GCP service tested between households. No public service is deployed. Existing animation and GIF primitives remain available in Advanced. Machine names stay `photocraft-*`. Komaphone has no automatic update channel yet and does not offer upstream PhotoCraft releases.
 
 ## Development
 

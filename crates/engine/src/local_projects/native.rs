@@ -101,6 +101,7 @@ impl Session {
         if self.local_projects.available() {
             return Err(EngineError::Other("Local storage is already configured".into()));
         }
+        self.enable_gallery(database.clone(), options)?;
         self.local_projects.worker = Some(Worker::start(database, options)?);
         self.local_projects.configured = true;
         self.local_replay.enable();
@@ -195,6 +196,7 @@ impl Session {
                 self.local_projects.writing = false;
                 match result {
                     Ok(ack) => {
+                        self.gallery.thumbnails.remove(&(ack.project, true));
                         if let Some((request, doc, editor_revision)) = self.local_projects.pending.take() {
                             if ack.project != request.project
                                 || ack.event_id != request.request_id
@@ -219,6 +221,9 @@ impl Session {
                     Ok((drafts, usage)) => {
                         self.local_projects.drafts = drafts;
                         self.local_projects.usage = Some(usage);
+                        if self.gallery.available() && !self.gallery.busy() && self.gallery.items.is_empty() {
+                            let _ = self.gallery_action(crate::gallery::GalleryAction::Refresh);
+                        }
                     }
                     Err(error) => self.local_projects.error = Some(error),
                 }
@@ -260,7 +265,7 @@ impl Session {
         }
     }
 
-    fn install_local_draft(&mut self, loaded: LoadedDraft) {
+    pub(crate) fn install_local_draft(&mut self, loaded: LoadedDraft) {
         if let Some(index) = self.documents().iter().position(|state| self.local_projects.status(state.doc.id).project == Some(loaded.info.project)) {
             self.set_active(index);
             return;

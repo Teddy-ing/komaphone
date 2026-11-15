@@ -83,6 +83,8 @@ impl PhotocraftApp {
             opacity_keys: None,
             control_rx: None,
             captures: crate::screenshot::Captures::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            world_probe: Default::default(),
             type_ime: type_tool::ImeState::default(),
             input_waiters: Vec::new(),
             live_adjust: None,
@@ -124,6 +126,7 @@ impl PhotocraftApp {
             synthetic_batch: None,
             synthetic_reinject: false,
             synthetic_snapshot: None,
+            canvas_input_cancelled: false,
             automation_input: false,
             run_depth: 0,
             paused_playbacks: Default::default(),
@@ -177,6 +180,8 @@ impl PhotocraftApp {
             window_lost: false,
             window_recovery_retry: None,
             gpu_render_state: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            world_render: Default::default(),
             gpu_fault: None,
             gpu_oom_retries: 0,
             started: None,
@@ -228,6 +233,10 @@ impl eframe::App for PhotocraftApp {
         if let Err(error) = self.session.flush_local_projects(std::time::Duration::from_secs(30)) {
             log::error!("Komaphone local save did not finish: {error}");
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(error) = self.session.flush_canvases(std::time::Duration::from_secs(30)) {
+            log::error!("Komaphone canvas save did not finish: {error}");
+        }
         if let Err(err) = tool_memory::save_on_exit(self) {
             log::warn!("Preferences: could not save the final tool selection: {err}");
         }
@@ -235,6 +244,8 @@ impl eframe::App for PhotocraftApp {
         // callback is inert afterwards (it holds only a weak slot).
         let finished = self.captures.cancel_all("the application is closing");
         self.finish_captures(finished);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.world_probe.cancel("the application is closing");
     }
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

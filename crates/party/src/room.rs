@@ -241,6 +241,17 @@ impl Room {
     pub fn id(&self) -> RoomId {
         self.state.id
     }
+    /// Accepted immutable dependencies only; incomplete deadline uploads are not originals.
+    pub fn submitted_assets(&self) -> impl Iterator<Item = AssetRef> + '_ {
+        self.state
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Submitted { value, .. } => Some(value.assets.iter().copied()),
+                Entry::Missing { .. } => None,
+            })
+            .flatten()
+    }
     /// Trusted service membership enumeration; artwork stays in participant projections.
     pub fn participants(&self) -> Vec<Participant> {
         self.state.members.iter().chain(&self.state.waiting).map(|m| m.participant.clone()).collect()

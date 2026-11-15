@@ -2,9 +2,14 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod archive;
 mod assets;
+mod backup;
+pub mod identity;
 pub mod server;
 mod store;
+pub mod tls;
+pub mod worlds;
 pub use assets::encode_png;
 pub use store::{SaveStage, Store, StoreOptions};
 
@@ -20,6 +25,12 @@ pub enum Error {
     Schema,
     #[error("The service is busy. Keep local work and retry shortly.")]
     Busy,
+    #[error("The application session has expired or been revoked; reconnect before synchronizing. Local artwork remains saved.")]
+    Session,
+    #[error("Google sign-in verification is temporarily unavailable; keep drawing locally and retry shortly.")]
+    IdentityProvider,
+    #[error("The transient presence stream expired or changed; open a fresh stream before publishing.")]
+    PresenceStream,
     #[error("Invalid request: {0}")]
     Invalid(&'static str),
     #[error("Service I/O failed: {0}")]

@@ -128,6 +128,19 @@ pub(crate) fn verify_store(tx: &Transaction<'_>) -> Result<()> {
     }
     Ok(())
 }
+
+/// A checksum-valid object table is insufficient if an accepted checkpoint was
+/// removed. Frozen transfer manifests are deliberately excluded: they may still
+/// be waiting for upload and are not accepted submissions.
+pub(crate) fn verify_room_dependencies(tx: &Transaction<'_>, room: &Room) -> Result<()> {
+    for asset in room.submitted_assets() {
+        let (_, bytes) = object_id(tx, room.id(), asset.hash)?;
+        if bytes != asset.bytes {
+            return Err(Error::Storage);
+        }
+    }
+    Ok(())
+}
 pub(crate) fn fetch(tx: &Transaction<'_>, room: RoomId, hash: AssetHash, offset: u64) -> Result<RpcResponse> {
     let (id, total) = object_id(tx, room, hash)?;
     if offset >= total {

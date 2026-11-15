@@ -43,6 +43,7 @@ mod file_dialog_probe;
 mod gpu_startup;
 #[cfg(target_os = "linux")]
 mod icon_theme;
+mod komaphone_launch;
 mod launch_args;
 #[cfg(target_os = "macos")]
 mod mac_menu;
@@ -520,15 +521,33 @@ fn main() -> eframe::Result {
             let mut app = PhotocraftApp::new(session, services);
             app.ui.komaphone.enabled = true;
             app.ui.tool = photocraft_ui_egui::Tool::Brush;
+            if let Some(endpoint) = std::env::var_os("KOMAPHONE_SERVICE_ENDPOINT") {
+                match endpoint.to_str().ok_or_else(|| "KOMAPHONE_SERVICE_ENDPOINT is not valid text".to_owned()).and_then(komaphone_launch::private_endpoint) {
+                    Ok(endpoint) => app.ui.rooms.endpoint = endpoint,
+                    Err(error) => app.session.rooms.status.error = Some(error),
+                }
+            }
             let local_data = std::env::var_os("KOMAPHONE_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .or_else(|| std::env::var_os("LOCALAPPDATA").map(|base| std::path::PathBuf::from(base).join("Komaphone")));
             if let Some(root) = local_data {
-                if let Err(error) = app.session.enable_rooms(root.join("rooms.sqlite3"), Default::default()) {
+                if let Err(error) = photocraft_engine::rooms::ClientOptions::from_environment()
+                    .map_err(|e| photocraft_engine::EngineError::Other(e.to_string()))
+                    .and_then(|options| app.session.enable_rooms(root.join("rooms.sqlite3"), options))
+                {
                     app.session.rooms.status.error = Some(error.to_string());
                 }
                 if let Err(error) = app.session.enable_local_projects(root.join("drafts.sqlite3"), Default::default()) {
                     app.session.local_projects.error = Some(error.to_string());
+                }
+                if let Err(error) = app.session.enable_canvases(root.join("canvases.sqlite3"), Default::default()) {
+                    app.session.canvases.error = Some(error.to_string());
+                }
+                if let Err(error) = photocraft_engine::rooms::ClientOptions::from_environment()
+                    .map_err(|e| photocraft_engine::EngineError::Other(e.to_string()))
+                    .and_then(|options| app.session.enable_worlds(root.join("world-queue.sqlite3"), options))
+                {
+                    app.session.worlds.error = Some(error.to_string());
                 }
             } else {
                 app.session.local_projects.error = Some("Set KOMAPHONE_DATA_DIR to a local folder to enable permanent drafts".into());
@@ -739,7 +758,10 @@ fn main() -> eframe::Result {
                 .env("PHOTOCRAFT_GPU_STARTUP_FAILURE", &reason)
                 .spawn();
             match launched {
-                Ok(_) => return Ok(()),
+                Ok(child) => match komaphone_launch::wait_for_gpu_fallback(child) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => log::error!("CPU compatibility mode did not finish successfully: {error}"),
+                },
                 Err(error) => log::error!("could not start CPU compatibility mode: {error}"),
             }
         }

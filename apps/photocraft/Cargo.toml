@@ -45,7 +45,7 @@ roxmltree = "0.21"
 craft-update = { workspace = true }
 rfd = { workspace = true }
 arboard = { version = "3.7", features = ["wayland-data-control"] }
-open = "5"
+open = { version = "5", features = ["shellexecute-on-windows"] }
 # Reads the saved window layout (eframe persistence) to drop values that would abort startup.
 ron = "0.12"
 # Background release checks; HTTPS with Rust TLS, no async runtime.

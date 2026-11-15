@@ -2,7 +2,8 @@
 use crate::{
     Result,
     contracts::{
-        AssetHash, AssetRef, AssignmentId, MAX_MESSAGE_BYTES, MAX_ROOM_SNAPSHOT_BYTES, Mode, Participant, RequestId, RoomId, decode_bounded, validate_version,
+        AssetHash, AssetRef, AssignmentId, GameId, MAX_MESSAGE_BYTES, MAX_ROOM_SNAPSHOT_BYTES, Mode, Participant, RequestId, RoomId, decode_bounded,
+        validate_version,
     },
     room::{Action, ApplyOutcome, RoomView},
 };
@@ -42,6 +43,20 @@ pub enum Operation {
     Upload { room: RoomId, hash: AssetHash, total: u64, offset: u64, bytes: Vec<u8>, finish: bool },
     Fetch { room: RoomId, hash: AssetHash, offset: u64 },
     Notes { room: RoomId },
+    History { room: RoomId, after_revision: u64 },
+    Game { room: RoomId, game: GameId },
+    GameFetch { room: RoomId, game: GameId, revision: u64, hash: AssetHash, offset: u64 },
+    GameNotes { room: RoomId, game: GameId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedGameSummary {
+    pub game: GameId,
+    pub revision: u64,
+    pub mode: Mode,
+    pub complete: bool,
+    pub authors: Vec<Participant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +70,8 @@ pub enum RpcResponse {
     Uploaded { asset: Option<AssetRef>, next_offset: u64 },
     AssetChunk { bytes: Vec<u8>, total: u64 },
     Notes { notes: Vec<(AssignmentId, String)> },
+    History { games: Vec<ArchivedGameSummary>, next_revision: Option<u64> },
+    Game { view: Box<RoomView> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

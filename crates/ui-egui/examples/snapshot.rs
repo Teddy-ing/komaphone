@@ -14,6 +14,7 @@
 //! `--update-notice` previews a newer release without contacting the network.
 //! `--custom-titlebar` draws the Windows/Linux title bar (caption buttons in the top bar).
 //! `--komaphone-data-dir PATH` exercises real local drafts in an isolated native test directory.
+//! `--canvases` shows the local canvas workspace from that isolated directory.
 //!
 //! `--monitor 1366x768 --window-top 31` simulates the display the window is on (in points) and
 //! where its content starts on it, e.g. a window running under a Windows taskbar.
@@ -73,6 +74,7 @@ fn main() {
     let background_jobs = args.iter().any(|a| a == "--background-jobs");
     let custom_titlebar = args.iter().any(|a| a == "--custom-titlebar");
     let local_data = arg(&args, "--komaphone-data-dir");
+    let canvases = args.iter().any(|a| a == "--canvases");
     // `--settle-ms N`: keep rendering frames for N ms before the capture (e.g. mid-job).
     let settle_ms: u64 = arg(&args, "--settle-ms").and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut render_options = eframe::egui_wgpu::RendererOptions::PREDICTABLE;
@@ -94,10 +96,15 @@ fn main() {
                 if let Err(error) = app.session.enable_rooms(std::path::PathBuf::from(&root).join("rooms.sqlite3"), Default::default()) {
                     eprintln!("Room storage: {error}");
                 }
-                if let Err(error) = app.session.enable_local_projects(std::path::PathBuf::from(root).join("drafts.sqlite3"), Default::default()) {
+                if let Err(error) = app.session.enable_local_projects(std::path::PathBuf::from(&root).join("drafts.sqlite3"), Default::default()) {
                     eprintln!("Cannot enable local drafts: {error}");
                     std::process::exit(1);
                 }
+                if let Err(error) = app.session.enable_canvases(std::path::PathBuf::from(root).join("canvases.sqlite3"), Default::default()) {
+                    eprintln!("Cannot enable local canvases: {error}");
+                    std::process::exit(1);
+                }
+                app.ui.canvas.open = canvases;
                 app.ui.komaphone.enabled = true;
             }
             if update_notice {
@@ -196,6 +203,11 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     if let Err(error) = harness.state_mut().session.flush_local_projects(std::time::Duration::from_secs(30)) {
         eprintln!("Local draft did not reach durable storage: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = harness.state_mut().session.flush_canvases(std::time::Duration::from_secs(30)) {
+        eprintln!("Canvas did not reach durable storage: {error}");
         std::process::exit(1);
     }
     // Let fade animations settle.

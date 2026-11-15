@@ -32,12 +32,20 @@ impl PhotocraftApp {
                 crate::control::Outcome::Done(v) => {
                     let _ = reply.send(v);
                 }
+                crate::control::Outcome::Deferred => {}
                 crate::control::Outcome::AfterInput => self.input_waiters.push(reply),
                 crate::control::Outcome::AfterJob(job) => self.jobs.waiters.push((job, reply)),
-                crate::control::Outcome::Screenshot { token, path } => {
+                crate::control::Outcome::Screenshot { token, path, settle } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.world_probe.active() {
+                        let _ = reply.send(serde_json::json!({"ok":false,"error":"Finish or cancel the world pixel probe before another screenshot"}));
+                        continue;
+                    }
                     // Admission is budgeted here, after this pass's completed captures were
                     // drained, so a just-finished request never causes a false rejection.
-                    let settle = crate::screenshot::settle_ms(ctx.global_style().animation_time);
+                    // Timing probes may skip animation delay, but retain real layout passes,
+                    // geometry epochs, document activation and all capture resource bounds.
+                    let settle = if settle { crate::screenshot::settle_ms(ctx.global_style().animation_time) } else { 0.0 };
                     let document = self.document_identity();
                     if let Err((reply, e)) = self.captures.admit(token, path, reply, document, settle, crate::screenshot::now()) {
                         let _ = reply.send(serde_json::json!({"ok": false, "error": e}));
@@ -46,6 +54,8 @@ impl PhotocraftApp {
             }
             // `ui.set` may have changed the edit target: the next request sees its colours.
             self.sync_mask_targets();
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::world_probe::observe(self, ctx);
         }
         self.control_rx = Some(rx);
     }

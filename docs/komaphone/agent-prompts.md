@@ -2,6 +2,10 @@
 
 Use these in the Komaphone repository with the intended model, GPT-6 Astra, and goal mode/subagents where available. These are ordinary task instructions, not an API integration or a claim that a model setting guarantees completion. The product baseline and executable checks decide success.
 
+## Current owner workflow
+
+Since 2026-11-15, use the [orchestration workflow](orchestration-workflow.md) for Codex review and owner-relayed Antigravity implementation. It includes the bounded K7 continuation and evidence-query prompts. The older implementation prompts below are worker task templates; they do not instruct Codex to launch implementation automatically. Keep all acceptance requirements intact.
+
 ## How to run
 
 Run one coordinator at a time. It may delegate independent work to subagents. Choose either the reusable next-milestone prompt or one explicit milestone prompt below; do not start all prompts in parallel. Each prompt relies on tracked repository instructions, so a new session can recover context. Model and budget selection remain your app settings; no token or spending budget is implied here.
@@ -22,9 +26,18 @@ checks, and fix failures. Assign file ownership; keep shared schema/registration
 edits under one coordinator and use the repository's per-agent Cargo target dirs.
 
 Keep the agreed scope: Windows, Rust/egui/wgpu, private sync service, two/three
-players, Animation and Exquisite Corpse first, deep-zoom shared world later.
-Baseline 1.1 requires remix, guided zoom tours, and since-you-were-away playback;
-deliver them at their assigned K4/K6 gates rather than treating them as optional.
+party players, Animation and Exquisite Corpse first, deep-zoom canvases later.
+Baseline 1.4 requires multiple named canvases with independently chosen dynamic
+member lists of variable size, plus remix, guided tours, and catch-up playback.
+Named groups are examples only; there is no fixed four-person canvas product cap.
+Deliver these at their assigned K4/K5/K6 gates. Keep party roster limits intact.
+Read docs/komaphone/hosting-plan.md for required GCP Compute Engine hosting and
+Google sign-in: account/linking and Linux deployment foundations in K6, hosted
+independent-public-network acceptance in K6.5, then K7 hardening and fresh friend onboarding from another household. Target total recurring
+USD $20/month or less; approximately $30 is acceptable. Include all resource
+costs before credits; do not silently grow beyond that preference. Choose K6.5
+after K6 rather than skipping directly to K7. LAN/VPN tests do not prove the
+normal hosted friend experience. Local drawing must remain usable offline.
 Preserve upstream attribution and the working editor. Do not pick unrelated
 Photoshop parity work. Keep the product baseline stable.
 
@@ -133,7 +146,8 @@ Delegate gallery and replay/export independently; review recovery and archive
 round trips. Produce a runnable Windows party build and local service runbook.
 Verify both complete games survive close/reopen and export/import to a fresh
 data directory. Smoke-test both modes across two separate Windows machines via
-the private service before claiming friend-ready. If unavailable, record a
+the private service before claiming private-network readiness. K6.5 separately
+proves hosted internet play; do not generalize this LAN result. If unavailable, record a
 partial local-only candidate and the pending external gate. Inspect actual
 reveals/exports, run applicable crate/clippy/WASM/corpus/performance gates, and
 update status/devlog. The shared world is still outstanding.
@@ -150,6 +164,13 @@ automatic zoom. Demonstrate new artwork inside artwork across six roughly 100x
 detail steps, persistence/reopen, precision stability, and viewport-only loading.
 Six levels are the test fixture, not the product limit.
 Use stable region/local-coordinate camera targets reusable by K6 guided tours.
+Use the product spec's Endless Paper behavior reference: pan/zoom and immediately
+draw at the new scale, with automatic region selection and predictable brush
+width. No mandatory Create detail step or visible internal region boundaries.
+Evaluate retained strokes/raster/hybrid as needed without adding vector UI.
+Create/name/rename/switch multiple local canvases with independent stable IDs,
+owner identity, drawings/history/bookmarks and recovery; test four canvases,
+including identical names. K6 supplies friend invitations and network enforcement.
 
 Delegate scene/storage and render/performance experiments with clear ownership.
 Do not call a larger bitmap or a raised zoom constant a deep-zoom solution.
@@ -170,6 +191,32 @@ deterministic merge, bookmarks/auto-zoom, and selected-view/full-archive exports
 Also deliver required W7 saved multi-stop tours with GIF/PNG-sequence export,
 W8 since-you-were-away highlights/navigation/replay, and G2 world remix with
 animated/still content, independent ownership, and preserved provenance.
+Read docs/komaphone/hosting-plan.md before freezing identity/storage contracts.
+Implement versioned account/profile/device separation and safe legacy linking
+with ownership proof; preserve IDs, accepted authorship, memberships, queued
+edits and local recovery. Do not link by email/name alone. Exercise wrong-account
+linking, account switches and isolated queues through a test-only verifier
+adapter; real Google login is a K6.5 gate. Keep local drawing usable signed out.
+Prove the existing service builds/runs on Linux with persistence/restart and the
+proposed trusted-HTTPS termination route in an isolated local environment.
+Prepare repeatable GCP configuration, resource inventory and a current complete
+cost estimate, aiming for <=USD $20/month with approximately $30 acceptable.
+Missing cloud/OAuth access does not block independent K6 work; record K6.5's
+remaining inputs and do not call a local deployment spike hosted acceptance.
+Implement W9 independent canvas ownership and invite/accept/remove/leave controls.
+Verify arbitrary overlapping/non-overlapping groups, different owners, and
+canvases excluding the primary test user. Exercise 2/4/8 concurrent editors as
+test fixtures, not caps, plus larger paginated member lists. Separate invited
+membership from concurrent connection capacity; document measured operational
+limits, not preset friend slots. Party games remain two/three players.
+Migrate K5's local-only owner checks into per-canvas authorization: separate
+owner, authenticated writer and viewer; retain author-local undo and local IDs.
+Enforce per-canvas authorization on lists/names/thumbnails, assets, edits, cursors,
+history, tours, exports and catch-up; global pairing is not membership. Test
+wrong-world references, stale invitations, active/offline revocation and recovery
+of rejected drafts. Rejoining cannot silently publish an old revoked queue.
+Copies/archive imports are owner-only; cross-canvas remix explicitly names and
+authorizes the destination without granting access to private source history.
 
 Delegate sync correctness and world UI/render integration; independently test
 overlapping and non-overlapping online sessions, conflicting offline metadata,
@@ -184,25 +231,92 @@ Verify world remix retries, deep placement, animation timing, credits, and sourc
 independence. These are required completion gates, not optional polish.
 Inspect the shared UI and rerun relevant performance, storage, WASM, and safety
 gates. Update status/devlog with reproducible evidence and remaining limits.
+Stop at K6's acceptance gate; the next milestone is K6.5, not K7.
+```
+
+## K6.5 GCP hosting and Google sign-in
+
+```text
+Start a goal to complete K6.5 in docs/komaphone/delivery-plan.md. Read AGENTS.md,
+the Komaphone product/architecture/status, and docs/komaphone/hosting-plan.md.
+Verify K6 identity/linking, Linux feasibility and world evidence plus K4 party
+evidence. Preserve current artwork and all existing two/three-player and dynamic
+canvas-membership rules. Do not restart the project or rewrite working sync.
+
+Complete native system-browser Google OAuth/OIDC sign-in with PKCE/state/nonce,
+server-verified identity and revocable Komaphone sessions. Keep profile IDs and
+device writers distinct, prove authority before linking old profiles, preserve
+queued/local work and credits, and isolate account switches. Test cancellation,
+expired/wrong-audience/replayed tokens, credential storage/redaction and access
+revocation. Google sign-in grants no automatic room/canvas access. Enforce private
+service admission and scoped invitations; close any legacy enrollment bypass.
+Local drawing/recovery remains usable signed out or during a service outage.
+
+Prepare the existing Rust service for one small Linux GCP Compute Engine VM,
+persistent disk/SQLite, trusted renewable HTTPS, supervised boot/restart,
+bounded logs/resources, and consistent off-VM backups. Deliver repeatable
+deploy/update/rollback assets and simple admin/friend runbooks. Package a normal
+configured client connection: no VPN/Tailscale, manual certificate installation,
+home-router setup or developer-token copying required of friends. Keep editor
+automation loopback-only and native Rust/WASM boundaries intact.
+
+Refresh pricing for all VM/address/disk/backup/traffic/log/domain costs and taxes.
+Target total recurring <=USD $20/month; approximately $30/month is acceptable.
+Record ordinary pre-credit cost, credit eligibility/expiry, capacity measurements,
+light/higher-use forecasts and budget alerts (which do not cap spend). Do not
+silently add infrastructure or increase recurring spend materially beyond ~$30.
+The provider/login/budget choices are settled; ask only for genuinely missing
+project/access/deployment decisions after making the proposed deployment concrete
+and reviewable. Use any applicable authorization already present; planning alone
+does not authorize provisioning. Continue independent local work if access is
+missing and leave actual cloud/login/remote evidence explicitly pending.
+
+Delegate independent authentication/migration and deployment/runbook modules
+with explicit file ownership; independently review authorization and recovery.
+When concretely authorized, deploy and test packaged Windows clients on independent public internet connections using actual Google
+sign-in and normal invites. The owner-approved H4 clarification allows home
+broadband plus a cellular hotspot with phone Wi-Fi off, even in one home;
+K7 retains fresh friend onboarding from another household.
+Complete both party modes, reconnect during phases, service restart and exports.
+Exercise simultaneous and non-overlapping canvas use, non-owner edits, denied
+nonmembers, offline queues, account switching, tours/catch-up/remix and fresh
+off-VM backup restoration. Verify HTTPS renewal/reboot. Retain broader K6 member
+fixtures and exact two/three-player coverage; report actual remote configurations.
+Fix K4-LAUNCH-01 earlier if it prevents these clients launching, keeping its K7
+regression gate. Inspect UI and run all required checks for affected crates.
+
+Complete every hosting-plan K6.5 acceptance case; a mock login, same-LAN test,
+VPN workaround or deployment script alone cannot close the milestone. Record
+exact checks, build/configuration versions, artifacts, costs, tested runbooks,
+limitations and genuinely missing external evidence in tracked status and local
+devlog. Stop at K6.5's gate. K7 then hardens this demonstrated hosted experience.
 ```
 
 ## K7 Final integration and distribution
 
 ```text
 Start a goal to complete K7 in docs/komaphone/delivery-plan.md. Read AGENTS.md and
-the Komaphone docs. Audit every required product ID against actual evidence;
+the Komaphone docs including docs/komaphone/hosting-plan.md. Verify accepted K6
+and K6.5 evidence before claiming this release ready. Audit every required
+product ID, including H1-H4, against actual evidence;
 use subagents to review reliability/networking and UX/exports independently.
 Fix gaps, prepare the Windows distribution, test clean install and upgrades,
 backup restoration, protocol mismatch, quotas, and both party/shared-world flows.
 Include all G2/W7/W8 remix, guided-tour/export, and catch-up acceptance cases.
+Include W9 isolation, variable member groups including more than four, and
+revocation tests. Keep benchmark group sizes separate from product limits.
 Measure performance on the recorded reference machine and inspect final UI.
 
-Prepare a concrete private hosting setup/runbook. Complete local work before
-requesting genuinely missing deployment access or a hosting expense decision.
-Verify distinct-machine/network use when available; label it unverified if not.
-Do not claim the deployed product complete while that acceptance gate is missing.
+Repeat the proven K6.5 GCP/Google-sign-in path with fresh installs and upgrades
+on separate household networks, without VPN/manual certificates. Retest account
+linking/switching, backup restoration, rollback, TLS renewal, offline use and the
+K4-LAUNCH-01 laptop launcher/export issue. K7 is not the first internet test.
+Recheck the full pre-credit recurring cost (<=USD $20 target, approximately $30
+acceptable) and measured limits. Continue independent checks if external access
+is missing; leave those gates unverified and do not claim the deployed product
+complete. Do not ask again to choose the already selected provider/login/budget.
 Update status/devlog with exact checks, artifacts, release instructions, known
-limits, and all outstanding work. Preserve attribution and baseline 1.1 scope.
+limits, and all outstanding work. Preserve attribution and baseline 1.4 scope.
 ```
 
 ## Resuming an interrupted run

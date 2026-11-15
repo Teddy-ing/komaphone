@@ -16,6 +16,8 @@
 //! - `ui.pointer {events: [{kind: down|move|up, x, y, pressure?, tiltX?, tiltY?, rotation?}], tool?, modifiers?, button?}`: drive the active tool in document coordinates (`button: "secondary"` opens the tool's canvas context menu (the pasteboard colour menu outside the image) or Brush Preset picker, or erases with Preferences › Tools › Right-click with painting tools = erase)
 //! - `ui.click {x, y, button?, count?}` / `ui.move {x, y}`: synthetic pointer input in screen points
 //!   (`count` at most [`MAX_CLICKS`])
+//! - `ui.worldInput {kind:down|move|up|wheel,x,y,...}`: bounded shared-canvas screen input
+//!   through egui frames, cancelled if its account, canvas or grant changes before injection.
 //! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`: synthetic keyboard input
 //! - The synthetic input methods reject unknown fields, wrong types, unknown enum values and
 //!   out-of-range numbers before acting, naming the parameter (#2449)
@@ -25,10 +27,14 @@
 //!   session, as on a real loss. For testing the fallback; returns whether a GPU canvas was active.
 //!   `destroy: true` destroys the window's real device instead, as a driver reset does: the app
 //!   saves its unsaved documents for recovery and closes (#3438); returns `destroyed`
-//! - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
+//! - `ui.screenshot {path?, focus?, settle?}`: capture the main window (PNG). Raises the window first (default)
 //!   because occluded macOS windows stop rendering
 //! - `ui.focus`: bring the main window to the front
 //! - `app.open {path}` / `app.save {path}`: relative file I/O under the automation roots; reply with `warnings`
+//! - `app.galleryFile {command, params}`: existing gallery export/import/backup/restore commands
+//!   through granted file roots. Replies pending; poll `komaphone.gallery.status` to completion.
+//! - `app.worldFile {command:"komaphone.world.export", params}`: shared canvas PNG,
+//!   tour or archive export through granted file roots. Completion is asynchronous.
 //! - `app.quit`
 //! - `jobs.list` / `jobs.cancel {job?}`: background jobs (#210) with progress; cancel one (or all).
 //!   `engine.execute`, `ui.menu.invoke` and `ui.dialog.confirm` wait for a command that runs as a
@@ -128,9 +134,12 @@ impl Dispatch {
 
 pub enum Outcome {
     Done(Value),
+    /// An opt-in observation owns its bounded reply waiter.
+    Deferred,
     Screenshot {
         token: u64,
         path: Option<String>,
+        settle: bool,
     },
     /// Synthetic input queued: reply once the app has processed all of it (so a following
     /// `ui.inspect`/`engine.execute` observes the effect).
@@ -182,7 +191,26 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod gallery_files_tests;
+
+#[cfg(test)]
+mod world_files_tests;
+
+mod canvas_input;
+mod world_input;
+
+pub(crate) fn validate_canvas_input(app: &PhotocraftApp, ctx: &egui::Context) -> bool {
+    canvas_input::validate(app, ctx) && world_input::validate(app, ctx)
+}
+pub(crate) fn clear_canvas_input(ctx: &egui::Context) {
+    canvas_input::clear(ctx);
+    world_input::clear(ctx);
+}
+
 pub(super) const METHODS: &[&str] = &[
+    "app.galleryFile",
+    "app.worldFile",
     "app.open",
     "app.quit",
     "app.save",
@@ -190,6 +218,7 @@ pub(super) const METHODS: &[&str] = &[
     "engine.execute",
     "jobs.cancel",
     "jobs.list",
+    "ui.canvasInput",
     "ui.click",
     "ui.context.choose",
     "ui.dialog.apply",
@@ -211,4 +240,6 @@ pub(super) const METHODS: &[&str] = &[
     "ui.type",
     "ui.window.close",
     "ui.window.open",
+    "ui.worldInput",
+    "ui.worldProbe",
 ];

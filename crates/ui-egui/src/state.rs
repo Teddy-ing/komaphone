@@ -207,6 +207,11 @@ pub struct UiState {
     #[serde(default)]
     pub komaphone: crate::komaphone_workspace::WorkspaceState,
     #[serde(default)]
+    pub gallery: crate::komaphone_gallery::GalleryUi,
+    pub canvas: crate::komaphone_canvas::CanvasUi,
+    #[serde(default)]
+    pub world: Box<crate::komaphone_world::WorldUi>,
+    #[serde(default)]
     pub rooms: crate::komaphone_rooms::RoomUi,
     pub tool: Tool,
     /// The last tool used in each shortcut group (the tools sharing a key, [`Tool::key`]), at most
@@ -536,6 +541,9 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             komaphone: Default::default(),
+            gallery: Default::default(),
+            canvas: Default::default(),
+            world: Default::default(),
             rooms: Default::default(),
             tool: Tool::Move,
             group_tools: Vec::new(),

@@ -13,6 +13,11 @@ use crate::AutomationError;
 
 const DENIED: &str = "automation filesystem access is not granted";
 
+#[cfg(not(target_arch = "wasm32"))]
+mod gallery_files;
+#[cfg(not(target_arch = "wasm32"))]
+mod world_files;
+
 #[derive(Clone)]
 struct RootCapability {
     dir: Arc<Dir>,
@@ -391,6 +396,12 @@ pub fn authorize_engine_command(id: &str, params: &Value) -> Result<(), Automati
                 | "layer.videoLayers.newVideoLayerFromFile"
                 | "layer.videoLayers.replaceFootage"
                 | "layer.videoLayers.reloadFrame"
+                | "komaphone.gallery.export"
+                | "komaphone.gallery.import"
+                | "komaphone.gallery.backup"
+                | "komaphone.gallery.restore"
+                | "komaphone.world.export"
+                | "komaphone.world.restore"
         )
         || command_uses_ambient_path(id, params)
         || profile_command_may_read_ambient(id, params)

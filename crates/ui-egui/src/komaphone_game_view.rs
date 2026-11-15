@@ -245,6 +245,10 @@ pub fn reveal(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("Your finished game");
         ui.horizontal_wrapped(|ui| {
+            button(app, ui, "Save to gallery", "komaphone.gallery.download", json!({"game":game}));
+            if ui.button("Open gallery").clicked() {
+                crate::komaphone_gallery::open(app);
+            }
             button(app, ui, "Archive game", "komaphone.room.archive", json!({}));
             button(app, ui, "Next game", "komaphone.room.next", json!({}));
             if ui.button("Return to my local drawings").clicked() {

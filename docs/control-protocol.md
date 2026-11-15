@@ -134,9 +134,12 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 - `ui.type {text}`: type text (goes to the focused widget, or to the canvas while the Type tool is editing)
 - `ui.resize {width, height}`: resize the main window
 - `ui.gpu.simulateLoss {error?}`: act as if the wgpu device was lost (or reported an error with `error: true`). The app switches to the CPU image compositor (after a loss for the rest of the session; after an error until a successful Retry GPU) and shows the same recovery warning as on a real loss. `gpuFallbackNotice` in `ui.inspect` contains the reason while the warning is open. Keep Using CPU saves CPU compatibility for the next launch. Retry GPU saves GPU mode; after an error (`error: true`) it also builds a new GPU canvas on the same device at once (`gpuInfo.canvas` is `gpu` again, #6577), and after a loss it asks the user to save and restart. The window renderer still requires a working graphics or software adapter. Returns `wasActive` and `gpuInfo`. For testing the fallback. With `destroy: true` it destroys the window's real wgpu device instead, as a driver reset does (see `docs/development.md` › device loss): the app saves every unsaved document for recovery and closes. Returns `destroyed`
-- `ui.screenshot {path?, focus?}`: capture the main window (PNG). With no path the reply contains
+- `ui.screenshot {path?, focus?, settle?}`: capture the main window (PNG). With no path the reply contains
   base64 PNG data; a path is relative to the automation write root. Raises the window first
-  (default) because occluded macOS windows stop rendering. A request sent before the first frame
+  (default) because occluded macOS windows stop rendering. `settle` defaults to `true`, waiting
+  for open/close animations. Timing probes may pass `settle: false` to omit only that delay;
+  three completed UI passes, geometry/activation checks, capture budgets and deadlines still apply.
+  A request sent before the first frame
   is queued (within the same limits and deadline) and captures once the window geometry is known,
   as on 0.15. At most four captures may be outstanding (waiting for geometry, rendered or awaiting
   collection), one image may use at most 128 MiB and all of them at most 256 MiB; the budget is
@@ -152,6 +155,26 @@ The transport is `apps/photocraft/src/control_server.rs`, and the handlers are i
 - `ui.focus`: bring the main window to the front
 - `app.open {path}` / `app.save {path?, tgaBits?, ddsCompression?, ddsMipmaps?, quality?, jpegFormat?, tiffCompression?, tiffTransparency?, tiffPyramid?, tiffLayers?}` (JPEG: `quality` on the 0–12 scale, `jpegFormat` `baseline`, `optimized` or `progressive`; TIFF: `tiffCompression` `none`, `lzw` or `zip`, `tiffTransparency` and `tiffPyramid` bools; automation never shows JPEG or TIFF Options): relative file I/O through the configured automation roots (`app.open` reads under the read root, `app.save` writes under the write root; absolute paths beneath the canonical or configured root are accepted, while `..` and paths escaping the root are refused, and both fail closed when no root was granted). Both reply with `warnings` (import/export notes such as "adjustment layer flattened"; `[]` when none), also shown to the user in the status bar and as a notice (`notices` in `ui.inspect`); `app.open` also returns the `path` and document `name` (directory `.pcraft` — the native on-disk form — loads through the read root's capability; the single-file (zip) form takes the bytes path), `app.save` the `path` written. `app.save` without `path` writes back only to the document's own PSD, PSB or `.pcraft` file, like File › Save. `tgaBits` (24 or 32) sets a TGA's bits per pixel: 32 writes the alpha channel (or else the transparency) as its alpha, 24 none; without it, 32 with an alpha channel or transparency, else 24. `ddsCompression` (`none`, `bc1`, `bc2` or `bc3`) and `ddsMipmaps` (bool) set a DDS texture's compression and mip chain; without them, uncompressed without mipmaps. Automation saves never show TGA, DDS, JPEG or TIFF options. Automation opens and saves never fire script events. Use these two rather than `file.open`, `file.save`, `file.saveAs` or `file.saveACopy`, which the control channel refuses (see [Engine commands](#engine-commands))
 - `app.quit`
+
+`app.galleryFile {command, params}` runs the existing `komaphone.gallery.export`,
+`komaphone.gallery.import`, `komaphone.gallery.backup`, or
+`komaphone.gallery.restore` command through the explicitly granted automation
+read/write roots. It uses the same command parameters, source privacy and phase
+checks as the gallery UI. Input is copied through held directory capabilities to
+private staging; completed output is published through held write capabilities.
+Request paths never reach ambient engine I/O. Parent traversal, descendant
+reparse points, ungranted paths and existing destinations are refused. The
+ordinary `engine.execute` and synthetic UI routes still deny ambient gallery
+file commands; request fields cannot grant a root or disable that policy.
+
+The immediate result is `{"pending":true,"saved":false}`. Poll
+`komaphone.gallery.status` until `busy` is false and inspect `error`, `notice` and
+the resulting gallery item. A queued request is not a completed save. Directory
+transfers currently require Windows. Scoped transfers have a separate
+4 GiB + 64 MiB byte ceiling and flat allowlisted members (up to 1024 draft
+archives plus gallery archive/index, or 36 PNG frames). Deduplicated local-store
+usage does not guarantee a backup fits that transfer ceiling. This does not
+change interactive native backup/export limits.
 
 ## Engine commands
 
@@ -817,3 +840,195 @@ retain custom collapse settings and Timeline visibility.
 ### Select the layer under the pointer
 
 Assign **Select Layer Under Cursor** in Keyboard Shortcuts to choose the topmost visible, pickable layer beneath the canvas pointer. Empty pixels and points outside the document leave the selection unchanged; dialogs, strokes and brush-resize gestures block it. The command follows zoom, pan, view rotation and horizontal flipping. Agents can invoke `ui.menu.invoke {"id":"layer.selectUnderCursor"}` after moving the screen pointer with `ui.move {"x": ..., "y": ...}`. The command has no default shortcut.
+
+### Komaphone local continuous canvases (K5)
+
+The `komaphone.canvas.*` engine namespace drives the same local workspace as the UI. It is separate from finite-document `ui.pointer` input. IDs are validated 32-character lowercase hexadecimal values; camera/region wide integers serialize as canonical decimal strings. The [implementation guide](komaphone/k5-local-canvases.md) records exact schemas, limits, durability and the K6 boundary.
+
+| Command suffix | Parameters and behavior |
+|---|---|
+| `status`, `list`, `view` | `{}`. Status exposes local metadata and pending/error state; list refreshes it. View returns ordered loaded-stroke identities/hashes and viewport counters, and refuses a stale camera/revision. |
+| `create`, `open`, `rename` | `{name}`, `{canvas}`, `{canvas,name}`. Duplicate names are allowed; rename requires the active ID. Selection persists the outgoing camera atomically. |
+| `camera`, `home` | `{camera}` or `{}`. Exact camera navigation on the active canvas; no artwork mutation. |
+| `stroke` | `{canvas,anchor,points:[[x,y]],width,color:{rgba:[r,g,b,a]},erase?}`. Bounded local coordinates and diameter; explicit opaque sRGBA, `a=1`. The owner and stroke ID come from the engine. |
+| `bookmark`, `go` | `{name}` saves/replaces that named location; `{name,animate?}` restores it or starts a three-second automatic flight. |
+| `flight` | `{state:"pause"|"resume"|"cancel"}`. Selection and direct navigation cancel an existing flight. |
+| `undo`, `redo`, `retry` | `{}`. Per-canvas saved stroke history or retry of an uncommitted failure. |
+
+A queued mutation returns `pending:true,saved:false`. Wait for `status` to report no pending work and no error before claiming a durable save. Canvas mutations are single-user native operations in K5, not membership authorization or service acknowledgment. Invalid/unknown parameters and foreign active-canvas targets fail without changing artwork. Existing automation command and filesystem grants still apply.
+
+`ui.canvasInput` accepts one real screen-space event per request:
+
+```json
+{"kind":"down","x":500,"y":350,"button":"left"}
+{"kind":"move","x":540,"y":390}
+{"kind":"up","x":540,"y":390,"button":"left"}
+{"kind":"wheel","x":540,"y":390,"deltaY":120,"unit":"point"}
+```
+
+Kinds are `down`, `move`, `up`, `wheel`; wheel supports `deltaX`, `deltaY` and `point|line` units. Button defaults to left; middle drag pans. Optional modifiers use the existing input schema. Coordinates are finite and bounded to ±1,000,000; wheel deltas to ±4096; queued events to 1024. The canvas workspace and an active canvas are required. Authenticated control access is required; resulting engine actions use the existing automation command gate. A canvas identity/activation change cancels stale queued input before delivery. Replies wait until actual egui input settles.
+
+`ui.inspect` exposes `canvases`, bounded transient `canvasFrameSamples`, and observed rectangles in `roomControls` (including `canvas.drawing`, `canvas.open.<id>` and `canvas.bookmark.<index>.go|play`). Read these rectangles before clicking; do not infer fixed screen positions. Frame samples report CPU UI/tessellation time separately from consecutive frame-start intervals; the latter includes scheduling and presentation waits. Neither measures input-to-photon latency. The [native acceptance harness](../scripts/komaphone/k5-native-smoke.ps1) uses actual clicks and mouse events, with engine commands only for inspection.
+
+When closing with unsaved canvas work, the observed controls include `canvas.close.keep`, `canvas.close.retry`, and `canvas.close.discard`. The prompt retains an interrupted stroke and blocks drawing beneath it. Canvas discard consent does not discard finite documents; a later accepted canvas mutation or finite-document close/cancel invalidates that consent.
+
+### Komaphone shared canvases (K6)
+
+The `komaphone.world.*` engine namespace controls named shared canvases. It uses the
+active authenticated service profile and device; callers cannot supply an author or
+grant themselves membership. Creation is private, invitations address one recipient,
+and each canvas has its own owner and member list. Party rooms retain their separate
+two-/three-player limit. K6 uses the existing private-service connection; real Google
+sign-in and public hosting are K6.5 acceptance gates.
+
+| Command suffix | Parameters and behavior |
+|---|---|
+| `status`, `list`, `people`, `members` | `{}`. Status includes local save activity, pending uploads, accepted/display revisions, viewer state, recovery metadata and export progress. Lists are bounded and paginated internally. |
+| `create`, `open`, `rename` | `{name}`, `{canvas}`, `{canvas,name,expected_revision?}`. Names need not be unique. Rename requires the current owner and uses revision conflict checks. |
+| `invite`, `accept`, `remove`, `leave` | `{recipient,expires_in_ms?}`, `{canvas,id,secret}`, `{member}`, `{}`. Owner-controlled membership; acceptance requires the intended recipient. Invitation capabilities are omitted from status and inspection output. |
+| `stroke`, `undo`, `redo` | Stroke takes `{canvas,id?,anchor,points:[[x,y]],width,color:{rgba:[r,g,b,a]},erase?}`. Undo/redo take `{}` and affect the current profile/device's art only. Erasers operate on that device's layer. |
+| `camera`, `home`, `bookmark`, `go`, `bookmark.remove`, `flight` | `{camera}`, `{}`, `{name}`, `{name,animate?}`, `{name}`, `{state:"pause"\|"resume"\|"cancel"}`. Camera and bookmarks belong to this viewer/canvas; animated bookmark travel lasts two seconds. |
+| `review.begin`, `review.control`, `review.scrub`, `review.markSeen`, `review.changes` | Begin and markSeen take `{}`; control takes `{state:"play"\|"pause"\|"cancel",speed?}`; scrub takes `{revision}`. Changes takes `{after,limit?,authors?,include_own?}`. Review freezes an interval; later arrivals remain unseen, and filtering highlights does not change canonical playback. |
+| `tour.put`, `tour.remove`, `tour.play`, `tour.control`, `tour.skipMissing` | Put takes `{id?,name,stops:[{camera,travel_ms,pause_ms,target?}],expected_revision?}`. Remove/skipMissing take `{id,expected_revision?}`; play takes `{id}`; control takes `{state:"pause"\|"resume"\|"cancel",elapsed_ms?}`. Missing destinations require explicit repair or skip. |
+| `remix.prepare`, `remix.place`, `remix.copy`, `remix.paste` | Prepare takes `{room,game,chain,frame?,fps?,looping?}`. Place/paste take `{id?,anchor,offset:[x,y],width,height}`; copy takes `{media}`. Source and destination access are checked by the service; copies retain provenance and independent ownership. |
+| `recovery`, `recovery.resume` | `{after?}`, `{canvas}`. Inspect retained rejected operations, or explicitly resume new work after fresh authorization/catch-up. Originals remain available; removed-member edits are never silently assigned a new membership epoch. |
+
+IDs use validated lowercase hexadecimal strings. Region coordinates retain the K5
+wide-integer representation. `pending:true` is an enqueue result, not a save or
+service acknowledgment. Wait for local `busy:false` before claiming local durability;
+also require active `pending:0`, matching accepted/display revisions and no error
+before claiming convergence. Durable offline work survives a process restart.
+Uncommitted pointer work remains a visible retryable draft and blocks closing unless
+the user explicitly discards that exact draft. A scope switch cancels queued input
+without assigning the old draft to the new account or canvas.
+
+`ui.worldInput` accepts the same bounded screen-space event schema as
+`ui.canvasInput`, delivered through real egui input. The shared workspace and an
+active canvas are required. Each queued event is bound to the service, profile,
+device, canvas, membership epoch and activation observed when it was queued.
+`ui.inspect` supplies `world`, `worldScene` (canonical hash and at most 128 stroke
+metadata records), `worldRender` and observed `roomControls`, including
+`world.drawing` and `world.open.<id>`. `world.frameSamples` separates CPU UI/tessellation
+time from frame-start intervals; it is not input-to-photon latency. Read rectangles
+before input rather than assuming coordinates.
+
+For frame sampling, `ui.inspect {"worldHash":false}` omits only the full-world
+digest computation and reports `worldScene.hashIncluded:false` and
+`canonicalHash:null`. The default remains `worldHash:true`. Use full inspection
+before and after a measurement to verify scene identity; do not count omitted
+hashes as convergence evidence. This avoids repeatedly serializing the entire
+retained history on the UI thread while measuring drawing frames. No measured
+overhead is subtracted from reported frame times.
+
+Native preview timing can use the opt-in `ui.worldProbe` observer. `arm` takes
+`canvas`, `sender` (profile ID), screen-point `x`/`y`, and `excludedStrokes` (IDs
+already observed). Its acknowledgment follows an actual blank GPU readback at
+that target. Send `wait` with the returned `token`, then deliver the sender's
+ordinary `ui.worldInput` events. The wait response requires a new preview with
+at least two points crossing the target and matching pixels in the same issued
+frame. Its proof includes the frame, geometry epoch, scope, preview identity,
+image dimensions and exact 5×5 RGBA patch. State or geometry changes cancel the
+observation; unrelated cursor/label overlap cannot satisfy it.
+
+Measure on the runner's single monotonic clock, from before input submission
+through receiving and parsing the successful wait response. This is an observed
+software upper bound, not a physical display measurement. Do not compare
+process-local clock epochs or subtract estimated capture overhead. After timing,
+`save` with `token` and an authorized relative `path` writes the exact retained
+image through the existing screenshot file capability; decode it and verify its
+patch against the reply. `cancel` releases the observation. The probe admits only
+one observation, is mutually exclusive with ordinary screenshots, bounds pending
+readback and retained image memory, and times out after four seconds or 256
+captures. It changes no artwork or synchronization policy. WASM returns an
+explicit unsupported error. The native harness retains the historical PNG-loop
+measurement under `-PresencePngDiagnostic`; results from the two methods are
+labeled separately.
+
+File actions through the control server use held filesystem capabilities:
+
+```json
+{"method":"app.worldFile","params":{"command":"komaphone.world.export","params":{"format":"png","path":"view.png","width":1280,"height":720}}}
+{"method":"app.worldFile","params":{"command":"komaphone.world.export","params":{"format":"archive","path":"canvas-archive"}}}
+{"method":"app.worldFile","params":{"command":"komaphone.world.restore","params":{"path":"canvas-archive"}}}
+```
+
+Export formats are `png`, `gif`, `sequence` and `archive`. PNG freezes the current
+catch-up position when reviewing; otherwise it uses the latest accepted scene.
+Its optional `elapsed_ms` selects the animation frame (the UI supplies its current
+playback time). GIF/sequence require a
+saved `tour` ID; dimensions are 1–2048 and frame rate 1–24. Archive export takes
+only `format` and `path`. Exports freeze the accepted scene revision, exclude
+unsynchronized changes and never overwrite an existing destination. The background
+job exposes completion/failure through `status.export`; cancel with
+`komaphone.world.export.cancel {}`. Direct automation execution does not grant
+ambient filesystem access.
+
+Restore takes `{path,canvas?}`, with an optional fresh destination ID for safe
+retry. In the K7 world-protocol-v2 implementation, sign in to the destination
+service; no source canvas needs to be open or present there. The worker validates
+the complete archive and streams its manifest and verified image files through
+profile/device-bound staging. Atomic commit creates an importer-only canvas with
+fresh canvas/object/operation/actor identities, preserving geometry, layer order,
+replay, tours, animation timing and historical credits. Imported authorship is
+file provenance, never live membership or account authority. Existing source and
+later destination edits are not overwritten. Exporting and importing again after
+new edits retains the complete history and original credits.
+
+The transport uses `ImportBegin`, `ImportChunk`, `ImportCommit` and `ImportCancel`;
+requests remain behind the authenticated worker and stable engine command above.
+Bounds are64KiB per raw chunk,32MiB manifest,512MiB total and128 retained historical
+actor entries. The actor bound protects directory response size and is not a
+canvas membership limit. Interrupted staging can retry its same destination ID;
+changing the archive bytes requires a new destination. Cancellation is refused
+once commit may have happened; inspect the destination and retry its same ID
+after an ambiguous confirmation. Filesystem capabilities remain mandatory for
+automation. Older protocol-v1 builds retain their original-service-only copy
+behavior; use matching updated client/service binaries for portable import.
+
+`komaphone.world.trash {}` lists only this account's recoverably deleted canvases.
+`komaphone.world.delete {canvas,expected_epoch}` requires the open canvas's owner
+and no unsynchronized edits. It moves the whole canvas to Trash, blocks normal
+reads/writes/presence, invalidates invitations and advances membership epochs
+without deleting artwork. `komaphone.world.undelete {canvas,expected_epoch}` uses
+the `owner_epoch` from the Trash entry. It restores the same canvas ID, artwork
+and previous member list; old offline queues retain their old epochs and cannot
+silently upload. This differs from archive restoration, which makes a new private
+copy. No permanent deletion command is exposed.
+
+`komaphone.world.stroke.copy {stroke}` selects one visible, synchronized stroke.
+`komaphone.world.stroke.paste {id?,anchor,offset:[x,y],scale}` creates a new stroke
+owned by the current account/device in the open destination canvas. Geometry,
+immutable source hash/revision and original artist credit are retained as copy
+provenance. Both source and destination membership are checked at upload, including
+on duplicate retries; later edits or deletion of either copy do not mutate the
+other. Rejected offline copies remain in local recovery. The UI places a copied
+stroke at the current view; media/complete animations retain their separate remix
+commands.
+
+Status separates `requests_pending` (durable/control requests) from
+`presence_requests_pending` (droppable live previews). `dropped_previews` counts
+coalesced/failed transient samples. Presence uses three fixed HTTP workers, at most
+one newest waiting publication and one waiting peer query, with a shared 52 ms
+dispatch interval and no catch-up bursts. Service-issued stream tokens and separate
+publication/observation serials order overlapping requests and replies. Account,
+canvas or epoch changes invalidate waiting work while old physical requests retain
+their slots until completion. This path does not delay durable local acknowledgments
+or consume the durable request queue. Downloaded canvases seed the gallery on offline restart, then a fresh
+authorized directory replaces that cached list. Thumbnail PNGs are bounded derived
+caches scoped to account, device, canvas, grant epoch and accepted revision.
+
+Local K5 canvases remain usable signed out. `komaphone.canvas.link {}` explicitly
+binds the protected local installation to a freshly verified service profile/device;
+`komaphone.canvas.link.status {}` reports the asynchronous result, backup and errors.
+`komaphone.canvas.link.rollback {}` records a reversible binding rollback. These
+operations preserve original art, IDs and authorship and do not upload local canvases.
+
+### Hosted account commands (K6.5)
+
+The native account seam uses `komaphone.account.signIn` (`endpoint` optional HTTPS origin, `display_name`, optional private `admission` capability), `komaphone.account.cancel` (empty object), `komaphone.account.signOut` (empty object), and `komaphone.account.select` (`slot` is a locally listed opaque ID, or null for a new isolated account). Commands are not journaled. Google authentication opens the system browser; OAuth state, nonce, code, PKCE verifier, device proofs and sessions never appear in ordinary status or exported artifacts.
+
+`komaphone.room.status` includes `hosted`, `signing_in`, `signed_in`, `account_slot`, and remembered `accounts` labels. Account selection preserves each slot's exact pending room requests and device writer, and pauses authentication until that account signs in again. It does not merge profiles, reassign artwork, invite the selected account to canvases, or publish another account's pending work. Signing out stops network work while local drawings remain available. The hosted endpoint rejects legacy pairing and legacy bearer credentials.
+
+These commands are implementation interfaces under K6.5 verification. See `docs/komaphone/status.md` for actual accepted evidence; synthetic identity tests do not establish working Google login or remote play.
+
+`komaphone.account.relocate` accepts an optional target `endpoint` (defaults to the configured hosted service) and `display_name`. It is an explicit move of the selected saved profile after the original service has been migrated. A fresh Google login must prove the same profile and device at the destination. Room transmission stays paused while the durable relocation journal coordinates the world queue rekey; queued operation IDs, writer sequence, recovery variants, bookmarks and review state must survive. An interrupted move is resumed by the same command, never by silently activating the old writer or a different account. A new independent account instead uses `komaphone.account.select` with null.

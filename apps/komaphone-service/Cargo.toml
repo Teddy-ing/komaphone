@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 photocraft-party = { path = "../../crates/party" }
+photocraft-scene = { workspace = true }
 photocraft-format = { workspace = true }
 photocraft-compose = { workspace = true }
 photocraft-doc = { workspace = true }
@@ -24,7 +25,10 @@ sha2 = "0.10"
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "blob", "backup"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 image = { workspace = true, features = ["png"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 tempfile = "=3.27.0"

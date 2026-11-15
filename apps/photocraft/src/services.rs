@@ -690,6 +690,8 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
     });
     let step: fn(&str, &serde_json::Value) -> photocraft_engine::Result<()> = photocraft_automation::workspace::authorize_desktop_engine_step;
     let automation_authorize = automation.is_some().then_some(step);
+    let automation_gallery_files = automation.as_ref().map(|workspace| workspace.gallery_files());
+    let automation_world_files = automation.as_ref().map(|workspace| workspace.world_files());
     let automation_command = automation.map(|_| {
         Box::new(|id: &str, params: &serde_json::Value| {
             photocraft_automation::workspace::authorize_desktop_engine_command(id, params).map_err(|error| error.to_string())
@@ -719,13 +721,15 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
         automation_open_pcraft,
         automation_save,
         automation_command,
+        automation_gallery_files,
+        automation_world_files,
         automation_authorize,
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
             photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
         })),
         inbox: None,
-        open_url: Some(Box::new(|url: &str| open::that(url).map_err(|e| e.to_string()))),
+        open_url: Some(Box::new(|url: &str| open::that_detached(url).map_err(|e| e.to_string()))),
         beep: Some(platform_beep),
         check_updates: crate::updates::service(),
         clipboard_set_image: Some({

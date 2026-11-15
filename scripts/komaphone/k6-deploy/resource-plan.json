@@ -1,0 +1,109 @@
+{
+  "kind": "komaphone_deployment_preparation",
+  "version": 1,
+  "prepared_on": "2026-11-08",
+  "project_id_owner_reported": "komaphone",
+  "deployment_authorized": false,
+  "region": "us-central1",
+  "zone": "us-central1-a",
+  "vm": {
+    "name": "komaphone-sync-1",
+    "machine_type": "e2-small",
+    "provisioning_model": "STANDARD",
+    "image_project": "debian-cloud",
+    "image_family": "debian-12",
+    "boot_disk": {
+      "type": "pd-standard",
+      "size_gib": 10
+    },
+    "data_disk": {
+      "name": "komaphone-data-1",
+      "type": "pd-standard",
+      "size_gib": 20,
+      "auto_delete": false
+    },
+    "service_bind": "127.0.0.1:43127",
+    "service_growth_quota_mib": 2048,
+    "canvas_member_limit": 4096,
+    "canvas_presence_connection_limit": 256,
+    "os_login": true
+  },
+  "network": {
+    "name": "komaphone-private",
+    "subnet_name": "komaphone-us-central1",
+    "subnet_range": "10.42.0.0/24",
+    "external_ipv4_count": 1,
+    "network_tier": "PREMIUM",
+    "public_tcp_ports": [
+      80,
+      443
+    ],
+    "ssh_tcp_port": 22,
+    "ssh_source_ranges": [
+      "35.235.240.0/20"
+    ],
+    "gameplay_admin_port_public": false
+  },
+  "backup": {
+    "bucket_name": null,
+    "location": "us-central1",
+    "storage_class": "STANDARD",
+    "uniform_bucket_level_access": true,
+    "public_access_prevention": "enforced",
+    "writer_iam_role": "roles/storage.objectCreator",
+    "writer_scope": "backup_bucket_only",
+    "schedule": "daily",
+    "live_lifecycle_days": 8,
+    "soft_delete_days": 7,
+    "planning_storage_gib": 32
+  },
+  "hostname": "komaphone.tedsoftware.org",
+  "dns": {
+    "use_existing_provider": true,
+    "cloud_dns_zone_count": 0,
+    "existing_www_unchanged": true,
+    "record_change_authorized": false,
+    "provider_owner_reported": "Namecheap"
+  },
+  "oauth_desktop_client_id": "981926394354-07f4s3dss4vgp7mteh0qe8e6dhk3s99o.apps.googleusercontent.com",
+  "oauth_setup_owner_reported": {
+    "app_name": "Komaphone Windows",
+    "audience": "External",
+    "status": "Testing",
+    "test_user_added": true,
+    "actual_sign_in_tested": false
+  },
+  "billing_linkage_owner_reported": true,
+  "billing_linkage_verified": false,
+  "credit_owner_reported": {
+    "kind": "Google Developer Program Premium",
+    "remaining_usd": 78.93,
+    "expires_on": "2027-04-29"
+  },
+  "credits_verified": false,
+  "budgets_usd": [
+    20,
+    30
+  ],
+  "monthly_estimate_usd_before_tax_credits": {
+    "light_5gib_egress_incremental": 18.83,
+    "higher_50gib_egress_incremental": 24.23,
+    "existing_domain_renewal_allocation_provisional": 1.0
+  },
+  "not_included": [
+    "load_balancer",
+    "cloud_nat",
+    "kubernetes",
+    "managed_database",
+    "paid_auth_platform",
+    "automatic_shutdown"
+  ],
+  "required_before_apply": [
+    "final Linux runtime and recovery measurements",
+    "public-service private admission and verified Google identity",
+    "project billing and credit details",
+    "owner-controlled DNS hostname and exact annual cost",
+    "tested release hashes, migration backup and compatible rollback",
+    "specific deployment authorization"
+  ]
+}

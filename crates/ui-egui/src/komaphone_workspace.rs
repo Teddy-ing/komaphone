@@ -99,6 +99,21 @@ pub fn home(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         if response.clicked() {
             project_command(app, "komaphone.project.new", json!({}));
         }
+        let response = ui.button("Gallery");
+        remember(ui, "home.gallery", &response);
+        if response.clicked() {
+            crate::komaphone_gallery::open(app);
+        }
+        let response = ui.button("Canvases");
+        remember(ui, "home.canvases", &response);
+        if response.clicked() {
+            crate::komaphone_canvas::open(app);
+        }
+        let response = ui.button("Shared canvases");
+        remember(ui, "home.worlds", &response);
+        if response.clicked() {
+            crate::komaphone_world::open(app);
+        }
         ui.add_space(12.0);
         ui.label(RichText::new("Your local drawings stay saved when the service is unavailable.").color(tokens.text_dim));
         ui.add_space(24.0);
@@ -110,6 +125,10 @@ pub fn home(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 /// canvas panel. Shared dialogs, brush pickers and editor overlays still render afterward.
 pub fn chrome(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     header(app, ui);
+    if app.ui.gallery.open {
+        crate::komaphone_rooms::window(app, ui.ctx());
+        return;
+    }
     if matches!(app.ui.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) && app.ui.transform.is_none() {
         brush_options(app, ui);
     } else {
@@ -162,13 +181,22 @@ fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if response.clicked() {
                     project_command(app, "komaphone.project.new", json!({}));
                 }
-                let response = ui.button("Local drafts");
-                remember(ui, "komaphone.project.list", &response);
+                let response = ui.button("Gallery");
+                remember(ui, "workspace.gallery", &response);
                 if response.clicked() {
-                    app.ui.komaphone.drafts_open = true;
-                    project_command(app, "komaphone.project.list", json!({}));
+                    crate::komaphone_gallery::open(app);
                 }
                 command(app, ui, "Import image", "file.placeEmbedded", json!({}));
+                let response = ui.button("Canvases");
+                remember(ui, "workspace.canvases", &response);
+                if response.clicked() {
+                    crate::komaphone_canvas::open(app);
+                }
+                let response = ui.button("Shared canvases");
+                remember(ui, "workspace.worlds", &response);
+                if response.clicked() {
+                    crate::komaphone_world::open(app);
+                }
                 ui.separator();
                 command(app, ui, "Undo", "edit.undo", json!({}));
                 command(app, ui, "Redo", "edit.redo", json!({}));

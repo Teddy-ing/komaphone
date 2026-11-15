@@ -11,6 +11,7 @@ next to them.
 | Path | Title | Author | Source | License |
 |---|---|---|---|---|
 | `docs/komaphone/k0-editor-fixture.json`, `docs/komaphone/k1-workspace-fixture.json` | Synthetic three-stroke drawing for workspace verification | OpenAI Codex | Original scripted geometry; K1 adapts the K0 fixture | MIT OR Apache-2.0 |
+| `apps/komaphone-service/tests/fixtures/tls/` | Public localhost-only TLS test certificate/key and derived DER RSA signing/verification fixtures | OpenAI Codex | Original generated test fixture and format conversions for synthetic OIDC tests; never a deployment identity | MIT OR Apache-2.0; adjacent fixture license |
 
 ## Bundled in the app
 

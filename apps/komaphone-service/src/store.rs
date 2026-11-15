@@ -8,19 +8,22 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 const APPLICATION_ID: u32 = 0x4b504852;
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 4;
 const MAX_IDENTITIES: u64 = 256;
 const MAX_ROOMS: u64 = 128;
 const MAX_RECEIPTS: u64 = 65536;
 
 #[derive(Clone, Copy, Debug)]
 pub struct StoreOptions {
+    /// Public hosted mode accepts verified, expiring sessions only.
+    pub hosted: bool,
     pub quota_bytes: u64,
     pub heartbeat_timeout_ms: u64,
+    pub world_limits: crate::worlds::Limits,
 }
 impl Default for StoreOptions {
     fn default() -> Self {
-        Self { quota_bytes: 2 * 1024 * 1024 * 1024, heartbeat_timeout_ms: 5000 }
+        Self { hosted: false, quota_bytes: 2 * 1024 * 1024 * 1024, heartbeat_timeout_ms: 5000, world_limits: Default::default() }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,18 +33,21 @@ pub enum SaveStage {
 }
 
 pub struct Store {
-    db: Connection,
-    options: StoreOptions,
+    pub(crate) db: Connection,
+    pub(crate) options: StoreOptions,
     heartbeats: BTreeMap<(RoomId, ParticipantId), u64>,
+    pub(crate) world_presence: crate::worlds::Presence,
 }
 
 impl Store {
     /// Open an existing local data file without replacing unknown schemas or corrupt data.
     /// The caller supplies a deterministic clock; the production service uses UTC origin + Instant.
     pub fn open(path: impl AsRef<Path>, options: StoreOptions, now_ms: u64) -> Result<Self> {
+        options.world_limits.validate()?;
         if options.quota_bytes < 64 * 1024 || options.quota_bytes > 16 * 1024 * 1024 * 1024 || !(100..=60000).contains(&options.heartbeat_timeout_ms) {
             return Err(Error::Invalid("store limits"));
         }
+        let path = path.as_ref();
         let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -74,19 +80,28 @@ impl Store {
         }
         if version == 0 {
             initialize(&mut db)?;
+        } else if version == 1 {
+            crate::identity::migrate(&mut db, path)?;
         }
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {
             return Err(Error::Storage);
         }
         let tx = db.transaction()?;
+        crate::identity::verify(&tx)?;
         assets::verify_store(&tx)?;
+        crate::archive::verify(&tx)?;
         for mut room in all_rooms(&tx)? {
+            assets::verify_room_dependencies(&tx, &room)?;
             room.restart(now_ms)?;
             save_room(&tx, &room)?;
         }
         tx.commit()?;
-        Ok(Self { db, options, heartbeats: BTreeMap::new() })
+        crate::identity::hosted::initialize(&mut db, path)?;
+        // Hosted tables precede world-v4 so the global version barrier and the
+        // import tables can commit together, including upgrades from v1/v2.
+        crate::worlds::initialize(&db, path)?;
+        Ok(Self { db, options, heartbeats: BTreeMap::new(), world_presence: Default::default() })
     }
 
     pub fn execute(&mut self, credential: Option<&str>, request: &RpcRequest, now_ms: u64) -> Result<RpcResponse> {
@@ -100,16 +115,34 @@ impl Store {
         if request_bytes.len() > photocraft_party::MAX_MESSAGE_BYTES {
             return Err(DomainError::Limit("request bytes").into());
         }
+        let authenticated = if matches!(request.operation, Operation::Pair { .. }) {
+            if self.options.hosted {
+                return Err(DomainError::Unauthorized.into());
+            }
+            None
+        } else {
+            let context = self.identity_authenticate(credential.ok_or(DomainError::Unauthorized)?, now_ms)?;
+            Some(self.identity_participant(context)?)
+        };
         let tx = self.db.transaction()?;
         let actor = match &request.operation {
             Operation::Pair { participant, credential } => {
                 pair(&tx, participant, credential)?;
                 participant.clone()
             }
-            _ => authenticate(&tx, credential)?,
+            _ => authenticated.ok_or(DomainError::Unauthorized)?,
         };
         let digest = digest(&request_bytes);
-        let durable = !matches!(request.operation, Operation::Poll { .. } | Operation::Fetch { .. } | Operation::Notes { .. });
+        let durable = !matches!(
+            request.operation,
+            Operation::Poll { .. }
+                | Operation::Fetch { .. }
+                | Operation::Notes { .. }
+                | Operation::History { .. }
+                | Operation::Game { .. }
+                | Operation::GameFetch { .. }
+                | Operation::GameNotes { .. }
+        );
         if durable && let Some((prior_hash, response)) = receipt(&tx, actor.id, request.request_id)? {
             if prior_hash != digest {
                 return Err(DomainError::Conflict.into());
@@ -166,17 +199,39 @@ impl Store {
 
     /// Consistent SQLite backup, never a copy of an active database file.
     pub fn backup(&self, destination: impl AsRef<Path>) -> Result<()> {
-        if destination.as_ref().exists() {
-            return Err(Error::Invalid("backup destination already exists"));
-        }
-        let _reserved = std::fs::OpenOptions::new().write(true).create_new(true).open(destination.as_ref())?;
-        self.db.backup("main", destination.as_ref(), None::<fn(rusqlite::backup::Progress)>)?;
-        let db = Connection::open_with_flags(destination, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let tx = db.unchecked_transaction()?;
-        assets::verify_store(&tx)?;
-        all_rooms(&tx)?;
-        Ok(())
+        crate::backup::copy(&self.db, destination.as_ref())
     }
+
+    /// Copy a consistent, verified backup or restore without modifying the source or
+    /// replacing a destination. A service restore uses a fresh, stopped data directory.
+    pub fn copy_verified(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<()> {
+        let db = Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        crate::backup::copy(&db, destination.as_ref())
+    }
+}
+
+pub(crate) fn verify_database(db: &Connection) -> Result<()> {
+    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let app: u32 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    if !(1..=SCHEMA).contains(&version) || app != APPLICATION_ID {
+        return Err(Error::Schema);
+    }
+    let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if check != "ok" {
+        return Err(Error::Storage);
+    }
+    let tx = db.unchecked_transaction()?;
+    if version >= 2 {
+        crate::identity::verify(&tx)?;
+        crate::identity::hosted::verify(&tx)?;
+    }
+    assets::verify_store(&tx)?;
+    for room in all_rooms(&tx)? {
+        assets::verify_room_dependencies(&tx, &room)?;
+    }
+    crate::archive::verify(&tx)?;
+    crate::worlds::verify(&tx)?;
+    Ok(())
 }
 
 fn initialize(db: &mut Connection) -> Result<()> {
@@ -187,7 +242,10 @@ fn initialize(db: &mut Connection) -> Result<()> {
         CREATE TABLE receipts(actor TEXT NOT NULL,id TEXT NOT NULL,hash TEXT NOT NULL,response BLOB NOT NULL,PRIMARY KEY(actor,id));
         CREATE TABLE invitations(id TEXT PRIMARY KEY,room TEXT NOT NULL,verifier TEXT UNIQUE NOT NULL,expires INTEGER NOT NULL,remaining INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE objects(id INTEGER PRIMARY KEY,room TEXT NOT NULL,actor TEXT NOT NULL,hash TEXT NOT NULL,total INTEGER NOT NULL,received INTEGER NOT NULL,complete INTEGER NOT NULL,data BLOB NOT NULL,updated INTEGER NOT NULL,UNIQUE(room,actor,hash));")?;
-    tx.pragma_update(None, "user_version", SCHEMA)?;
+    crate::identity::initialize(&tx)?;
+    // Hosted initialization publishes version 3; world-v4 publishes the final
+    // downgrade barrier atomically with its additional import tables.
+    tx.pragma_update(None, "user_version", 2)?;
     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
     tx.commit()?;
     Ok(())
@@ -222,9 +280,10 @@ fn pair(tx: &Transaction<'_>, participant: &Participant, credential: &str) -> Re
         "INSERT INTO identities(actor,device,label,verifier) VALUES(?1,?2,?3,?4)",
         params![participant.id.as_str(), participant.device.as_str(), participant.display_name, verifier],
     )?;
+    crate::identity::register_legacy(tx, participant)?;
     Ok(())
 }
-fn authenticate(tx: &Transaction<'_>, credential: Option<&str>) -> Result<Participant> {
+pub(crate) fn authenticate(tx: &Transaction<'_>, credential: Option<&str>) -> Result<Participant> {
     let token = credential.ok_or(DomainError::Unauthorized)?;
     validate_secret(token).map_err(|_| DomainError::Unauthorized)?;
     let found: Option<(String, String, String)> = tx
@@ -295,7 +354,7 @@ fn room_response(room: &Room, actor: ParticipantId, outcome: Option<photocraft_p
 }
 fn room_target(operation: &Operation, response: &RpcResponse) -> Option<RoomId> {
     match operation {
-        Operation::Pair { .. } => None,
+        Operation::Pair { .. } | Operation::History { .. } | Operation::Game { .. } | Operation::GameFetch { .. } | Operation::GameNotes { .. } => None,
         Operation::Create { .. } => {
             if let RpcResponse::Room { view, .. } = response {
                 Some(view.id)
@@ -367,6 +426,10 @@ fn dispatch(tx: &Transaction<'_>, actor: &Participant, request: &RpcRequest, now
             assets::fetch(tx, *room, *hash, *offset)
         }
         Operation::Notes { room } => Ok(RpcResponse::Notes { notes: load_room(tx, *room)?.notes(actor.id)? }),
+        Operation::History { room, after_revision } => crate::archive::history(tx, *room, actor.id, *after_revision),
+        Operation::Game { room, game } => crate::archive::game(tx, *room, *game, actor.id),
+        Operation::GameFetch { room, game, revision, hash, offset } => crate::archive::fetch(tx, *room, *game, actor.id, *revision, *hash, *offset),
+        Operation::GameNotes { room, game } => crate::archive::notes(tx, *room, *game, actor.id),
     }
 }
 fn moderator(room: &Room, actor: ParticipantId) -> Result<()> {

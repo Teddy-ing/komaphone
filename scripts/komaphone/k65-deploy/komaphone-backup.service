@@ -1,0 +1,23 @@
+[Unit]
+Description=Komaphone consistent off-VM backup
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/komaphone
+ConditionPathIsMountPoint=/var/lib/komaphone
+
+[Service]
+Type=oneshot
+User=komaphone
+Group=komaphone
+EnvironmentFile=/etc/komaphone/backup.env
+Environment=CLOUDSDK_CONFIG=/var/lib/komaphone/gcloud-config
+ExecStart=/opt/komaphone/current/backup.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/komaphone
+UMask=0077
+MemoryMax=512M
+TimeoutStartSec=30min
+Nice=10

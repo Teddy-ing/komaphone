@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 photocraft-party = { path = "../party" }
+photocraft-scene = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -20,9 +21,14 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["blocking
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
 getrandom = { workspace = true }
 sha2 = "0.10"
+base64 = "=0.22.1"
+chrono = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+open = { version = "=5.4.5", features = ["shellexecute-on-windows"] }

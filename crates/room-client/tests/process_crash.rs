@@ -8,6 +8,16 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+fn publish_marker(root: &Path, bytes: impl AsRef<[u8]>) {
+    use std::io::Write;
+    let staged = root.join("ready.tmp");
+    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&staged).unwrap();
+    file.write_all(bytes.as_ref()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    std::fs::rename(staged, root.join("ready")).unwrap();
+}
+
 struct FixtureCredentials;
 impl CredentialStore for FixtureCredentials {
     fn get(&self, _: &str, _: &str) -> Result<Option<String>> {
@@ -47,7 +57,7 @@ fn process_child() {
         let pin = photocraft_room_client::FreezePin { room: view.id, epoch: view.epoch, assignment: assignment.id, project: assignment.project, revision: 1 };
         store.update_poll(view).unwrap();
         store.pin_freeze(pin.clone()).unwrap();
-        std::fs::write(root.join("ready"), serde_json::to_vec(&pin).unwrap()).unwrap();
+        publish_marker(root, serde_json::to_vec(&pin).unwrap());
         loop {
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -56,12 +66,12 @@ fn process_child() {
     if mode == "during_write" {
         let db = rusqlite::Connection::open(root.join("room.sqlite3")).unwrap();
         db.execute_batch("BEGIN IMMEDIATE; UPDATE outbox SET body=x'7b7d';").unwrap();
-        std::fs::write(root.join("ready"), id.as_str()).unwrap();
+        publish_marker(root, id.as_str());
         loop {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    std::fs::write(root.join("ready"), id.as_str()).unwrap();
+    publish_marker(root, id.as_str());
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }

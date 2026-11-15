@@ -1,9 +1,11 @@
 # Komaphone local private service
 
 `photocraft-sync` is a separate Rust service. It never uses the editor automation port.
-K2 supports **loopback HTTP only**; all non-loopback addresses fail closed. TLS and the
-separate-Windows-machine private-network route must be implemented and verified before
-the K4 friend-ready claim. This is not a public or paid deployment.
+Plain HTTP remains **loopback only**. K4 adds native HTTPS with explicit certificate/key
+files, frozen-roster historical game access and verified backup/restore commands.
+The [K4 service runbook](../../docs/komaphone/k4-service.md) prepares the private route;
+the separate-Windows-machine result must be recorded before a friend-ready claim.
+No public or paid deployment is implied.
 
 From the workspace with the Rust/MSVC environment loaded:
 
@@ -77,16 +79,36 @@ Operational limits: 256 paired identities, 128 rooms, 128 invitations per room,
 512 MiB total stored object bytes per room, within the configured database quota.
 Limits reject growth and preserve existing data; no automatic destructive cleanup is
 provided. Prior game snapshots remain in the archive table, with original game/project
-IDs protected against reuse. Gallery access and portable editable archives are K4 work.
+IDs protected against reuse. K4 History pages contain at most sixteen terminal game
+summaries. Game/asset/notes reads always check that game's frozen roster, including
+after later lobby membership changes. Hidden active games are unavailable.
 
-`Store::backup` uses SQLite's online backup API into a new destination, then validates
-room snapshots and hashes of complete objects. It refuses to overwrite an existing
-destination. `Store::open` validates schema, database integrity, bounded snapshots, and
-complete object hashes before serving or updating restored rooms. Keep a separate copy
-of the original database when diagnosing corruption; failures do not replace it.
-The K4 runbook will add portable archive/administration interfaces and retention policy.
+`--backup-to <new-file>` uses SQLite's consistent backup API and publishes a verified
+snapshot without overwriting another path. `--restore-from <backup>` restores into a
+fresh data directory and refuses an existing database. These commands start no listener
+and retain the source. `Store::open` validates schema, database integrity, bounded current
+and archived snapshots, and complete object hashes before serving restored rooms.
+See the K4 runbook for NTFS publication, trust, limits and fresh-restore instructions.
 
 ## Acceptance harness
+
+The K6 canvas endpoint also accepts `presence_open`, `presence_update` and
+`presence_read`. An authenticated open returns a random stream bound to that device,
+canvas and current membership epoch. Updates carry a positive publication serial;
+older or duplicate serials cannot replace a newer preview or renew its expiry.
+Snapshots carry a separate service observation serial so overlapping replies can be
+applied in service order. An expired or replaced stream returns HTTP 409
+`presence_stream`; credential and membership failures retain their distinct 401/403
+responses. Legacy `presence` writes are refused while that device/canvas has an
+active ordered stream. All presence actions share the existing 1,200/minute bucket.
+
+Visible peers expire after two seconds; stream leases expire after thirty seconds
+without a newer accepted publication. One bounded connection map counts both against
+`--canvas-presence-limit`, and replies retain the two-MiB byte limit. Committed stroke
+IDs suppress delayed previews on that stream; after 128 distinct completed IDs, the
+next commit invalidates the stream instead of evicting a protected ID. Restart,
+membership removal, leaving, Trash and device revocation invalidate the corresponding
+transient state. None of this changes the durable schema or drawing history.
 
 ```powershell
 cargo test -p photocraft-sync --offline --no-fail-fast

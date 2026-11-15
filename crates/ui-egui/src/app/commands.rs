@@ -38,6 +38,11 @@ impl PhotocraftApp {
         self.run_depth += 1;
         let r = self.run_command_at_depth(id, params);
         self.run_depth -= 1;
+        if r.is_ok() && id.starts_with("komaphone.canvas.") && !matches!(id, "komaphone.canvas.status" | "komaphone.canvas.list" | "komaphone.canvas.view") {
+            // A new accepted canvas action needs a new discard decision, even
+            // if it is queued before the native close event reaches the guard.
+            self.ui.canvas.close_approval = None;
+        }
         r
     }
 

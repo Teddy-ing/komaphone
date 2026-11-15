@@ -25,7 +25,11 @@ pub(crate) fn read_dropped(_f: &dyn egui::DroppedFile) -> Result<Vec<u8>, String
 impl PhotocraftApp {
     /// The document/focus identity the in-flight synthetic batch was queued for.
     fn synthetic_target(&self, ctx: &egui::Context) -> SyntheticTarget {
-        SyntheticTarget { document: self.document_identity(), focus: ctx.memory(|m| m.focused()) }
+        SyntheticTarget {
+            document: self.document_identity(),
+            focus: ctx.memory(|m| m.focused()),
+            canvas: self.ui.canvas.open.then(|| self.session.canvases.active.as_ref().map(|a| (a.id, self.session.canvases.activation))).flatten(),
+        }
     }
 
     fn synthetic_target_matches(&self, ctx: &egui::Context) -> bool {
@@ -41,6 +45,18 @@ impl PhotocraftApp {
     /// If a pass consumed it but PhotoCraft returned before handling input (fonts not ready), the
     /// same batch is appended again on the next hook, exactly once.
     pub(crate) fn inject_synthetic(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // eframe can retain an injected batch across hidden ticks. Keep its exact
+        // events long enough to withdraw them if canvas cancellation clears it.
+        let preserved = self.synthetic_batch.clone();
+        if self.cancel_stale_canvas_pass(ctx) {
+            if let Some(batch) = preserved {
+                remove_event_run(&mut raw_input.events, &batch);
+            }
+            return;
+        }
+        if self.synthetic.is_empty() && self.synthetic_batch.is_none() {
+            crate::control::clear_canvas_input(ctx);
+        }
         if self.synthetic_batch.is_some() {
             if !self.synthetic_target_matches(ctx) {
                 // eframe may already carry the batch in its preserved input: withdraw exactly
@@ -70,6 +86,38 @@ impl PhotocraftApp {
         self.synthetic_snapshot = Some(self.synthetic_target(ctx));
         raw_input.events.extend(events.iter().cloned());
         self.synthetic_batch = Some(events);
+    }
+
+    /// A worker reply or control request can switch canvases after the raw hook.
+    /// Unlike finite-editor input, these events must never reach another canvas.
+    /// Clear held state as well as the queue, and skip the stale interaction pass.
+    pub(crate) fn cancel_stale_canvas_pass(&mut self, ctx: &egui::Context) -> bool {
+        let pending = self.synthetic_batch.is_some() || !self.synthetic.is_empty();
+        let changed = pending
+            && (self.synthetic_snapshot.is_some_and(|queued| {
+                let current = self.synthetic_target(ctx).canvas;
+                (queued.canvas.is_some() || current.is_some()) && queued.canvas != current
+            }) || !crate::control::validate_canvas_input(self, ctx));
+        if changed {
+            self.cancel_synthetic("the canvas changed before screen input could be handled");
+            crate::control::clear_canvas_input(ctx);
+            self.ui.canvas.cancel_gesture_for_switch();
+            self.ui.world.cancel_gesture_for_switch();
+            self.canvas_input_cancelled = true;
+        }
+        if self.canvas_input_cancelled {
+            ctx.input_mut(|input| {
+                input.events.clear();
+                input.raw.events.clear();
+                input.pointer = egui::PointerState::default();
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+                input.keys_down.clear();
+                input.modifiers = egui::Modifiers::NONE;
+            });
+            ctx.stop_dragging();
+            ctx.request_repaint();
+        }
+        self.canvas_input_cancelled
     }
 
     /// A pass begins with the in-flight batch. The events are already in this pass's input, so a

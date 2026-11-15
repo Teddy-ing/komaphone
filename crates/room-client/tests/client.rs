@@ -248,7 +248,7 @@ fn future_database_schema_is_preserved() {
     let path = root.path().join("rooms.sqlite3");
     drop(paired(&path, MemoryCredentials::default()));
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 2).unwrap();
+    db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
     let before = std::fs::read(&path).unwrap();
     assert!(Outbox::open(&path, Box::new(MemoryCredentials::default())).is_err());
@@ -282,7 +282,12 @@ fn one_response(response: String) -> (String, std::thread::JoinHandle<()>) {
                 Err(error) => panic!("Test listener did not accept a request: {error}"),
             }
         };
+        // Windows may inherit the listener's nonblocking mode on accept. The
+        // accept loop is bounded separately; request IO must wait for bytes with
+        // deadlines instead of racing the client's first write with WouldBlock.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         let mut bytes = [0u8; 8192];
         let _ = stream.read(&mut bytes).unwrap();
         stream.write_all(response.as_bytes()).unwrap();

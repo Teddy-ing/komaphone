@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use crate::PhotocraftApp;
 use crate::widgets::{ButtonRole, DialogButton};
 
+pub(crate) mod canvas_close;
+pub(crate) mod world_close;
+
 const EXIT: &str = "file.exit";
 
 /// An action waiting on the user, and the dirty documents still to ask about.
@@ -98,6 +101,9 @@ fn discarded(app: &PhotocraftApp, id: &str, params: &Value) -> (Option<DocId>, V
 
 /// Park `id` behind a prompt if it would discard unsaved work. Returns whether it did.
 pub fn intercept(app: &mut PhotocraftApp, id: &str, params: &Value) -> bool {
+    if id == EXIT && (world_close::intercept(app) || canvas_close::intercept(app)) {
+        return true;
+    }
     let (target, docs) = discarded(app, id, params);
     if docs.is_empty() {
         return false;
@@ -128,6 +134,12 @@ pub fn intercept(app: &mut PhotocraftApp, id: &str, params: &Value) -> bool {
 /// Puts up `prompt`. One over several documents shows the document it asks about first; each
 /// later one is shown as it comes up (see [`advance`]).
 fn ask(app: &mut PhotocraftApp, mut prompt: Prompt) {
+    if prompt.id == EXIT {
+        // This finite-document decision can delay or cancel shutdown. A prior
+        // canvas discard answer must not cover changes made during that delay.
+        app.ui.canvas.close_approval = None;
+        app.ui.world.close_approval = None;
+    }
     if !matches!(reach(&prompt.id), Some(Reach::Target)) {
         // Keep an unfinished canvas gesture on its originating tab until it is answered.
         // Otherwise a multi-document quit could make its preview appear to belong to the
@@ -154,7 +166,9 @@ impl PhotocraftApp {
     /// Whether closing now would lose work: a document has unsaved changes and closing wasn't
     /// confirmed. The web build has the browser ask before leaving the page while this holds (#1380).
     pub fn has_unsaved_work(&self) -> bool {
-        !self.allow_close && self.session.documents().iter().any(|d| needs_confirmation(self, EXIT, d.doc.id))
+        world_close::has_unsaved_work(self)
+            || canvas_close::has_unsaved_work(self)
+            || (!self.allow_close && self.session.documents().iter().any(|d| needs_confirmation(self, EXIT, d.doc.id)))
     }
 }
 
@@ -165,7 +179,7 @@ pub fn guard_window_close(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if !ctx.input(|i| i.viewport().close_requested()) {
         return;
     }
-    if !app.allow_close && intercept(app, EXIT, &Value::Null) {
+    if world_close::intercept(app) || canvas_close::intercept(app) || (!app.allow_close && intercept(app, EXIT, &Value::Null)) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         return;
@@ -297,6 +311,12 @@ fn couldnt_save(e: String) -> String {
 }
 
 pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if world_close::show(app, ctx) {
+        return;
+    }
+    if canvas_close::show(app, ctx) {
+        return;
+    }
     // Save can ask for a path and then TIFF or Targa Options, and then write in the background.
     // Wait for all three; cancellation or a failed save brings us back.
     if app.file_dialog_open() || app.save_options_open() || app.saving() {
@@ -447,7 +467,11 @@ fn show_local(app: &mut PhotocraftApp, ctx: &egui::Context, doc: DocId, name: &s
 fn apply(app: &mut PhotocraftApp, ctx: &egui::Context, doc: DocId, answer: Answer) {
     let local = app.discard.as_ref().is_some_and(|p| local_draft(app, &p.id, doc));
     match answer {
-        Answer::Cancel => app.discard = None,
+        Answer::Cancel => {
+            app.discard = None;
+            app.ui.canvas.close_approval = None;
+            app.ui.world.close_approval = None;
+        }
         Answer::Discard => advance(app, ctx),
         Answer::Save if local => {
             show_tab(app, Some(doc));

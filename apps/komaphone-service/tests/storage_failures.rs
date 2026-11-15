@@ -26,7 +26,19 @@ fn setup(path: &std::path::Path, quota_bytes: u64) -> (Store, photocraft_party::
 fn actual_sqlite_page_quota_rolls_back_upload_without_ack_or_losing_room() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("service.sqlite3");
-    let (mut store, room) = setup(&path, 128 * 1024);
+    let (store, room) = setup(&path, StoreOptions::default().quota_bytes);
+    drop(store);
+    // Identity/world schema growth must not turn this into an initialization
+    // failure test. Measure the initialized fixture and permit only 64 KiB of
+    // growth; the unchanged 256 KiB upload below still exhausts actual SQLite.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let pages: i64 = db.pragma_query_value(None, "page_count", |r| r.get(0)).unwrap();
+    let page_size: i64 = db.pragma_query_value(None, "page_size", |r| r.get(0)).unwrap();
+    let base_bytes = u64::try_from(pages.checked_mul(page_size).unwrap()).unwrap();
+    drop(db);
+    let quota_bytes = base_bytes.checked_add(64 * 1024).unwrap();
+    println!("SQLite initialized fixture: {base_bytes} bytes; failure-test quota: {quota_bytes} bytes");
+    let mut store = Store::open(&path, StoreOptions { quota_bytes, ..Default::default() }, 0).unwrap();
     let bytes = vec![1u8; 32768];
     let hash = AssetHash::new(&format!("{:x}", Sha256::digest(&bytes))).unwrap();
     let request = req(3, Operation::Upload { room, hash, total: 256 * 1024, offset: 0, bytes, finish: false });

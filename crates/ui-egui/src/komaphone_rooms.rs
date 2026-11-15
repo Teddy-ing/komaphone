@@ -14,6 +14,9 @@ pub struct RoomUi {
     pub room_id: String,
     #[serde(skip)]
     pub invitation: String,
+    #[serde(skip)]
+    pub admission: String,
+    pub advanced_connection: bool,
     pub corpse: bool,
     pub rotations: u8,
     pub timed: bool,
@@ -46,10 +49,12 @@ impl Default for RoomUi {
     fn default() -> Self {
         Self {
             open: false,
-            endpoint: "http://127.0.0.1:43127".into(),
+            endpoint: "https://komaphone.tedsoftware.org".into(),
             display_name: String::new(),
             room_id: String::new(),
             invitation: String::new(),
+            admission: String::new(),
+            advanced_connection: false,
             corpse: false,
             rotations: 2,
             timed: false,
@@ -91,13 +96,16 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
     egui::Window::new("Private room").id(egui::Id::unique("komaphone-rooms")).open(&mut open).default_width(650.0).max_height(560.0).show(ctx, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let tokens = Tokens::get(ctx);
-            let status = app.session.rooms.status.clone();
             ui.label(RichText::new("Private games for two or three players").strong());
             ui.label("Your local drawings stay saved when the service is unavailable.");
             ui.separator();
             connection(app, ui);
+            let status = app.session.rooms.status.clone();
             if let Some(error) = status.error.as_ref() {
                 ui.colored_label(tokens.text, error);
+            }
+            if let Some(notice) = status.notice.as_ref() {
+                ui.label(RichText::new(notice).color(tokens.text_dim));
             }
             if status.pending > 0 {
                 ui.label(format!("{} request(s) waiting for service confirmation", status.pending));
@@ -122,23 +130,121 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
     app.ui.rooms.open &= open;
 }
 fn connection(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    let status = &app.session.rooms.status;
+    let status = app.session.rooms.status.clone();
+    if app.ui.rooms.display_name.is_empty()
+        && let Some(profile) = &status.profile
+    {
+        app.ui.rooms.display_name = profile.display_name.clone();
+    }
+    if status.signing_in {
+        ui.label("Finish signing in with Google in your browser.");
+        button(app, ui, "Cancel sign-in", "komaphone.account.cancel", json!({}));
+        return;
+    }
+    if let Some(relocation) = &status.relocation {
+        ui.label("This account move is paused. Its saved drawings and queued edits are retained.");
+        button(
+            app,
+            ui,
+            "Resume account move",
+            "komaphone.account.relocate",
+            json!({"endpoint":relocation.to_endpoint,"display_name":app.ui.rooms.display_name}),
+        );
+        button(app, ui, "Sign out", "komaphone.account.signOut", json!({}));
+        return;
+    }
     if status.paired {
         ui.horizontal_wrapped(|ui| {
             ui.strong(status.profile.as_ref().map_or("Your profile", |p| p.display_name.as_str()));
-            ui.label(if status.connected { "Connected" } else { "Service unavailable · reconnecting" });
+            ui.label(if status.hosted && !status.signed_in {
+                "Sign in to reconnect"
+            } else if !status.polling {
+                "Connection paused"
+            } else if status.connected {
+                "Connected"
+            } else {
+                "Service unavailable · reconnecting"
+            });
         });
+        if !status.polling && (!status.hosted || status.signed_in) {
+            ui.label("Reconnect to resume syncing your saved artwork.");
+            // Durable pending work is why a paused account may need Retry; it
+            // must not disable this explicit recovery action via Rooms::busy.
+            button(app, ui, "Reconnect", "komaphone.room.retry", json!({}));
+        }
     }
     if !status.paired {
         egui::Grid::new("room-connection").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-            ui.label("Service address");
-            ui.text_edit_singleline(&mut app.ui.rooms.endpoint);
-            ui.end_row();
-            ui.label("Your name");
-            ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.display_name).char_limit(96));
+            let label = ui.label("Your name");
+            ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.display_name).char_limit(96)).labelled_by(label.id);
             ui.end_row();
         });
-        button(app, ui, "Connect", "komaphone.room.connect", json!({"endpoint":app.ui.rooms.endpoint,"display_name":app.ui.rooms.display_name}));
+        ui.collapsing("First-time service invitation", |ui| {
+            let label = ui.label("Enter the private invitation from your service administrator.");
+            ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.admission).password(true).char_limit(64)).labelled_by(label.id);
+        });
+        let response = ui.add_enabled(app.session.is_enabled("komaphone.account.signIn"), egui::Button::new("Sign in with Google"));
+        crate::komaphone_workspace::remember(ui, "komaphone.account.signIn", &response);
+        if response.clicked() {
+            let admission = std::mem::take(&mut app.ui.rooms.admission);
+            let endpoint = if app.ui.rooms.advanced_connection { app.ui.rooms.endpoint.as_str() } else { "https://komaphone.tedsoftware.org" };
+            run(app, "komaphone.account.signIn", json!({"endpoint":endpoint,"display_name":app.ui.rooms.display_name,"admission":admission}));
+        }
+        ui.label("Local drawing is available without signing in.");
+        ui.collapsing("Advanced connection", |ui| {
+            let label = ui.label("Service address");
+            ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.endpoint).char_limit(2048)).labelled_by(label.id);
+            ui.checkbox(&mut app.ui.rooms.advanced_connection, "Use this custom service address");
+            if app.ui.rooms.advanced_connection {
+                button(
+                    app,
+                    ui,
+                    "Connect to private network",
+                    "komaphone.room.connect",
+                    json!({"endpoint":app.ui.rooms.endpoint,"display_name":app.ui.rooms.display_name}),
+                );
+            }
+        });
+    }
+    if status.profile.is_some() && status.endpoint.as_deref() != Some("https://komaphone.tedsoftware.org") {
+        ui.collapsing("Move this saved profile to hosting", |ui| {
+            ui.label("Use this after the administrator moves the original service. Google sign-in must prove ownership before queued artwork moves.");
+            button(app, ui, "Move saved profile to hosting", "komaphone.account.relocate", json!({"display_name":app.ui.rooms.display_name}));
+        });
+    }
+    if status.hosted || !status.accounts.is_empty() {
+        if status.signed_in {
+            button(app, ui, "Sign out", "komaphone.account.signOut", json!({}));
+        } else if status.paired {
+            button(
+                app,
+                ui,
+                "Sign in again",
+                "komaphone.account.signIn",
+                json!({"endpoint":status.endpoint.as_deref().unwrap_or("https://komaphone.tedsoftware.org"),"display_name":app.ui.rooms.display_name}),
+            );
+        }
+        button(app, ui, "Use another account", "komaphone.account.select", json!({"slot":null}));
+        if status.accounts.len() > 1 {
+            ui.collapsing("Saved accounts on this computer", |ui| {
+                for account in &status.accounts {
+                    if status.account_slot.as_deref() == Some(&account.id) {
+                        continue;
+                    }
+                    let label = account.profile.as_ref().map_or("Unfinished sign-in", |profile| profile.display_name.as_str());
+                    let response = ui.add_enabled(app.session.is_enabled("komaphone.account.select"), egui::Button::new(label));
+                    if response.clicked() {
+                        if let Some(endpoint) = &account.endpoint {
+                            app.ui.rooms.endpoint = endpoint.clone();
+                        }
+                        if let Some(profile) = &account.profile {
+                            app.ui.rooms.display_name = profile.display_name.clone();
+                        }
+                        run(app, "komaphone.account.select", json!({"slot":account.id}));
+                    }
+                }
+            });
+        }
     }
 }
 fn options(ui: &mut egui::Ui, state: &mut RoomUi) {
@@ -172,11 +278,11 @@ fn create_join(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.separator();
     ui.strong("Join a friend");
     egui::Grid::new("room-join").num_columns(2).show(ui, |ui| {
-        ui.label("Room ID");
-        ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.room_id).char_limit(32));
+        let label = ui.label("Room ID");
+        ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.room_id).char_limit(32)).labelled_by(label.id);
         ui.end_row();
-        ui.label("Private invitation");
-        ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.invitation).password(true).char_limit(64));
+        let label = ui.label("Private invitation");
+        ui.add(egui::TextEdit::singleline(&mut app.ui.rooms.invitation).password(true).char_limit(64)).labelled_by(label.id);
         ui.end_row();
     });
     let response = ui.add_enabled(app.session.is_enabled("komaphone.room.join"), egui::Button::new("Join room"));
@@ -320,4 +426,147 @@ fn invitation_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
     });
     ui.weak("Invitations expire after one hour. Share the service address, room ID and invitation privately.");
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn account_capabilities_are_excluded_from_settings_and_debug() {
+        let state = RoomUi { admission: "private-admission".into(), invitation: "private-room-invite".into(), ..RoomUi::default() };
+        let saved = serde_json::to_string(&state).unwrap();
+        let debug = format!("{state:?}");
+        for secret in [&state.admission, &state.invitation] {
+            assert!(!saved.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+        let restored: RoomUi = serde_json::from_str(&saved).unwrap();
+        assert!(restored.admission.is_empty() && restored.invitation.is_empty());
+    }
+
+    #[test]
+    fn paused_account_move_retains_a_visible_sign_out_control() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.rooms.status.relocation = Some(
+            serde_json::from_value(json!({
+                "id":"00000000000000000000000000000001",
+                "from_endpoint":"http://127.0.0.1:43127",
+                "to_endpoint":"https://komaphone.tedsoftware.org",
+                "profile":"00000000000000000000000000000002",
+                "device":"00000000000000000000000000000003"
+            }))
+            .unwrap(),
+        );
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))), ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| connection(&mut app, ui));
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(crate::komaphone_workspace::control_rect(&ctx, "komaphone.account.signOut").is_some());
+        assert!(crate::komaphone_workspace::control_rect(&ctx, "komaphone.account.relocate").is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn paused_app(pending: usize) -> (tempfile::TempDir, PhotocraftApp) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        // Empty isolated worker provides the command seam, with no endpoint or
+        // credential. Presentation below is synthetic and never polled into it.
+        app.session.enable_rooms(directory.path().join("rooms.sqlite3"), Default::default()).unwrap();
+        app.session.rooms.status = serde_json::from_value(json!({
+            "hosted":true,"signed_in":true,"paired":true,"polling":false,"connected":false,"pending":pending,
+            "endpoint":"https://komaphone.tedsoftware.org",
+            "profile":{"id":"11111111111111111111111111111111","device":"22222222222222222222222222222222","display_name":"Saved account"}
+        }))
+        .unwrap();
+        app.ui.rooms.open = true;
+        (directory, app)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn paused_saved_account_reconnect_is_explicit_and_keeps_queued_work_enabled() {
+        for pending in [0, 3] {
+            let (_directory, app) = paused_app(pending);
+            let mut h =
+                egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 720.0)).build_ui_state(|ui, app: &mut PhotocraftApp| connection(app, ui), app);
+            h.run_steps(3);
+            assert!(h.query_by_label("Connection paused").is_some());
+            assert!(h.query_by_label("Service unavailable · reconnecting").is_none());
+            assert!(!h.get_by_label("Reconnect").accesskit_node().is_disabled());
+            assert_eq!(h.state().session.rooms.status.pending, pending);
+            assert!(!h.state().session.rooms.status.polling, "rendering never resumes a paused account");
+            assert_eq!(h.state().session.rooms.busy(), pending > 0, "rendering does not dispatch Retry");
+            if pending == 0 {
+                h.get_by_label("Reconnect").click();
+                h.run_steps(2);
+                assert!(h.state().session.rooms.busy(), "explicit click dispatches existing room.retry");
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reconnect_is_absent_during_signout_login_relocation_and_active_polling() {
+        #[derive(Debug)]
+        enum AccountState {
+            SignedOut,
+            SigningIn,
+            Relocating,
+            Polling,
+        }
+        for state in [AccountState::SignedOut, AccountState::SigningIn, AccountState::Relocating, AccountState::Polling] {
+            let (_directory, mut app) = paused_app(0);
+            match state {
+                AccountState::SignedOut => app.session.rooms.status.signed_in = false,
+                AccountState::SigningIn => app.session.rooms.status.signing_in = true,
+                AccountState::Relocating => {
+                    app.session.rooms.status.relocation = Some(
+                        serde_json::from_value(json!({
+                            "id":"00000000000000000000000000000001",
+                            "from_endpoint":"http://127.0.0.1:43127",
+                            "to_endpoint":"https://komaphone.tedsoftware.org",
+                            "profile":"11111111111111111111111111111111",
+                            "device":"22222222222222222222222222222222"
+                        }))
+                        .unwrap(),
+                    );
+                }
+                AccountState::Polling => app.session.rooms.status.polling = true,
+            }
+            let mut h =
+                egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 720.0)).build_ui_state(|ui, app: &mut PhotocraftApp| connection(app, ui), app);
+            h.run_steps(3);
+            assert!(h.query_by_label("Reconnect").is_none(), "{state:?}");
+            assert!(!h.state().session.rooms.busy(), "presentation never queues a network action");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn capture_paused_reconnect_fixture() {
+        let Some(directory) = std::env::var_os("KOMAPHONE_RECONNECT_FIXTURES").map(std::path::PathBuf::from) else { return };
+        let _gpu = photocraft_testkit::gpu_lock();
+        std::fs::create_dir_all(&directory).unwrap();
+        for (width, height, pending) in [(1280.0, 800.0, 0), (760.0, 560.0, 3)] {
+            let (_data, app) = paused_app(pending);
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, height))
+                .with_pixels_per_point(1.0)
+                .wgpu()
+                .build_ui_state(|ui, app: &mut PhotocraftApp| window(app, ui.ctx()), app);
+            PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::Studio);
+            h.run_steps(5);
+            assert!(!h.get_by_label("Reconnect").accesskit_node().is_disabled());
+            h.render().unwrap().save(directory.join(format!("paused-reconnect-{width}-{height}-pending-{pending}.png"))).unwrap();
+        }
+    }
 }

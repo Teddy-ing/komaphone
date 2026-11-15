@@ -183,6 +183,43 @@ fn settling_counts_real_ui_passes_and_issues_once() {
 }
 
 #[test]
+fn timing_capture_skips_animation_delay_but_keeps_layout_and_geometry_guards() {
+    for fast in [false, true] {
+        let ctx = Context::default();
+        ctx.style_mut_of(ctx.theme(), |style| style.animation_time = 1.0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut app = crate::PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default()).with_control(receiver);
+        let before = geometry(80.0, 60.0, None);
+        app.captures.note_geometry(before);
+        let params = if fast { serde_json::json!({"focus": false, "settle": false}) } else { serde_json::json!({"focus": false}) };
+        let (request, _reply) = crate::ControlRequest::new("ui.screenshot", params);
+        sender.send(request).unwrap();
+        app.drain_control(&ctx);
+        let now = Instant::now();
+        let mut callbacks = Vec::new();
+        for _ in 0..SETTLE_PASSES - 1 {
+            app.captures.note_pass();
+            assert!(app.captures.issue(&ctx, now, None, |cb| callbacks.push(cb)).is_empty());
+            assert!(callbacks.is_empty(), "fast capture still waits for three real layout passes");
+        }
+        app.captures.note_pass();
+        assert!(app.captures.issue(&ctx, now, None, |cb| callbacks.push(cb)).is_empty());
+        if fast {
+            assert_eq!(callbacks.len(), 1, "explicit opt-out skips only the animation clock");
+            callbacks.pop().unwrap().complete(image(&before));
+            let resized = geometry(90.0, 70.0, None);
+            app.captures.note_geometry(resized);
+            assert!(app.captures.drain(now, Some(resized), None).is_empty(), "stale pixels are retried, never saved");
+            assert_eq!(app.captures.pending(), 1);
+        } else {
+            assert!(callbacks.is_empty(), "default capture retains its animation delay");
+            assert!(app.captures.issue(&ctx, now + Duration::from_secs(3), None, |cb| callbacks.push(cb)).is_empty());
+            assert_eq!(callbacks.len(), 1);
+        }
+    }
+}
+
+#[test]
 fn a_completed_image_is_saved_only_when_drained() {
     let ctx = Context::default();
     let now = Instant::now();

@@ -60,6 +60,18 @@ harnesses supply network acceptance evidence. On restricted Windows runners the 
 tests require access to loopback sockets and Credential Manager; blocked tests are not
 passes. `cargo clippy -p photocraft-room-client --all-targets -- -D warnings` is the lint gate.
 
+K6 shared canvases use a separate durable world worker and outbox. Their disposable
+presence pipeline has three fixed HTTP slots, one newest waiting publication and one
+coalesced peer query. All dispatches, including stream negotiation, share a 52 ms
+minimum interval (at most 1,154 per minute), preserved across canvas/account switches.
+The UI samples the current gesture each frame; the worker owns network pacing.
+Service-issued stream tokens and publication serials prevent old packets from
+replacing newer gestures, while service observation serials order peer snapshots.
+Every superseded request retires its engine receipt. Late replies cannot cross an
+account, canvas, membership epoch or replaced stream, and accepted strokes suppress
+matching stale previews. The durable artwork lane remains independent of all three
+slots. These transient records are not replay or local-save acknowledgments.
+
 After stopping **isolated test** app instances, remove only their own credentials with:
 
 ```powershell

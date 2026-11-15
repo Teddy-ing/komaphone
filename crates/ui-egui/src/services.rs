@@ -438,6 +438,11 @@ pub struct Services {
     pub automation_write: Option<AutomationWriteFn>,
     pub automation_open_pcraft: Option<AutomationOpenPcraftFn>,
     pub automation_command: Option<AutomationCommandFn>,
+    /// Explicit launch-time directory capabilities for gallery files. The native adapter
+    /// stages I/O and publishes through held roots; ordinary ambient commands stay denied.
+    pub automation_gallery_files: Option<std::sync::Arc<dyn photocraft_engine::gallery::GalleryFileAccess>>,
+    /// Held filesystem capabilities for shared-canvas exports; never supplied by command JSON.
+    pub automation_world_files: Option<std::sync::Arc<dyn photocraft_engine::world_assets::WorldFileAccess>>,
     /// Same policy as [`Self::automation_command`], as a function pointer the engine calls for
     /// each step of `actions.play`. Installed on the session only while a control request or
     /// an automation-driven [`PhotocraftApp::run`] runs, so a local play of a recorded `file.*` step still works.
