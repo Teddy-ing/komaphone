@@ -1,4 +1,4 @@
-# Synthetic packaging tests; never read an actual downloaded OAuth configuration.
+﻿# Synthetic packaging tests; never read an actual downloaded OAuth configuration.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'sanitize-google-config.ps1')
@@ -18,7 +18,12 @@ try {
     $input = @{installed=@{client_id=$clientId;client_secret='synthetic-value&=only';token_uri='https://untrusted.invalid';project_id='excluded'};unrelated='excluded'}
     [IO.File]::WriteAllBytes($file, (Json-Bytes $input))
     $sanitized = Read-K65GoogleDesktopConfiguration $file
-    $parsed = $sanitized | ConvertFrom-Json -AsHashtable
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $parsed = $sanitized | ConvertFrom-Json -AsHashtable
+    } else {
+        Add-Type -AssemblyName System.Web.Extensions
+        $parsed = [Web.Script.Serialization.JavaScriptSerializer]::new().DeserializeObject($sanitized)
+    }
     if ($parsed.Count -ne 1 -or $parsed.installed.Count -ne 2 -or $parsed.installed.client_id -cne $clientId -or $parsed.installed.client_secret -cne 'synthetic-value&=only') {
         throw 'Sanitized output did not retain exactly the pinned public-client fields.'
     }

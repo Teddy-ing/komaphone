@@ -284,7 +284,7 @@ try {
     $threeLobby = Wait-K2 2 { param($s) $s.status.room.phase -eq 'lobby' -and $s.status.room.members.Count -eq 3 -and $s.status.pending -eq 0 } 'waiting participant promoted'
     Wait-K2 3 { param($s) $s.status.room.phase -eq 'lobby' -and $s.status.room.revision -ge $threeLobby.status.room.revision } 'third player observed promoted lobby' | Out-Null
     Invoke-K2 3 'komaphone.room.leave' | Out-Null
-    $left = Wait-K2 3 { param($s) $s.status.pending -eq 0 -and -not $s.status.polling } 'native membership leave committed'
+    $left = Wait-K2 3 { param($s) $s.status.pending -eq 0 -and $null -eq $s.status.room -and $s.status.polling } 'native membership leave committed'
     Wait-K2 2 { param($s) $s.status.room.members.Count -eq 2 } 'host observed native leave' | Out-Null
     Invoke-K2 2 'komaphone.room.invite' @{ expires_in_ms = 3600000; uses = 1 } | Out-Null
     Wait-K2 2 { param($s) $s.status.invitation_id -and $s.status.pending -eq 0 } 'return invitation committed' | Out-Null

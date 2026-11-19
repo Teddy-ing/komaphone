@@ -14,7 +14,11 @@ pub fn sync(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let reveal_game = app.session.rooms.status.room.as_ref().and_then(|room| room.reveal.first()).map(|entry| match entry {
         RevealedEntry::Artwork { assignment, .. } | RevealedEntry::Missing { assignment, .. } => assignment.id.game,
     });
-    if reveal_game.is_some() && reveal_game != app.ui.rooms.announced_reveal {
+    if reveal_game.is_none() {
+        app.ui.rooms.announced_reveal = None;
+        app.ui.rooms.restored_reveal = None;
+        app.ui.rooms.requested_notes = None;
+    } else if reveal_game != app.ui.rooms.announced_reveal {
         app.ui.rooms.announced_reveal = reveal_game;
         app.ui.rooms.view_reveal = true;
         if app.ui.komaphone.enabled {

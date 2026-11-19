@@ -742,13 +742,15 @@ fn handle(store: &mut Outbox, command: ClientCommand) -> Result<()> {
             if store.status().pending > 0 {
                 return Err(Error::Busy);
             }
-            store.enqueue(Operation::Create { mode, timer_ms }).map(|_| ())
+            store.enqueue(Operation::Create { mode, timer_ms })?;
+            store.resume_for_room_action()
         }
         ClientCommand::Join { room, invitation } => {
             if store.status().pending > 0 {
                 return Err(Error::Busy);
             }
-            store.enqueue(Operation::Join { room, invitation }).map(|_| ())
+            store.enqueue(Operation::Join { room, invitation })?;
+            store.resume_for_room_action()
         }
         ClientCommand::Invite { expires_in_ms, uses } => {
             let (room, _) = room_and_revision(store)?;
@@ -759,8 +761,13 @@ fn handle(store: &mut Outbox, command: ClientCommand) -> Result<()> {
             store.enqueue(Operation::RevokeInvite { room, invitation_id }).map(|_| ())
         }
         ClientCommand::Action(action) => {
+            let is_leave = matches!(action.as_ref(), Action::Leave);
             let (room, expected_revision) = room_and_revision(store)?;
-            store.enqueue(Operation::Apply { room, expected_revision, action }).map(|_| ())
+            store.enqueue(Operation::Apply { room, expected_revision, action })?;
+            if is_leave {
+                store.resume_for_room_action()?;
+            }
+            Ok(())
         }
         ClientCommand::Start => start(store),
         ClientCommand::Submit { submission, assets, freeze } => submit(store, *submission, assets, freeze),
@@ -873,13 +880,27 @@ fn network_step(store: &mut Outbox, transport: &Transport, last_poll: &mut Insta
             request_id: RequestId::new(&random_hex(16)?).map_err(|e| Error::Invalid(e.to_string()))?,
             operation: Operation::Poll { room: room.id, after_revision: room.revision },
         };
-        match transport.call(&endpoint, &credential, &request)? {
-            RpcResponse::Room { view, .. } if view.id == room.id => store.update_poll(*view)?,
-            _ => return Err(Error::Invalid("Service returned the wrong room view".into())),
+        match transport.call(&endpoint, &credential, &request) {
+            Ok(RpcResponse::Room { view, .. }) if view.id == room.id => {
+                let revision = view.revision;
+                store.update_poll(*view)?;
+                let _ = store.refresh_pending_leave(room.id, revision, false)?;
+            }
+            Ok(_) => return Err(Error::Invalid("Service returned the wrong room view".into())),
+            Err(Error::Rejected { code, .. }) if code == "unauthorized" && store.complete_already_left(room.id)? => {
+                *last_poll = Instant::now();
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         }
         *last_poll = Instant::now();
     }
     store.ensure_transfer_freeze()?;
+    if !store.status().blocked
+        && let Some(room) = store.status().room.as_ref()
+    {
+        let _ = store.refresh_pending_leave(room.id, room.revision, false)?;
+    }
     if !store.status().blocked
         && let Some(request) = store.next()?
     {
@@ -893,6 +914,50 @@ fn network_step(store: &mut Outbox, transport: &Transport, last_poll: &mut Insta
             Err(error) => {
                 if fence.stopped() {
                     return Err(error);
+                }
+                if let Operation::Apply { room, action, .. } = &request.operation
+                    && matches!(action.as_ref(), Action::Leave)
+                    && matches!(&error, Error::Rejected { code, .. } if matches!(code.as_str(), "conflict" | "unauthorized"))
+                {
+                    let poll = RpcRequest {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id: RequestId::new(&random_hex(16)?).map_err(|e| Error::Invalid(e.to_string()))?,
+                        operation: Operation::Poll { room: *room, after_revision: 0 },
+                    };
+                    match transport.call(&endpoint, &credential, &poll) {
+                        Ok(RpcResponse::Room { view, .. }) if view.id == *room => {
+                            *last_poll = Instant::now();
+                            let revision = view.revision;
+                            store.update_poll(*view)?;
+                            if store.refresh_pending_leave(*room, revision, true)?
+                                && let Some(rebound) = store.next()?
+                            {
+                                match transport.call(&endpoint, &credential, &rebound) {
+                                    Ok(response) => {
+                                        store.acknowledge(&rebound, &response)?;
+                                        return Ok(None);
+                                    }
+                                    Err(retry_error) => {
+                                        if fence.stopped() {
+                                            return Err(retry_error);
+                                        }
+                                        let permanent = !matches!(retry_error, Error::Unavailable)
+                                            && !matches!(
+                                                &retry_error,
+                                                Error::Rejected { code, .. } if matches!(code.as_str(), "busy" | "storage" | "account_changed")
+                                            );
+                                        store.mark_error(&retry_error, Some(rebound.request_id), permanent)?;
+                                        return Err(retry_error);
+                                    }
+                                }
+                            }
+                        }
+                        Err(Error::Rejected { code, .. }) if code == "unauthorized" && store.complete_already_left(*room)? => {
+                            *last_poll = Instant::now();
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
                 }
                 let permanent = !matches!(error, Error::Unavailable)
                     && !matches!(&error, Error::Rejected { code, .. } if matches!(code.as_str(), "busy" | "storage"|"account_changed"));

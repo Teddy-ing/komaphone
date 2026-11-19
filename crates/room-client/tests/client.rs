@@ -123,7 +123,7 @@ fn acknowledgment_and_authorized_room_view_commit_together() {
 }
 
 #[test]
-fn disconnected_leave_ack_clears_removed_lobby_membership_and_rejoin_resumes_polling() {
+fn disconnected_leave_ack_clears_lobby_membership_keeps_connection_active_and_allows_rejoin() {
     use photocraft_party::{DeviceId, Participant, ParticipantId};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("rooms.sqlite3");
@@ -145,15 +145,17 @@ fn disconnected_leave_ack_clears_removed_lobby_membership_and_rejoin_resumes_pol
     assert_eq!(store.status().pending, 0);
     assert!(store.status().room.is_none());
     assert!(store.invitation().unwrap().is_none());
-    assert!(!store.active());
-    assert!(!store.status().polling);
-    assert!(!store.status().connected);
+    assert!(store.active());
+    assert!(store.status().polling);
+    assert!(store.status().connected);
     drop(store);
     let mut store = Outbox::open(&path, Box::new(vault)).unwrap();
     assert_eq!(store.status().pending, 0);
     assert!(store.status().room.is_none());
     assert!(store.status().paired);
-    assert!(!store.active());
+    assert!(store.active());
+    assert!(store.status().polling);
+    assert!(!store.status().connected);
     assert_eq!(store.status().profile, Some(profile.clone()));
     store.enqueue(Operation::Join { room: room.id(), invitation: "5".repeat(64) }).unwrap();
     room.apply(profile.id, room.revision(), 0, Action::Join { participant: profile.clone() }).unwrap();
@@ -166,15 +168,44 @@ fn disconnected_leave_ack_clears_removed_lobby_membership_and_rejoin_resumes_pol
 }
 
 #[test]
-fn active_game_leave_retains_assignment_for_explicit_reconnect() {
+fn temporary_disconnect_retains_assignment_while_room_leave_departs_all_phases_and_persists_across_reopen_and_relogin() {
+    use photocraft_party::room::Phase;
     use photocraft_party::{DeviceId, GameId, Participant, ParticipantId, ProjectId};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("rooms.sqlite3");
     let vault = MemoryCredentials::default();
-    let mut store = paired(&path, vault.clone());
+    let endpoint = "https://private.example:43127";
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    let login = store.prepare_hosted_login(endpoint, "Host", None).unwrap();
+    let profile_id = ParticipantId::new(&"1".repeat(32)).unwrap();
+    let now_ms = u64::try_from(chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now()).timestamp_millis()).unwrap();
+    store
+        .install_hosted_session(
+            endpoint,
+            &photocraft_room_client::hosted_auth::Session {
+                profile: profile_id,
+                device: login.device,
+                label: login.label,
+                token: "a".repeat(64),
+                device_credential: login.device_proof.clone(),
+                expires_at_ms: now_ms + 3_600_000,
+            },
+        )
+        .unwrap();
     let profile = store.status().profile.unwrap();
     let guest =
         Participant { id: ParticipantId::new(&"2".repeat(32)).unwrap(), device: DeviceId::new(&"3".repeat(32)).unwrap(), display_name: "Friend".into() };
+
+    // 1. Solo lobby leave clears room without pausing account polling or canvas access.
+    let solo = Room::new(RoomId::new(&"9".repeat(32)).unwrap(), profile.clone(), Mode::ExquisiteCorpse, None).unwrap();
+    store.update_poll(solo.view(profile.id).unwrap()).unwrap();
+    store.enqueue(Operation::Apply { room: solo.id(), expected_revision: solo.revision(), action: Box::new(Action::Leave) }).unwrap();
+    store.acknowledge(&store.next().unwrap().unwrap(), &RpcResponse::Disconnected).unwrap();
+    assert!(store.status().room.is_none());
+    assert!(store.active() && store.status().polling);
+    assert!(photocraft_room_client::world_worker::WorldAccess::from_room(&store).unwrap().is_some());
+
+    // 2. Intentional temporary disconnect during an active game keeps room + assignment paused for Reconnect.
     let mut room = Room::new(RoomId::new(&"1".repeat(32)).unwrap(), profile.clone(), Mode::Animation { rotations: 1 }, None).unwrap();
     room.apply(guest.id, room.revision(), 0, Action::Join { participant: guest.clone() }).unwrap();
     for actor in [profile.id, guest.id] {
@@ -189,17 +220,59 @@ fn active_game_leave_retains_assignment_for_explicit_reconnect() {
     .unwrap();
     let before = room.view(profile.id).unwrap();
     store.update_poll(before.clone()).unwrap();
-    store.enqueue(Operation::Apply { room: room.id(), expected_revision: room.revision(), action: Box::new(Action::Leave) }).unwrap();
-    store.acknowledge(&store.next().unwrap().unwrap(), &RpcResponse::Disconnected).unwrap();
-    assert!(!store.active());
-    assert!(!store.status().polling);
+    let assigned_id = before.assignment.as_ref().unwrap().assignment.id;
+    store.save_note(photocraft_room_client::NoteDraft { assignment: assigned_id, note: "Keep this handoff note".into() }).unwrap();
+    store.enqueue(Operation::Disconnect { room: room.id() }).unwrap();
+    store.stop_polling().unwrap();
+    let disconnect = store.next().unwrap().unwrap();
+    store.acknowledge(&disconnect, &RpcResponse::Disconnected).unwrap();
+    assert!(!store.active() && !store.status().polling);
     assert_eq!(store.status().room.as_ref().and_then(|view| view.assignment.clone()), before.assignment);
-    assert!(store.status().room.unwrap().members.iter().any(|member| member.participant.id == profile.id && !member.connected));
     drop(store);
-    let store = Outbox::open(path, Box::new(vault)).unwrap();
-    assert!(!store.active());
-    assert_eq!(store.status().pending, 0);
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    assert!(!store.active() && !store.status().polling);
     assert_eq!(store.status().room.as_ref().and_then(|view| view.assignment.clone()), before.assignment);
+    store.retry().unwrap();
+    assert!(store.active() && store.status().polling);
+
+    // 3. Explicit Leave in active, revealed, and archived phases departs the room while preserving notes,
+    //    and stays departed across restart AND sign-out / sign-in.
+    for phase in [Phase::Drawing, Phase::Reveal, Phase::Archived] {
+        let mut view = before.clone();
+        view.phase = phase;
+        if matches!(phase, Phase::Reveal | Phase::Archived) {
+            view.assignment = None;
+        }
+        store.update_poll(view).unwrap();
+        store.enqueue(Operation::Apply { room: room.id(), expected_revision: before.revision, action: Box::new(Action::Leave) }).unwrap();
+        store.acknowledge(&store.next().unwrap().unwrap(), &RpcResponse::Disconnected).unwrap();
+        assert!(store.status().room.is_none(), "{phase:?}");
+        assert!(store.active() && store.status().polling, "{phase:?}");
+    }
+    assert_eq!(store.saved_note(endpoint, room.id(), assigned_id).unwrap().unwrap().note, "Keep this handoff note");
+
+    // Sign out and sign back in: must NOT resurrect the departed room.
+    store.sign_out_local().unwrap();
+    assert!(!store.status().signed_in && store.status().room.is_none());
+    let relogin = store.prepare_hosted_login(endpoint, "Host", None).unwrap();
+    store
+        .install_hosted_session(
+            endpoint,
+            &photocraft_room_client::hosted_auth::Session {
+                profile: profile.id,
+                device: relogin.device,
+                label: relogin.label,
+                token: "b".repeat(64),
+                device_credential: relogin.device_proof,
+                expires_at_ms: now_ms + 7_200_000,
+            },
+        )
+        .unwrap();
+    assert!(store.status().signed_in && store.active() && store.status().room.is_none());
+    drop(store);
+    let reopened = Outbox::open(&path, Box::new(vault)).unwrap();
+    assert!(reopened.status().signed_in && reopened.active() && reopened.status().room.is_none());
+    assert_eq!(reopened.saved_note(endpoint, room.id(), assigned_id).unwrap().unwrap().note, "Keep this handoff note");
 }
 
 #[test]
@@ -438,4 +511,239 @@ fn pending_room_metadata_does_not_mark_a_drawing_as_submitted() {
     let store = Outbox::open(path, Box::new(vault)).unwrap();
     assert_eq!(store.status().pending, 1);
     assert!(store.status().submission_project.is_none());
+}
+
+#[test]
+fn worker_recovers_stale_paused_and_rejected_leave_requests_and_joins_another_room() {
+    use photocraft_party::protocol::RpcRequest;
+    use photocraft_party::room::Phase;
+    use photocraft_party::{DeviceId, Participant, ParticipantId};
+    use photocraft_room_client::{ClientCommand, ClientEvent, ClientOptions, Worker};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+    let host = Participant { id: ParticipantId::new(&"1".repeat(32)).unwrap(), device: DeviceId::new(&"2".repeat(32)).unwrap(), display_name: "Host".into() };
+    let laptop =
+        Participant { id: ParticipantId::new(&"3".repeat(32)).unwrap(), device: DeviceId::new(&"4".repeat(32)).unwrap(), display_name: "Laptop".into() };
+    let old_room_id = RoomId::new(&"a".repeat(32)).unwrap();
+    let new_room_id = RoomId::new(&"b".repeat(32)).unwrap();
+
+    let mut old_room = Room::new(old_room_id, host.clone(), Mode::Animation { rotations: 1 }, None).unwrap();
+    old_room.apply(laptop.id, old_room.revision(), 0, Action::Join { participant: laptop.clone() }).unwrap();
+    let mut old_view = old_room.view(laptop.id).unwrap();
+    old_view.phase = Phase::Reveal;
+    old_view.revision = 86;
+    old_view.members[0].connected = false;
+
+    let mut new_room = Room::new(new_room_id, host, Mode::ExquisiteCorpse, None).unwrap();
+    new_room.apply(laptop.id, new_room.revision(), 0, Action::Join { participant: laptop.clone() }).unwrap();
+    let new_view = new_room.view(laptop.id).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ServerMode {
+        AcceptCurrentRevision(u64),
+        ConflictOnceThenAccept(u64),
+        UnauthorizedAlreadyLeft,
+        RejectPhasePermanently,
+    }
+    let mode = Arc::new(Mutex::new(ServerMode::AcceptCurrentRevision(100)));
+    let server_mode = Arc::clone(&mode);
+    let old_view_server = old_view.clone();
+    let new_view_server = new_view.clone();
+
+    let server = std::thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let req: RpcRequest = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(split) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buffer[..split]);
+                    let len = headers
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap();
+                    if buffer.len() >= split + 4 + len {
+                        break RpcRequest::decode(&buffer[split + 4..split + 4 + len]).unwrap();
+                    }
+                }
+            };
+            let current_mode = *server_mode.lock().unwrap();
+            let (http_status, body) = match (&req.operation, current_mode) {
+                (Operation::Join { room, .. }, _) if *room == new_room_id => {
+                    (200, serde_json::to_vec(&RpcResponse::Room { view: Box::new(new_view_server.clone()), outcome: None }).unwrap())
+                }
+                (Operation::Poll { room, .. }, _) if *room == new_room_id => {
+                    (200, serde_json::to_vec(&RpcResponse::Room { view: Box::new(new_view_server.clone()), outcome: None }).unwrap())
+                }
+                (Operation::Poll { room, .. }, ServerMode::UnauthorizedAlreadyLeft) if *room == old_room_id => {
+                    (403, br#"{"code":"unauthorized","message":"not a member"}"#.to_vec())
+                }
+                (Operation::Poll { room, .. }, ServerMode::AcceptCurrentRevision(rev) | ServerMode::ConflictOnceThenAccept(rev)) if *room == old_room_id => {
+                    let mut v = old_view_server.clone();
+                    v.revision = rev;
+                    (200, serde_json::to_vec(&RpcResponse::Room { view: Box::new(v), outcome: None }).unwrap())
+                }
+                (Operation::Poll { room, .. }, ServerMode::RejectPhasePermanently) if *room == old_room_id => {
+                    let mut v = old_view_server.clone();
+                    v.revision = 120;
+                    (200, serde_json::to_vec(&RpcResponse::Room { view: Box::new(v), outcome: None }).unwrap())
+                }
+                (Operation::Apply { room, expected_revision, action }, ServerMode::AcceptCurrentRevision(rev))
+                    if *room == old_room_id && matches!(action.as_ref(), Action::Leave) =>
+                {
+                    if *expected_revision == rev {
+                        (200, serde_json::to_vec(&RpcResponse::Disconnected).unwrap())
+                    } else {
+                        (409, br#"{"code":"conflict","message":"stale revision"}"#.to_vec())
+                    }
+                }
+                (Operation::Apply { room, expected_revision, action }, ServerMode::ConflictOnceThenAccept(rev))
+                    if *room == old_room_id && matches!(action.as_ref(), Action::Leave) =>
+                {
+                    if *expected_revision < rev {
+                        *server_mode.lock().unwrap() = ServerMode::AcceptCurrentRevision(rev);
+                        (409, br#"{"code":"conflict","message":"concurrent revision bump"}"#.to_vec())
+                    } else {
+                        (200, serde_json::to_vec(&RpcResponse::Disconnected).unwrap())
+                    }
+                }
+                (Operation::Apply { room, action, .. }, ServerMode::UnauthorizedAlreadyLeft)
+                    if *room == old_room_id && matches!(action.as_ref(), Action::Leave) =>
+                {
+                    (403, br#"{"code":"unauthorized","message":"not a member"}"#.to_vec())
+                }
+                (Operation::Apply { room, action, .. }, ServerMode::RejectPhasePermanently)
+                    if *room == old_room_id && matches!(action.as_ref(), Action::Leave) =>
+                {
+                    (409, br#"{"code":"phase","message":"rejected for test"}"#.to_vec())
+                }
+                _ => panic!("unexpected fixture operation"),
+            };
+            let reason = match http_status {
+                200 => "OK",
+                403 => "Forbidden",
+                409 => "Conflict",
+                _ => "Error",
+            };
+            write!(stream, "HTTP/1.1 {http_status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+
+    let wait_status = |worker: &Worker, pred: &dyn Fn(&photocraft_room_client::ClientStatus) -> bool| -> photocraft_room_client::ClientStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(ClientEvent::Status { status, .. }) = worker.poll()
+                && pred(&status)
+            {
+                return *status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for expected worker status");
+    };
+
+    // Case A: Exact observed Laptop loop — reopened paused Reveal room with stale queued Leave (expected_revision 86 vs server 100),
+    //         clicking Reconnect (Retry) refreshes Leave to 100, retains old row, departs room without pausing, and joins new room!
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("rooms.sqlite3");
+    let vault = MemoryCredentials::default();
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    let login = store.prepare_hosted_login(&endpoint, "Laptop", None).unwrap();
+    let now_ms = u64::try_from(chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now()).timestamp_millis()).unwrap();
+    store
+        .install_hosted_session(
+            &endpoint,
+            &photocraft_room_client::hosted_auth::Session {
+                profile: laptop.id,
+                device: login.device,
+                label: login.label,
+                token: "c".repeat(64),
+                device_credential: login.device_proof,
+                expires_at_ms: now_ms + 3_600_000,
+            },
+        )
+        .unwrap();
+    store.update_poll(old_view.clone()).unwrap();
+    store.stop_polling().unwrap();
+    store.enqueue(Operation::Apply { room: old_room_id, expected_revision: 86, action: Box::new(Action::Leave) }).unwrap();
+    drop(store);
+
+    let worker = Worker::start_with_credentials(path.clone(), ClientOptions::default(), Box::new(vault.clone())).unwrap();
+    let initial = wait_status(&worker, &|s| !s.polling && s.pending == 1 && s.room.as_ref().map(|r| r.id) == Some(old_room_id));
+    assert!(!initial.blocked);
+    worker.send(ClientCommand::Retry).unwrap();
+    let departed = wait_status(&worker, &|s| s.room.is_none() && s.pending == 0 && s.polling && s.connected && !s.blocked);
+    assert!(departed.error.is_none());
+    worker.send(ClientCommand::Join { room: new_room_id, invitation: "d".repeat(64) }).unwrap();
+    let joined = wait_status(&worker, &|s| s.room.as_ref().map(|r| r.id) == Some(new_room_id) && s.pending == 0 && s.polling && s.connected);
+    assert_eq!(joined.room.unwrap().id, new_room_id);
+    drop(worker);
+
+    let retained_count: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT COUNT(*) FROM outbox WHERE retained=1", [], |r| r.get(0)).unwrap();
+    assert_eq!(retained_count, 1, "superseded stale Leave remains retained for audit");
+
+    // Case B: Sub-250ms concurrent revision bump on Leave (409 conflict) auto-polls, refreshes, and departs cleanly.
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    let mut stale_view = old_view.clone();
+    stale_view.revision = 100;
+    store.update_poll(stale_view).unwrap();
+    drop(store);
+    *mode.lock().unwrap() = ServerMode::ConflictOnceThenAccept(105);
+    let worker = Worker::start_with_credentials(path.clone(), ClientOptions::default(), Box::new(vault.clone())).unwrap();
+    wait_status(&worker, &|s| s.room.as_ref().map(|r| r.id) == Some(old_room_id));
+    worker.send(ClientCommand::Action(Box::new(Action::Leave))).unwrap();
+    wait_status(&worker, &|s| s.room.is_none() && s.pending == 0 && s.polling && !s.blocked);
+    drop(worker);
+
+    // Case C: Already-removed room (403 unauthorized on Poll/Leave) completes departure cleanly.
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    store.update_poll(old_view.clone()).unwrap();
+    drop(store);
+    *mode.lock().unwrap() = ServerMode::UnauthorizedAlreadyLeft;
+    let worker = Worker::start_with_credentials(path.clone(), ClientOptions::default(), Box::new(vault.clone())).unwrap();
+    wait_status(&worker, &|s| s.room.as_ref().map(|r| r.id) == Some(old_room_id));
+    worker.send(ClientCommand::Action(Box::new(Action::Leave))).unwrap();
+    wait_status(&worker, &|s| s.room.is_none() && s.pending == 0 && s.polling && !s.blocked && s.error.is_none());
+    drop(worker);
+
+    // Case D: Permanent non-conflict rejection exposes blocked state, and RetainRejected retains the record and exits the stuck room.
+    let mut store = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    let mut current_view = old_view;
+    current_view.revision = 120;
+    store.update_poll(current_view).unwrap();
+    drop(store);
+    *mode.lock().unwrap() = ServerMode::RejectPhasePermanently;
+    let worker = Worker::start_with_credentials(path.clone(), ClientOptions::default(), Box::new(vault.clone())).unwrap();
+    wait_status(&worker, &|s| s.room.as_ref().map(|r| r.id) == Some(old_room_id));
+    worker.send(ClientCommand::Action(Box::new(Action::Leave))).unwrap();
+    wait_status(&worker, &|s| s.blocked && s.pending == 1);
+    worker.send(ClientCommand::RetainRejected).unwrap();
+    wait_status(&worker, &|s| s.room.is_none() && s.pending == 0 && !s.blocked && s.polling && s.error.is_none());
+    drop(worker);
+
+    stop.store(true, Ordering::Release);
+    let _ = std::net::TcpStream::connect(endpoint.strip_prefix("http://").unwrap());
+    server.join().unwrap();
 }

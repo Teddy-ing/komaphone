@@ -4,6 +4,8 @@ Use these in the Komaphone repository with the intended model, GPT-6 Astra, and 
 
 ## Current owner workflow
 
+For owner-requested fine-tuning and later additions, use the [adjustments backlog and per-item prompts](adjustments-backlog.md). Queue actual requests only; complete each Antigravity evidence handoff and Codex disposition before the next implementation item. K7 external tests remain required even when adjustments run first.
+
 Since 2026-11-15, use the [orchestration workflow](orchestration-workflow.md) for Codex review and owner-relayed Antigravity implementation. It includes the bounded K7 continuation and evidence-query prompts. The older implementation prompts below are worker task templates; they do not instruct Codex to launch implementation automatically. Keep all acceptance requirements intact.
 
 ## How to run

@@ -93,40 +93,46 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("Private room").id(egui::Id::unique("komaphone-rooms")).open(&mut open).default_width(650.0).max_height(560.0).show(ctx, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let tokens = Tokens::get(ctx);
-            ui.label(RichText::new("Private games for two or three players").strong());
-            ui.label("Your local drawings stay saved when the service is unavailable.");
-            ui.separator();
-            connection(app, ui);
-            let status = app.session.rooms.status.clone();
-            if let Some(error) = status.error.as_ref() {
-                ui.colored_label(tokens.text, error);
-            }
-            if let Some(notice) = status.notice.as_ref() {
-                ui.label(RichText::new(notice).color(tokens.text_dim));
-            }
-            if status.pending > 0 {
-                ui.label(format!("{} request(s) waiting for service confirmation", status.pending));
-            }
-            if status.blocked {
-                button(app, ui, "Retry pending request", "komaphone.room.retry", json!({}));
-                button(app, ui, "Keep rejected work and refresh", "komaphone.room.retainRejected", json!({}));
-            }
-            if let Some(room) = status.room {
-                room_view(app, ui, &room);
-            } else if status.paired {
-                create_join(app, ui);
-            }
-            ui.separator();
-            let response = ui.button("Return to drawing");
-            crate::komaphone_workspace::remember(ui, "workspace.return", &response);
-            if response.clicked() {
-                app.ui.rooms.open = false;
-            }
+    egui::Window::new("Private room")
+        .id(egui::Id::unique("komaphone-rooms"))
+        .open(&mut open)
+        .default_width(650.0)
+        .default_height(560.0)
+        .max_height(640.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let tokens = Tokens::get(ctx);
+                ui.label(RichText::new("Private games for two or three players").strong());
+                ui.label("Your local drawings stay saved when the service is unavailable.");
+                ui.separator();
+                connection(app, ui);
+                let status = app.session.rooms.status.clone();
+                if let Some(error) = status.error.as_ref() {
+                    ui.colored_label(tokens.text, error);
+                }
+                if let Some(notice) = status.notice.as_ref() {
+                    ui.label(RichText::new(notice).color(tokens.text_dim));
+                }
+                if status.pending > 0 {
+                    ui.label(format!("{} request(s) waiting for service confirmation", status.pending));
+                }
+                if status.blocked {
+                    button(app, ui, "Retry pending request", "komaphone.room.retry", json!({}));
+                    button(app, ui, "Keep rejected work and refresh", "komaphone.room.retainRejected", json!({}));
+                }
+                if let Some(room) = status.room {
+                    room_view(app, ui, &room);
+                } else if status.paired {
+                    create_join(app, ui);
+                }
+                ui.separator();
+                let response = ui.button("Return to drawing");
+                crate::komaphone_workspace::remember(ui, "workspace.return", &response);
+                if response.clicked() {
+                    app.ui.rooms.open = false;
+                }
+            });
         });
-    });
     app.ui.rooms.open &= open;
 }
 fn connection(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
@@ -162,6 +168,8 @@ fn connection(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 "Connection paused"
             } else if status.connected {
                 "Connected"
+            } else if status.room.is_none() && status.pending == 0 && status.error.is_none() {
+                if status.hosted { "Signed in · ready" } else { "Ready" }
             } else {
                 "Service unavailable · reconnecting"
             });
@@ -548,6 +556,68 @@ mod account_tests {
             assert!(h.query_by_label("Reconnect").is_none(), "{state:?}");
             assert!(!h.state().session.rooms.busy(), "presentation never queues a network action");
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn leaving_revealed_or_rejected_room_exposes_create_and_join_without_pausing_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("rooms.sqlite3");
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.enable_rooms(db_path, Default::default()).unwrap();
+        app.ui.rooms.open = true;
+
+        // 1. Reopened revealed room shows View finished game, Claim host role, and Leave room.
+        app.session.rooms.status = serde_json::from_value(json!({
+            "hosted": true,
+            "signed_in": true,
+            "paired": true,
+            "polling": true,
+            "connected": true,
+            "pending": 0,
+            "blocked": false,
+            "endpoint": "https://komaphone.tedsoftware.org",
+            "profile": {"id": "33333333333333333333333333333333", "device": "44444444444444444444444444444444", "display_name": "Laptop player"},
+            "room": {
+                "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "revision": 100,
+                "epoch": 2,
+                "phase": "reveal",
+                "round": 1,
+                "mode": {"kind": "animation", "rotations": 1},
+                "timer_ms": null,
+                "moderator": "11111111111111111111111111111111",
+                "members": [
+                    {"participant": {"id": "11111111111111111111111111111111", "device": "22222222222222222222222222222222", "display_name": "Host"}, "connected": false, "ready": true},
+                    {"participant": {"id": "33333333333333333333333333333333", "device": "44444444444444444444444444444444", "display_name": "Laptop player"}, "connected": true, "ready": true}
+                ],
+                "waiting": [],
+                "paused": null,
+                "deadline_ms": null,
+                "assignment": null,
+                "reveal": [{"kind": "missing", "assignment": {"id": {"game": "55555555555555555555555555555555", "chain": 0, "round": 0}, "player": "11111111111111111111111111111111", "project": "66666666666666666666666666666666"}, "reason": "Fixture"}]
+            }
+        }))
+        .unwrap();
+
+        let mut h =
+            egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 760.0)).build_ui_state(|ui, app: &mut PhotocraftApp| window(app, ui.ctx()), app);
+        h.run_steps(3);
+        assert!(h.query_by_label("View finished game").is_some());
+        assert!(!h.get_by_label("Claim host role").accesskit_node().is_disabled());
+        assert!(!h.get_by_label("Leave room").accesskit_node().is_disabled());
+        assert!(h.query_by_label("Create room").is_none());
+        assert!(h.query_by_label("Join room").is_none());
+
+        // 2. Post-leave state (and cold-reopen signed-in no-room state) shows Create room and Join room without Connection paused.
+        h.state_mut().session.rooms.status.room = None;
+        h.state_mut().session.rooms.status.connected = false;
+        h.run_steps(3);
+        assert!(h.query_by_label("Connection paused").is_none());
+        assert!(h.query_by_label("Service unavailable · reconnecting").is_none());
+        assert!(h.query_by_label("Signed in · ready").is_some());
+        assert!(!h.get_by_label("Create room").accesskit_node().is_disabled());
+        assert!(!h.get_by_label("Join room").accesskit_node().is_disabled());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

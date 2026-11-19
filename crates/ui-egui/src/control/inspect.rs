@@ -36,6 +36,7 @@ pub(super) fn with_world_hash(app: &PhotocraftApp, ctx: &egui::Context, world_ha
     }
     dialogs.extend(crate::discard_ui::inspect(app));
     let mut room_controls = [
+        "home.room",
         "workspace.room",
         "workspace.gallery",
         "home.gallery",
@@ -171,6 +172,13 @@ pub(super) fn with_world_hash(app: &PhotocraftApp, ctx: &egui::Context, world_ha
         "komaphone.gallery.remix",
         "komaphone.room.connect",
         "komaphone.room.create",
+        "komaphone.room.invite",
+        "komaphone.room.claim",
+        "komaphone.room.leave",
+        "komaphone.room.retry",
+        "komaphone.room.retainRejected",
+        "komaphone.account.signIn",
+        "komaphone.account.signOut",
         "komaphone.room.ready",
         "komaphone.room.start",
         "komaphone.room.openDraft",

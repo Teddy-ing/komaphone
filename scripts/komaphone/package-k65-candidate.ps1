@@ -116,7 +116,7 @@ $info = [ordered]@{
 }
 Write-LanText (Join-Path $candidate 'package-info.json') ($info | ConvertTo-Json -Depth 5)
 $rows = @(Get-ChildItem -LiteralPath $candidate -Recurse -File | Sort-Object FullName | ForEach-Object {
-    $relative = [IO.Path]::GetRelativePath($candidate, $_.FullName).Replace('\','/')
+    $relative = (Get-LanRelativePath $candidate $_.FullName).Replace('\','/')
     "$( (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash )  $relative"
 })
 Write-LanText (Join-Path $candidate 'SHA256SUMS') (($rows -join "`n") + "`n")
@@ -137,11 +137,12 @@ $environment = @{
 }
 $environment += Get-K65LauncherCompilerEnvironment
 Invoke-K65BuildEnvironment -Variables $environment -Body {
-    & $cargoPath test --manifest-path (Join-Path $launcherRoot 'Cargo.toml') --locked --offline *> $buildLog
+    $manifestPath = Join-Path $launcherRoot 'Cargo.toml'
+    & cmd.exe /d /c "`"$cargoPath`" test --manifest-path `"$manifestPath`" --locked --offline > `"$buildLog`" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "Launcher tests failed: $buildLog" }
-    & $cargoPath clippy --manifest-path (Join-Path $launcherRoot 'Cargo.toml') --locked --offline --all-targets -- -D warnings *>> $buildLog
+    & cmd.exe /d /c "`"$cargoPath`" clippy --manifest-path `"$manifestPath`" --locked --offline --all-targets -- -D warnings >> `"$buildLog`" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "Launcher lint failed: $buildLog" }
-    & $cargoPath build --manifest-path (Join-Path $launcherRoot 'Cargo.toml') --release --locked --offline *>> $buildLog
+    & cmd.exe /d /c "`"$cargoPath`" build --manifest-path `"$manifestPath`" --release --locked --offline >> `"$buildLog`" 2>&1"
     if ($LASTEXITCODE -ne 0) { throw "Launcher build failed: $buildLog" }
 }
 $launcher = Get-LanFile (Join-Path $targetPath 'release/komaphone-k65-launcher.exe')
@@ -182,15 +183,15 @@ $transfer = [ordered]@{schemaVersion=1;product='Komaphone';milestone=$presentati
 Write-LanText (Join-Path $stagePath 'transfer-info.json') ($transfer | ConvertTo-Json -Depth 4)
 $expected = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
 $rows = @(Get-ChildItem -LiteralPath $stagePath -Recurse -File | Sort-Object FullName | ForEach-Object {
-    $relative = [IO.Path]::GetRelativePath($stagePath, $_.FullName).Replace('\','/')
+    $relative = (Get-LanRelativePath $stagePath $_.FullName).Replace('\','/')
     $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
     $expected.Add($relative,$hash)
     "$hash  $relative"
 })
 Write-LanText (Join-Path $stagePath 'TRANSFER-SHA256SUMS') (($rows -join "`n") + "`n")
 $expected.Add('TRANSFER-SHA256SUMS',(Get-FileHash -LiteralPath (Join-Path $stagePath 'TRANSFER-SHA256SUMS') -Algorithm SHA256).Hash)
-[IO.Compression.ZipFile]::CreateFromDirectory($stagePath,$zipStage,[IO.Compression.CompressionLevel]::Optimal,$false)
+New-LanZip $stagePath $zipStage
 Assert-LanZip $zipStage $expected
 [IO.Directory]::Move($stagePath,$outputPath)
-[IO.File]::Move($zipStage,$zipPath,$false)
+[IO.File]::Move($zipStage,$zipPath)
 [pscustomobject]@{destination=$outputPath;zip=$zipPath;zipSha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash;files=$expected.Count;candidateManifestSha256=$manifestHash;launcherSha256=$launcherHash;profile=$ProfileName;buildLog=$buildLog;status=$info.status}

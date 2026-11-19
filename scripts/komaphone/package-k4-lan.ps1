@@ -22,7 +22,18 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
+
+function Get-LanRelativePath([string] $Base, [string] $Child) {
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        return [IO.Path]::GetRelativePath($Base, $Child)
+    }
+    $prefix = [IO.Path]::GetFullPath($Base).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $full = [IO.Path]::GetFullPath($Child)
+    if (-not $full.StartsWith($prefix, [StringComparison]::Ordinal)) { throw "Path escapes root: $Child" }
+    return $full.Substring($prefix.Length)
+}
 $candidateFiles = @(
     'photocraft.exe', 'photocraft-sync.exe', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ATTRIBUTION.md',
     'assets/fonts/OFL-Inter.txt', 'assets/fonts/OFL-JetBrainsMono.txt',
@@ -133,6 +144,23 @@ function Copy-LanFile([string] $Source, [string] $Target, [string] $Hash) {
     Assert-LanHash $Target $Hash
 }
 
+function New-LanZip([string] $SourceDirectory, [string] $ZipPath) {
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        [IO.Compression.ZipFile]::CreateFromDirectory($SourceDirectory, $ZipPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+        return
+    }
+    $zipStream = [IO.File]::Open($ZipPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $archive = [IO.Compression.ZipArchive]::new($zipStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            foreach ($file in @(Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File | Sort-Object FullName)) {
+                $entryName = (Get-LanRelativePath $SourceDirectory $file.FullName).Replace('\', '/')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            }
+        } finally { $archive.Dispose() }
+    } finally { $zipStream.Dispose() }
+}
+
 function Assert-LanZip([string] $Path, [Collections.Generic.Dictionary[string,string]] $Expected) {
     $archive = [IO.Compression.ZipFile]::OpenRead($Path)
     try {
@@ -143,7 +171,11 @@ function Assert-LanZip([string] $Path, [Collections.Generic.Dictionary[string,st
             $stream = $entry.Open()
             $sha = [Security.Cryptography.SHA256]::Create()
             try {
-                $actual = [Convert]::ToHexString($sha.ComputeHash($stream))
+                $actual = if ($PSVersionTable.PSVersion.Major -ge 7) {
+                    [Convert]::ToHexString($sha.ComputeHash($stream))
+                } else {
+                    [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+                }
                 if ($actual -cne $Expected[$entry.FullName]) { throw "ZIP bytes differ: $($entry.FullName)" }
             } finally { $sha.Dispose(); $stream.Dispose() }
         }

@@ -15,7 +15,14 @@ function Read-K65GoogleDesktopConfiguration {
         }
         if ($count -lt 1 -or $count -gt 32768) { throw 'bounds' }
         $utf8 = [Text.UTF8Encoding]::new($false, $true)
-        $document = $utf8.GetString($buffer, 0, $count) | ConvertFrom-Json -AsHashtable -Depth 16 -ErrorAction Stop
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $document = $utf8.GetString($buffer, 0, $count) | ConvertFrom-Json -AsHashtable -Depth 16 -ErrorAction Stop
+        } else {
+            Add-Type -AssemblyName System.Web.Extensions
+            $serializer = [Web.Script.Serialization.JavaScriptSerializer]::new()
+            $serializer.RecursionLimit = 16
+            $document = $serializer.DeserializeObject($utf8.GetString($buffer, 0, $count))
+        }
         if ($document -isnot [Collections.IDictionary] -or $document['installed'] -isnot [Collections.IDictionary]) { throw 'shape' }
         $installed = $document['installed']
         $clientId = '981926394354-07f4s3dss4vgp7mteh0qe8e6dhk3s99o.apps.googleusercontent.com'

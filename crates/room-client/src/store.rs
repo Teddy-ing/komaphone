@@ -446,12 +446,13 @@ impl Outbox {
         if self.next()?.as_ref() != Some(request) {
             return Err(Error::Invalid("Acknowledgment request differs from the durable outbox".into()));
         }
+        let left_room = matches!(&request.operation, Operation::Apply { action, .. } if matches!(action.as_ref(), photocraft_party::room::Action::Leave));
         let mut candidate = self.state.clone();
         apply_response(&mut candidate, request, response)?;
         candidate.status.remember_game_draft()?;
         candidate.status.connected = candidate.active;
         candidate.status.error = None;
-        candidate.status.notice = Some("Service committed the room change".into());
+        candidate.status.notice = Some(if left_room { "Left room · create or join another room".into() } else { "Service committed the room change".into() });
         let transaction = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         let removed = transaction.execute("DELETE FROM outbox WHERE request_id=?1 AND retained=0", [request.request_id.as_str()]).map_err(sql)?;
         if removed != 1 {
@@ -516,6 +517,14 @@ impl Outbox {
     /// Keep a recoverable copy of rejected requests while allowing new user actions.
     /// This never discards the local drawing or rewrites an accepted submission.
     pub fn retain_rejected(&mut self) -> Result<()> {
+        let leave_room = self
+            .state
+            .status
+            .room
+            .as_ref()
+            .map(|room| room.id)
+            .and_then(|current| self.unretained_leave_only().ok().flatten().filter(|(_, room, _)| *room == current).map(|(_, room, _)| room));
+        let mut candidate = self.state.clone();
         // A submission consists of a manifest plus many dependent chunks. Retaining only
         // the rejected chunk would send its dependent tail and cascade avoidable failures.
         let transaction = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
@@ -523,12 +532,132 @@ impl Outbox {
             transaction.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE retained=0 AND rejected IS NOT NULL)", [], |row| row.get(0)).map_err(sql)?;
         if rejected {
             transaction.execute("UPDATE outbox SET retained=1 WHERE retained=0", []).map_err(sql)?;
+            if let Some(room) = leave_room {
+                leave_projection(&mut candidate, room)?;
+                candidate.status.remember_game_draft()?;
+            }
         }
+        candidate.status.error = None;
+        candidate.status.notice = Some(if rejected && leave_room.is_some() {
+            "Rejected leave request retained locally · create or join another room".into()
+        } else {
+            "Rejected request retained locally; review the current room before submitting again".into()
+        });
+        notes::transition(&transaction, &self.state.status, &mut candidate.status)?;
+        write_state(&transaction, &candidate)?;
+        transaction.commit().map_err(sql)?;
+        self.state = candidate;
+        self.refresh_counts()
+    }
+
+    pub(crate) fn resume_for_room_action(&mut self) -> Result<()> {
+        self.check_hosted_access()?;
+        if !self.state.active {
+            self.state.active = true;
+            self.state.status.error = None;
+            self.refresh_counts()?;
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    fn unretained_leave_only(&self) -> Result<Option<(RequestId, RoomId, u64)>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT CASE WHEN length(body)<=?1 THEN body ELSE NULL END,digest FROM outbox WHERE retained=0 ORDER BY seq LIMIT 8193")
+            .map_err(sql)?;
+        let mut rows = statement.query([MAX_MESSAGE_BYTES as i64]).map_err(sql)?;
+        let mut head: Option<(RequestId, RoomId, u64)> = None;
+        let mut count = 0usize;
+        while let Some(row) = rows.next().map_err(sql)? {
+            count = count.saturating_add(1);
+            if count > MAX_PENDING {
+                return Err(Error::Busy);
+            }
+            let body: Vec<u8> = row.get(0).map_err(sql)?;
+            let checksum: String = row.get(1).map_err(sql)?;
+            if digest(&body) != checksum {
+                return Err(Error::Storage("Pending request checksum failed".into()));
+            }
+            let request = RpcRequest::decode(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+            let Operation::Apply { room, expected_revision, action } = request.operation else {
+                return Ok(None);
+            };
+            if !matches!(action.as_ref(), photocraft_party::room::Action::Leave) {
+                return Ok(None);
+            }
+            if let Some((_, existing_room, _)) = head {
+                if existing_room != room {
+                    return Ok(None);
+                }
+            } else {
+                head = Some((request.request_id, room, expected_revision));
+            }
+        }
+        Ok(head)
+    }
+
+    pub(crate) fn refresh_pending_leave(&mut self, target_room: RoomId, revision: u64, force_reissue: bool) -> Result<bool> {
+        if self.state.status.blocked {
+            return Ok(false);
+        }
+        let Some((_id, room, expected_revision)) = self.unretained_leave_only()? else {
+            return Ok(false);
+        };
+        if room != target_room || (!force_reissue && expected_revision == revision) {
+            return Ok(false);
+        }
+        let prepared = self.prepare(Operation::Apply { room, expected_revision: revision, action: Box::new(photocraft_party::room::Action::Leave) })?;
+        let count: i64 = self.db.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).map_err(sql)?;
+        let used: i64 = self
+            .db
+            .query_row("SELECT (SELECT COALESCE(SUM(length(body)),0) FROM outbox) + (SELECT COALESCE(SUM(length(body)),0) FROM account_outbox)", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql)?;
+        let count = usize::try_from(count).map_err(|_| Error::Storage("Invalid pending request count".into()))?;
+        let used = u64::try_from(used).map_err(|_| Error::Storage("Invalid pending request size".into()))?;
+        if count.saturating_add(1) > MAX_PENDING || used.saturating_add(prepared.body.len() as u64) > MAX_PENDING_BYTES {
+            return Err(Error::Busy);
+        }
+        let transaction = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        transaction
+            .execute("UPDATE outbox SET retained=1, rejected=COALESCE(rejected, ?1) WHERE retained=0", ["superseded: refreshed leave to current room revision"])
+            .map_err(sql)?;
+        insert(&transaction, &prepared)?;
         transaction.commit().map_err(sql)?;
         self.state.status.error = None;
-        self.state.status.notice = Some("Rejected request retained locally; review the current room before submitting again".into());
         self.refresh_counts()?;
-        self.save_state()
+        self.save_state()?;
+        Ok(true)
+    }
+
+    pub(crate) fn complete_already_left(&mut self, target_room: RoomId) -> Result<bool> {
+        if self.state.status.blocked {
+            return Ok(false);
+        }
+        let Some((_id, room, _)) = self.unretained_leave_only()? else {
+            return Ok(false);
+        };
+        if room != target_room {
+            return Ok(false);
+        }
+        let mut candidate = self.state.clone();
+        leave_projection(&mut candidate, target_room)?;
+        candidate.status.remember_game_draft()?;
+        candidate.status.connected = candidate.active;
+        candidate.status.error = None;
+        candidate.status.notice = Some("Left room · create or join another room".into());
+        let transaction = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        transaction
+            .execute("UPDATE outbox SET retained=1, rejected=COALESCE(rejected, ?1) WHERE retained=0", ["unauthorized: already removed from room"])
+            .map_err(sql)?;
+        notes::transition(&transaction, &self.state.status, &mut candidate.status)?;
+        write_state(&transaction, &candidate)?;
+        transaction.commit().map_err(sql)?;
+        self.state = candidate;
+        self.refresh_counts()?;
+        Ok(true)
     }
 
     pub fn stop_polling(&mut self) -> Result<()> {
@@ -841,30 +970,19 @@ fn apply_response(state: &mut SavedState, request: &RpcRequest, response: &RpcRe
 }
 
 fn leave_projection(state: &mut SavedState, room: RoomId) -> Result<()> {
-    let view = state
-        .status
-        .room
-        .as_mut()
-        .filter(|view| view.id == room)
-        .ok_or_else(|| Error::Invalid("Leave acknowledgment named a different current room".into()))?;
-    let actor = state.status.profile.as_ref().map(|profile| profile.id);
-    let own_member = view.members.iter().any(|member| Some(member.participant.id) == actor);
-    let retained_member = own_member && (view.phase != photocraft_party::room::Phase::Lobby || view.members.len() == 1);
-    if retained_member {
-        // An active game's roster is frozen. Keep its stable room/assignment for explicit
-        // reconnect, but never resume heartbeat polling after this acknowledged leave.
-        if let Some(member) = view.members.iter_mut().find(|member| Some(member.participant.id) == actor) {
-            member.connected = false;
-            member.ready = false;
-        }
-    } else {
-        state.status.room = None;
-        state.status.freeze_pin = None;
-        state.frozen = None;
+    if let Some(current) = &state.status.room
+        && current.id != room
+    {
+        return Err(Error::Invalid("Leave acknowledgment named a different current room".into()));
     }
-    state.active = false;
-    state.status.polling = false;
-    state.status.connected = false;
+    // Room departure clears the local active-room projection so the player can
+    // create or join another room while keeping account polling and canvas
+    // access active. Intentional temporary disconnect uses Operation::Disconnect.
+    state.status.room = None;
+    state.status.freeze_pin = None;
+    state.frozen = None;
+    state.status.reveal_position = None;
+    state.status.game_drafts = None;
     state.status.invitation_id = None;
     state.last_invitation = None;
     Ok(())

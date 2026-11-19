@@ -4,6 +4,8 @@ Owner-selected workflow, 2026-11-15. Applies to finishing K7 and subsequent owne
 
 ## Responsibilities and quota discipline
 
+Owner-requested quality-of-life changes and later additions are tracked in the [adjustments backlog](adjustments-backlog.md). They may proceed while remaining K7 external tests wait, with one item implemented and reviewed before the next. Preserve pending release gates and refresh any acceptance evidence invalidated by a change.
+
 - Codex scopes work, writes handoffs, reviews supplied evidence, asks focused questions and gives a qualified disposition. It does not start implementation, broad code investigation, builds or subagents by default in this workflow. The owner currently has little Codex quota; prefer one compact review and one consolidated question packet per checkpoint.
 - Antigravity is the implementation and investigation worker. The owner manually carries prompts and responses between tools; there is no assumed direct subagent connection or shared conversational memory. Antigravity must explicitly read repository instructions and the current handoff. Its tool access and capabilities must be established, not assumed.
 - Only one implementation worker/coordinator writes at a time. Preserve existing dirty/untracked work, user drawings, profiles, cloud resources and build caches. Never reset/clean/mass-commit the checkout to manufacture a clean baseline. Record pre-existing changes separately from this task's edits using before/after snapshots or patches; HEAD alone is insufficient in this dirty checkout.
