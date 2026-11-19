@@ -294,3 +294,112 @@ fn playback_checkpoints_are_throttled_but_pause_saves_the_chosen_frame_immediate
     paint_reveal(&mut app, &ctx, 10.3);
     assert_eq!(app.ui.rooms.last_reveal_save_time, 10.3, "Pausing makes the pending position eligible immediately");
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn submission_error_renders_in_reference_panel_and_room_window_until_dismissed() {
+    use egui_kittest::kittest::Queryable;
+
+    let directory = tempfile::tempdir().unwrap();
+    let room = view(Mode::ExquisiteCorpse, Phase::Drawing);
+    let assigned_project = room.assignment.as_ref().unwrap().assignment.project;
+    let mut app = app(room.clone());
+    app.session.enable_local_projects(directory.path().join("drafts.sqlite3"), Default::default()).unwrap();
+    app.session.flush_local_projects(std::time::Duration::from_secs(20)).unwrap();
+    app.session.rooms.status.connected = true;
+    app.session.rooms.status.paired = true;
+    app.session.open_room_draft().unwrap();
+    app.session.flush_local_projects(std::time::Duration::from_secs(20)).unwrap();
+    let doc_id = app.session.active().unwrap().doc.id;
+    assert_eq!(app.session.local_projects.status(doc_id).project, Some(assigned_project));
+
+    let error_text =
+        "This drawing exceeds the 64 MiB single-object upload limit; merge or simplify heavy imported layers in your saved local draft and try again.";
+    app.session.rooms.set_submission_error(error_text);
+    assert_eq!(app.session.room_sync_label(doc_id), "Submission failed · local draft retained");
+
+    // 1. With `Private room` closed (normal drawing view), `reference_panel` + `chrome` render the error and Dismiss button.
+    app.ui.rooms.open = false;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            crate::komaphone_workspace::chrome(app, ui);
+            reference_panel(app, ui);
+        },
+        app,
+    );
+    h.run_steps(3);
+    assert!(h.query_by_label(error_text).is_some(), "reference_panel must display submission error while Private room is closed");
+    assert!(h.query_by_label("Submission failed · local draft retained").is_some(), "footer must show honest failed sync label");
+    assert!(crate::komaphone_workspace::control_rect(&h.ctx, "komaphone.room.dismissError").is_some());
+
+    // 2. Opening `Private room` moves the control ownership into the modal without duplicating covered controls.
+    h.state_mut().ui.rooms.open = true;
+    h.run_steps(3);
+    assert!(h.query_by_label(error_text).is_some(), "Private room window also displays persistent submission error");
+    assert!(crate::komaphone_workspace::control_rect(&h.ctx, "komaphone.room.dismissError").is_some());
+
+    // 3. Clicking `Dismiss` clears the error in both views and restores `Local draft · not submitted`.
+    h.state_mut().ui.rooms.open = false;
+    h.run_steps(2);
+    h.get_by_label("Dismiss").click();
+    h.run_steps(2);
+    assert!(h.state().session.rooms.submission_error().is_none());
+    assert!(h.query_by_label(error_text).is_none());
+    assert!(h.query_by_label("Local draft · not submitted").is_some());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn capture_submission_error_ui_fixtures() {
+    let Some(out_dir) = std::env::var_os("KOMAPHONE_SUBMISSION_ERROR_SCREENSHOTS").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let _gpu = photocraft_testkit::gpu_lock();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let room = view(Mode::ExquisiteCorpse, Phase::Drawing);
+    let mut app = app(room);
+    app.session.enable_local_projects(directory.path().join("drafts.sqlite3"), Default::default()).unwrap();
+    app.session.flush_local_projects(std::time::Duration::from_secs(20)).unwrap();
+    app.session.rooms.status.connected = true;
+    app.session.rooms.status.paired = true;
+    app.session.rooms.status.polling = true;
+    app.session.open_room_draft().unwrap();
+    app.session.flush_local_projects(std::time::Duration::from_secs(20)).unwrap();
+    app.session
+        .execute("paint.stroke", serde_json::json!({"points": [[180, 120], [520, 280], [840, 420]], "size": 22, "color": [0.2, 0.55, 0.85, 1.0], "seed": 7}))
+        .unwrap();
+    app.session.flush_local_projects(std::time::Duration::from_secs(20)).unwrap();
+
+    let error_text =
+        "This drawing exceeds the 64 MiB single-object upload limit; merge or simplify heavy imported layers in your saved local draft and try again.";
+    app.session.rooms.set_submission_error(error_text);
+    app.ui.rooms.open = false;
+
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_pixels_per_point(1.0).wgpu().build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            crate::komaphone_workspace::chrome(app, ui);
+            reference_panel(app, ui);
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Assigned Exquisite Corpse canvas (1024 × 512 · Saved locally)");
+                });
+            });
+        },
+        app,
+    );
+    PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::Studio);
+    h.run_steps(5);
+    h.render().unwrap().save(out_dir.join("01-workspace-submission-error.png")).unwrap();
+
+    h.state_mut().ui.rooms.open = true;
+    h.run_steps(5);
+    h.render().unwrap().save(out_dir.join("02-room-window-submission-error.png")).unwrap();
+
+    h.state_mut().ui.rooms.open = false;
+    h.run_steps(3);
+    egui_kittest::kittest::Queryable::get_by_label(&h, "Dismiss").click();
+    h.run_steps(5);
+    h.render().unwrap().save(out_dir.join("03-workspace-after-dismiss.png")).unwrap();
+}

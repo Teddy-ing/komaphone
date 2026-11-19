@@ -64,3 +64,12 @@ pub struct LoadedDraft {
     pub head_revision: u64,
     pub recovery_warning: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionSummary {
+    pub revision: u64,
+    pub checkpoint: photocraft_party::contracts::AssetRef,
+    pub elapsed_ms: u64,
+    pub command: String,
+    pub kind: ReplayKind,
+}

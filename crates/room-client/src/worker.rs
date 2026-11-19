@@ -60,6 +60,7 @@ pub enum ClientCommand {
     Submit {
         submission: Box<Submission>,
         assets: Vec<Vec<u8>>,
+        local_revision: u64,
         freeze: bool,
     },
     /// Explicitly queue one bounded protocol operation for headless integration/automation.
@@ -770,7 +771,7 @@ fn handle(store: &mut Outbox, command: ClientCommand) -> Result<()> {
             Ok(())
         }
         ClientCommand::Start => start(store),
-        ClientCommand::Submit { submission, assets, freeze } => submit(store, *submission, assets, freeze),
+        ClientCommand::Submit { submission, assets, local_revision, freeze } => submit(store, *submission, assets, local_revision, freeze),
         ClientCommand::Enqueue(operation) => store.enqueue(operation).map(|_| ()),
         ClientCommand::Disconnect => {
             let status = store.status();
@@ -807,8 +808,11 @@ fn start(store: &mut Outbox) -> Result<()> {
     store.enqueue(Operation::Apply { room, expected_revision, action: Box::new(Action::Start { game, projects }) }).map(|_| ())
 }
 
-fn submit(store: &mut Outbox, submission: Submission, assets: Vec<Vec<u8>>, freeze: bool) -> Result<()> {
+fn submit(store: &mut Outbox, submission: Submission, assets: Vec<Vec<u8>>, local_revision: u64, freeze: bool) -> Result<()> {
     submission.validate().map_err(|e| Error::Invalid(e.to_string()))?;
+    if local_revision == 0 || submission.revision > local_revision {
+        return Err(Error::Invalid("Submission replay steps cannot exceed the durable local revision".into()));
+    }
     let (room, expected_revision) = room_and_revision(store)?;
     let status = store.status();
     let view = status.room.ok_or_else(|| Error::Invalid("Room is unavailable".into()))?;
@@ -825,7 +829,7 @@ fn submit(store: &mut Outbox, submission: Submission, assets: Vec<Vec<u8>>, free
             && pin.epoch == view.epoch
             && pin.assignment == submission.assignment
             && pin.project == submission.project
-            && pin.revision != submission.revision
+            && pin.revision != local_revision
     }) {
         return Err(Error::Invalid("This deadline already pinned a different acknowledged revision; submit the first pinned revision".into()));
     }
@@ -1069,14 +1073,67 @@ mod tests {
             seam: None,
         };
         for freeze in [true, false] {
-            assert!(submit(&mut store, submission.clone(), vec![b"future artifact".to_vec()], freeze).is_err());
+            assert!(submit(&mut store, submission.clone(), vec![b"future artifact".to_vec()], submission.revision, freeze).is_err());
             assert_eq!(store.status().pending, 0);
             assert!(store.next().unwrap().is_none());
             assert!(store.status().submission_project.is_none());
         }
+        assert!(submit(&mut store, submission.clone(), Vec::new(), 1, true).is_err(), "replay steps exceeding the pinned local revision must never queue");
         let mut original = submission;
         original.revision = 1;
-        submit(&mut store, original, Vec::new(), true).unwrap();
+        submit(&mut store, original, Vec::new(), 1, true).unwrap();
+        assert_eq!(store.status().pending, 2);
+    }
+
+    #[test]
+    fn keyframed_submission_matches_pinned_local_revision_while_rejecting_mismatched_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Outbox::open(root.path().join("client.sqlite3"), Box::new(FixtureCredentials)).unwrap();
+        store.configure("http://127.0.0.1:43127", "Keyframe pin fixture").unwrap();
+        let pair = store.next().unwrap().unwrap();
+        let profile = store.status().profile.unwrap();
+        store.acknowledge(&pair, &RpcResponse::Paired { participant: profile.clone() }).unwrap();
+        let room = Room::new(RoomId::new(&"1".repeat(32)).unwrap(), profile.clone(), Mode::Animation { rotations: 1 }, Some(1000)).unwrap();
+        let mut view = room.view(profile.id).unwrap();
+        view.phase = Phase::Transfer;
+        view.epoch = 2;
+        let assignment = Assignment {
+            id: AssignmentId { game: GameId::new(&"2".repeat(32)).unwrap(), chain: 0, round: 0 },
+            player: profile.id,
+            project: ProjectId::new(&"3".repeat(32)).unwrap(),
+        };
+        view.assignment = Some(AssignmentView { assignment: assignment.clone(), submitted: false, reference: None });
+        store.update_poll(view.clone()).unwrap();
+        store.pin_freeze(FreezePin { room: view.id, epoch: view.epoch, assignment: assignment.id, project: assignment.project, revision: 120 }).unwrap();
+        let image = AssetRef { hash: AssetHash::new(&"4".repeat(64)).unwrap(), bytes: 4 };
+        let checkpoint =
+            CheckpointRef { id: CheckpointId::new(&"5".repeat(32)).unwrap(), asset: AssetRef { hash: AssetHash::new(&"6".repeat(64)).unwrap(), bytes: 4 } };
+        let manifest = AssetRef { hash: AssetHash::new(&"9".repeat(64)).unwrap(), bytes: 4 };
+        let keyframed = Submission {
+            id: SubmissionId::new(&"7".repeat(32)).unwrap(),
+            assignment: assignment.id,
+            author: profile.id,
+            project: assignment.project,
+            revision: 36,
+            image,
+            checkpoint,
+            replay: ReplayRef {
+                id: ReplayId::new(&"8".repeat(32)).unwrap(),
+                manifest: Some(manifest),
+                baseline: checkpoint,
+                end_event: Some(photocraft_party::EventId::new(&"a".repeat(32)).unwrap()),
+                event_count: 35,
+                duration_ms: 5000,
+            },
+            assets: vec![image, checkpoint.asset, manifest],
+            note: String::new(),
+            seam: None,
+        };
+        for bad_local in [0, 35, 119, 121] {
+            assert!(submit(&mut store, keyframed.clone(), Vec::new(), bad_local, true).is_err(), "accepted bad local_revision {bad_local}");
+            assert_eq!(store.status().pending, 0);
+        }
+        submit(&mut store, keyframed, Vec::new(), 120, true).unwrap();
         assert_eq!(store.status().pending, 2);
     }
 }

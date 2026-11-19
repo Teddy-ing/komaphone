@@ -351,6 +351,11 @@ pub fn specs() -> Vec<CommandSpec> {
         spec("komaphone.room.disconnect", "Disconnect", "{}", |s, p| native_simple(s, p, "disconnect")),
         spec("komaphone.room.retry", "Retry pending room work", "{}", |s, p| native_simple(s, p, "retry")),
         spec("komaphone.room.retainRejected", "Keep rejected work and refresh", "{}", |s, p| native_simple(s, p, "retain")),
+        spec("komaphone.room.dismissError", "Dismiss submission notice", "{}", |s, p| {
+            fields(p, &[])?;
+            s.rooms.clear_submission_error();
+            Ok(json!({"cleared":true}))
+        }),
     ];
     specs.push(CommandSpec {
         id: "komaphone.room.status",
@@ -362,13 +367,16 @@ pub fn specs() -> Vec<CommandSpec> {
         run: |s, p| {
             fields(p, &[])?;
             s.poll_rooms();
-            Ok(json!({"available":s.rooms.available(),"busy":s.rooms.busy(),"status":s.rooms.status}))
+            Ok(json!({"available":s.rooms.available(),"busy":s.rooms.busy(),"submissionError":s.rooms.submission_error(),"status":s.rooms.status}))
         },
         journal: false,
     });
     for command in &mut specs {
         command.enabled = match command.id {
             "komaphone.room.status" => always,
+            "komaphone.room.dismissError" => |s| {
+                if s.rooms.submission_error().is_some() { Ok(()) } else { Err("No submission notice to dismiss".into()) }
+            },
             "komaphone.room.create" | "komaphone.room.join" => idle,
             "komaphone.room.ready" => lobby_member,
             "komaphone.room.options" => lobby_host,

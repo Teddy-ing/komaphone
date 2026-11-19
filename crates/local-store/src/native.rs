@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    DraftInfo, Error, LoadedDraft, MAX_CHECKPOINT_BYTES, MAX_PROJECTS, MAX_RECORD_BYTES, MAX_REPLAY_PAGE, ReplayRecord, Result, SCHEMA_VERSION, SaveAck,
-    SaveRequest, StoreOptions, Usage,
+    DraftInfo, Error, LoadedDraft, MAX_CHECKPOINT_BYTES, MAX_PROJECTS, MAX_RECORD_BYTES, MAX_REPLAY_PAGE, ReplayRecord, Result, RevisionSummary,
+    SCHEMA_VERSION, SaveAck, SaveRequest, StoreOptions, Usage,
 };
 
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -268,6 +268,20 @@ impl Store {
         Ok((document, verified.info))
     }
 
+    /// Verify revision metadata, timing, command kind, and checkpoint reference without loading or decoding its `.pcraft` blob.
+    pub fn revision_summary(&self, project: ProjectId, revision: u64) -> Result<RevisionSummary> {
+        let verified = verify_revision(&self.db, project, revision)?;
+        Ok(summary_from_verified(revision, verified))
+    }
+
+    /// Read a retained result checkpoint alongside its verified compressed `.pcraft` bytes and metadata summary.
+    pub fn load_revision_bytes(&self, project: ProjectId, revision: u64) -> Result<(Document, Vec<u8>, RevisionSummary)> {
+        let verified = verify_revision(&self.db, project, revision)?;
+        let bytes = read_object(&self.db, &verified.checkpoint, MAX_CHECKPOINT_BYTES)?;
+        let document = photocraft_format::load_from_bytes_with(&bytes, &load_options()).map_err(|e| Error::Corrupt(e.to_string()))?;
+        Ok((document, bytes, summary_from_verified(revision, verified)))
+    }
+
     /// Canonical records after a revision, bounded by count and 16 MiB serialized bytes.
     /// Advance the cursor by the returned count. History is never pruned.
     pub fn replay_page(&self, project: ProjectId, after_revision: u64, limit: usize) -> Result<Vec<ReplayRecord>> {
@@ -482,6 +496,13 @@ fn verify_revision(db: &Connection, project: ProjectId, revision: u64) -> Result
     }
     let info = draft_info(project.as_str(), row.title, revision as i64, row.updated_at, row.elapsed_ms)?;
     Ok(VerifiedRevision { info, checkpoint: row.checkpoint, record, record_bytes: payload_bytes.len(), envelope })
+}
+
+fn summary_from_verified(revision: u64, verified: VerifiedRevision) -> RevisionSummary {
+    let checkpoint = match verified.envelope.step {
+        ReplayStep::Resolved { result, .. } | ReplayStep::Checkpoint { result } => result.asset,
+    };
+    RevisionSummary { revision, checkpoint, elapsed_ms: verified.record.elapsed_ms, command: verified.record.command, kind: verified.record.kind }
 }
 
 fn request_fingerprint(request: &SaveRequest, checkpoint: &str, payload: &str) -> String {

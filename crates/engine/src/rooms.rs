@@ -14,10 +14,18 @@ pub use photocraft_room_client::ClientOptions;
 pub use photocraft_room_client::FreezePin;
 pub use photocraft_room_client::{GameDrafts, NoteDraft, RevealPosition};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmissionErrorScope {
+    Assignment { room: photocraft_party::RoomId, assignment: photocraft_party::AssignmentId },
+    Room(Option<photocraft_party::RoomId>),
+}
+
 #[derive(Default)]
 pub struct Rooms {
     pub status: ClientStatus,
     pub media: media::RoomMedia,
+    submission_error: Option<String>,
+    submission_error_scope: Option<SubmissionErrorScope>,
     invitation: Option<Invitation>,
     configured: bool,
     sending: Option<u64>,
@@ -46,6 +54,64 @@ impl Rooms {
     pub fn submission_project(&self) -> Option<photocraft_party::ProjectId> {
         self.submission_sending.map(|(_, project)| project).or(self.status.submission_project)
     }
+    pub fn submission_error(&self) -> Option<&str> {
+        self.submission_error.as_deref()
+    }
+    pub(crate) fn submission_error_for(&self, room: photocraft_party::RoomId, assignment: photocraft_party::AssignmentId) -> Option<&str> {
+        match self.submission_error_scope {
+            Some(SubmissionErrorScope::Assignment { room: expected_room, assignment: expected_assignment })
+                if expected_room == room && expected_assignment == assignment =>
+            {
+                self.submission_error.as_deref()
+            }
+            _ => None,
+        }
+    }
+    pub fn set_submission_error(&mut self, error: impl Into<String>) {
+        let message = error.into();
+        let scope = match self.status.room.as_ref() {
+            Some(room) => match room
+                .assignment
+                .as_ref()
+                .filter(|a| !a.submitted && matches!(room.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer))
+            {
+                Some(assignment) => SubmissionErrorScope::Assignment { room: room.id, assignment: assignment.assignment.id },
+                None => SubmissionErrorScope::Room(Some(room.id)),
+            },
+            None => SubmissionErrorScope::Room(None),
+        };
+        if self.status.error.is_none() || self.status.error.as_deref() == self.submission_error.as_deref() {
+            self.status.error = Some(message.clone());
+        }
+        self.submission_error = Some(message);
+        self.submission_error_scope = Some(scope);
+    }
+    pub fn clear_submission_error(&mut self) {
+        if self.submission_error.is_some() && self.status.error.as_deref() == self.submission_error.as_deref() {
+            self.status.error = None;
+        }
+        self.submission_error = None;
+        self.submission_error_scope = None;
+    }
+    fn reconcile_submission_error(&mut self) {
+        let Some(scope) = self.submission_error_scope else { return };
+        let keep = match scope {
+            SubmissionErrorScope::Assignment { room: expected_room, assignment: expected_assignment } => self.status.room.as_ref().is_some_and(|room| {
+                room.id == expected_room
+                    && matches!(room.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer)
+                    && room
+                        .assignment
+                        .as_ref()
+                        .is_some_and(|a| a.assignment.id == expected_assignment && !a.submitted && self.submission_project() != Some(a.assignment.project))
+            }),
+            SubmissionErrorScope::Room(expected_room) => self.status.room.as_ref().map(|r| r.id) == expected_room && self.submission_project().is_none(),
+        };
+        if !keep {
+            self.clear_submission_error();
+        } else if self.status.error.is_none() {
+            self.status.error = self.submission_error.clone();
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     fn accept_status(&mut self, handled_sequence: u64, status: ClientStatus) -> bool {
         if self.sending.is_some_and(|pending| pending > handled_sequence) {
@@ -67,7 +133,14 @@ impl Rooms {
         self.sending = None;
         if self.submission_sending.is_some_and(|(pending, _)| pending <= handled_sequence) {
             self.submission_sending = None;
+            if self.status.submission_project.is_none()
+                && !self.status.room.as_ref().and_then(|r| r.assignment.as_ref()).is_some_and(|a| a.submitted)
+                && let Some(error) = self.status.error.clone()
+            {
+                self.set_submission_error(error);
+            }
         }
+        self.reconcile_submission_error();
         access_changed
     }
 }
@@ -193,6 +266,15 @@ impl Session {
         );
         let changes_access =
             account_transition || matches!(command, photocraft_room_client::ClientCommand::Disconnect | photocraft_room_client::ClientCommand::Connect { .. });
+        let clears_submission_error = changes_access
+            || matches!(
+                &command,
+                photocraft_room_client::ClientCommand::Retry
+                    | photocraft_room_client::ClientCommand::RetainRejected
+                    | photocraft_room_client::ClientCommand::Create { .. }
+                    | photocraft_room_client::ClientCommand::Join { .. }
+            )
+            || matches!(&command, photocraft_room_client::ClientCommand::Action(action) if matches!(action.as_ref(), photocraft_party::room::Action::Leave));
         if changes_access {
             if let Some(worker) = &self.rooms.worker {
                 worker.pause_authenticated();
@@ -225,6 +307,7 @@ impl Session {
             self.rooms.status.error = None;
             self.rooms.status.notice = None;
             self.rooms.submission_sending = None;
+            self.rooms.clear_submission_error();
             if let Err(error) = self.world_access(None) {
                 self.worlds.error = Some(error.to_string());
             }
@@ -232,6 +315,9 @@ impl Session {
         // A stopped canvas worker must never prevent room cancellation/sign-out.
         let worker = self.rooms.worker.as_ref().ok_or_else(|| EngineError::Other("Private rooms require the native Windows app".into()))?;
         let sequence = worker.send(command).map_err(|e| EngineError::Other(e.to_string()))?;
+        if clears_submission_error {
+            self.rooms.clear_submission_error();
+        }
         self.rooms.sending = Some(sequence);
         Ok(sequence)
     }
@@ -240,10 +326,23 @@ impl Session {
     /// revision. An unrelated local draft cannot be submitted to an assignment.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn queue_room_submission(&mut self, submission: photocraft_party::Submission, assets: Vec<Vec<u8>>, freeze: bool) -> Result<()> {
-        self.check_room_submission(&submission, freeze)?;
+        let local_revision = submission.revision;
+        self.queue_prepared_room_submission(submission, assets, local_revision, freeze)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn queue_prepared_room_submission(
+        &mut self,
+        submission: photocraft_party::Submission,
+        assets: Vec<Vec<u8>>,
+        local_revision: u64,
+        freeze: bool,
+    ) -> Result<()> {
+        self.check_room_submission(&submission, local_revision, freeze)?;
         let project = submission.project;
-        let sequence = self.room_request(photocraft_room_client::ClientCommand::Submit { submission: Box::new(submission), assets, freeze })?;
+        let sequence = self.room_request(photocraft_room_client::ClientCommand::Submit { submission: Box::new(submission), assets, local_revision, freeze })?;
         self.rooms.submission_sending = Some((sequence, project));
+        self.rooms.clear_submission_error();
         Ok(())
     }
 
@@ -265,16 +364,19 @@ impl Session {
         self.room_request(photocraft_room_client::ClientCommand::PinFreeze(pin)).map(|_| ())
     }
 
-    pub(crate) fn check_room_submission(&self, submission: &photocraft_party::Submission, freeze: bool) -> Result<()> {
+    pub(crate) fn check_room_submission(&self, submission: &photocraft_party::Submission, local_revision: u64, freeze: bool) -> Result<()> {
         submission.validate().map_err(|e| EngineError::Other(e.to_string()))?;
+        if local_revision == 0 || submission.revision > local_revision {
+            return Err(EngineError::Other("Submission replay steps cannot exceed the durable local revision".into()));
+        }
         let document = self.documents().iter().find(|document| self.local_projects.status(document.doc.id).project == Some(submission.project));
         let saved = if freeze {
             let open_revision = document.map(|document| self.local_projects.status(document.doc.id).local_revision).unwrap_or(0);
             let listed_revision = self.local_projects.drafts.iter().find(|draft| draft.project == submission.project).map_or(0, |draft| draft.revision);
-            submission.revision > 0 && submission.revision <= open_revision.max(listed_revision)
+            local_revision <= open_revision.max(listed_revision)
         } else {
             document.is_some_and(|document| {
-                self.local_document_saved(document.doc.id) && self.local_projects.status(document.doc.id).local_revision == submission.revision
+                self.local_document_saved(document.doc.id) && self.local_projects.status(document.doc.id).local_revision == local_revision
             })
         };
         if !saved {
@@ -293,7 +395,7 @@ impl Session {
                 && pin.epoch == room.epoch
                 && pin.assignment == submission.assignment
                 && pin.project == submission.project
-                && pin.revision != submission.revision
+                && pin.revision != local_revision
         }) {
             return Err(EngineError::Other("This deadline already pinned a different acknowledged revision; submit the first pinned revision".into()));
         }

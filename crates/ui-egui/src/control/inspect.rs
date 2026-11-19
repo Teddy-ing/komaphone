@@ -177,6 +177,7 @@ pub(super) fn with_world_hash(app: &PhotocraftApp, ctx: &egui::Context, world_ha
         "komaphone.room.leave",
         "komaphone.room.retry",
         "komaphone.room.retainRejected",
+        "komaphone.room.dismissError",
         "komaphone.account.signIn",
         "komaphone.account.signOut",
         "komaphone.room.ready",

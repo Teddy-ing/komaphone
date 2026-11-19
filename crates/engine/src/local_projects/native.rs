@@ -187,9 +187,9 @@ impl Session {
                 self.local_projects.preparing_room = false;
                 let result = (*result)
                     .map_err(EngineError::Other)
-                    .and_then(|prepared| self.queue_room_submission(prepared.submission, prepared.assets, prepared.freeze));
+                    .and_then(|prepared| self.queue_prepared_room_submission(prepared.submission, prepared.assets, prepared.local_revision, prepared.freeze));
                 if let Err(error) = result {
-                    self.rooms.status.error = Some(error.to_string());
+                    self.rooms.set_submission_error(error.to_string());
                 }
             }
             Response::Saved(result) => {

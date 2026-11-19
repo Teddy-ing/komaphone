@@ -120,6 +120,9 @@ impl Session {
         if self.local_projects.preparing_room || self.rooms.busy() {
             return "Sync pending · awaiting service confirmation";
         }
+        if self.rooms.submission_error_for(room.id, assignment.assignment.id).is_some() {
+            return "Submission failed · local draft retained";
+        }
         if !self.rooms.status.connected {
             return "Service unavailable · not submitted";
         }
@@ -182,6 +185,7 @@ impl Session {
             return Err(EngineError::Other("Submission preparation is already running".into()));
         }
         self.local_request(native::Request::PrepareRoom(Box::new(request)))?;
+        self.rooms.clear_submission_error();
         self.local_projects.preparing_room = true;
         Ok(())
     }

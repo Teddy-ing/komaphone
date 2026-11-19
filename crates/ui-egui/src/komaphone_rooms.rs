@@ -107,8 +107,15 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 ui.separator();
                 connection(app, ui);
                 let status = app.session.rooms.status.clone();
+                let submission_error = app.session.rooms.submission_error().map(str::to_owned);
                 if let Some(error) = status.error.as_ref() {
                     ui.colored_label(tokens.text, error);
+                }
+                if let Some(sub_error) = submission_error.as_ref() {
+                    if status.error.as_ref() != Some(sub_error) {
+                        ui.colored_label(tokens.text, sub_error);
+                    }
+                    button(app, ui, "Dismiss", "komaphone.room.dismissError", json!({}));
                 }
                 if let Some(notice) = status.notice.as_ref() {
                     ui.label(RichText::new(notice).color(tokens.text_dim));

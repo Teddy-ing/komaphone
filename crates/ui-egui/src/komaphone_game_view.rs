@@ -144,6 +144,18 @@ pub fn reference_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             } else {
                 button(app, ui, "Submit saved drawing", "komaphone.room.submit", json!({"note":submission_note(app,&room)}));
             }
+            let tokens = crate::theme::Tokens::get(ui.ctx());
+            let status_error = app.session.rooms.status.error.clone();
+            let submission_error = app.session.rooms.submission_error().map(str::to_owned);
+            if let Some(error) = status_error.as_ref() {
+                ui.colored_label(tokens.text, error);
+            }
+            if let Some(sub_error) = submission_error.as_ref() {
+                if status_error.as_ref() != Some(sub_error) {
+                    ui.colored_label(tokens.text, sub_error);
+                }
+                button(app, ui, "Dismiss", "komaphone.room.dismissError", json!({}));
+            }
             if !app.session.rooms.status.connected {
                 ui.label("Service unavailable · your drawing stays saved locally");
             }
