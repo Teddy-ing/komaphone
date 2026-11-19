@@ -15,6 +15,8 @@ fn stroke(info: &CanvasInfo, n: u64) -> Stroke {
         width: 8.0,
         color: Srgba { rgba: [0.1, 0.4, 0.7, 1.0] },
         erase: false,
+        brush: None,
+        samples: None,
     }
 }
 fn view(info: &CanvasInfo) -> Viewport {

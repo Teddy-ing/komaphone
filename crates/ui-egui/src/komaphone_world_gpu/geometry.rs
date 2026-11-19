@@ -6,21 +6,41 @@ use photocraft_engine::scene::{
 use std::ops::Range;
 
 #[derive(Clone, Copy)]
+pub(super) enum BrushOp {
+    Normal,
+    Erase,
+    Behind,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TileCopy {
+    pub staging_offset: u64,
+    pub x0: u32,
+    pub y0: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone)]
 pub(super) enum Kind {
     Color { erase: bool },
     Image(AssetHash),
+    Brush { op: BrushOp, copies: Vec<TileCopy> },
 }
+
 pub(super) struct Batch {
     pub device: DeviceId,
     pub kind: Kind,
     pub indices: Range<u32>,
 }
+
 #[derive(Default)]
 pub(super) struct Geometry {
     pub vertices: Vec<u8>,
     pub indices: Vec<u8>,
     pub batches: Vec<Batch>,
 }
+
 impl Geometry {
     pub fn vertex_count(&self) -> usize {
         self.vertices.len() / 32
@@ -34,6 +54,12 @@ impl Geometry {
     fn vertex(&mut self, position: [f32; 2], uv: [f32; 2], color: [f32; 4], view: &Viewport) {
         let values =
             [position[0] * 2.0 / view.width as f32 - 1.0, 1.0 - position[1] * 2.0 / view.height as f32, uv[0], uv[1], color[0], color[1], color[2], color[3]];
+        for value in values {
+            self.vertices.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn vertex_phys(&mut self, position: [f32; 2], uv: [f32; 2], color: [f32; 4], phys: [u32; 2]) {
+        let values = [position[0] * 2.0 / phys[0] as f32 - 1.0, 1.0 - position[1] * 2.0 / phys[1] as f32, uv[0], uv[1], color[0], color[1], color[2], color[3]];
         for value in values {
             self.vertices.extend_from_slice(&value.to_le_bytes());
         }
@@ -77,6 +103,31 @@ impl Geometry {
         if first != end {
             self.batches.push(Batch { device: shared.device, kind: Kind::Color { erase: projected.erase }, indices: first..end });
         }
+        Ok(())
+    }
+    pub fn brush_tiles(&mut self, device: DeviceId, op: BrushOp, copies: Vec<TileCopy>, phys: [u32; 2]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.reserve(copies.len().saturating_mul(4), copies.len().saturating_mul(6))?;
+        let first = (self.indices.len() / 4) as u32;
+        let pw = phys[0] as f32;
+        let ph = phys[1] as f32;
+        for copy in &copies {
+            let base = self.vertex_count() as u32;
+            let x0 = copy.x0 as f32;
+            let y0 = copy.y0 as f32;
+            let x1 = (copy.x0 + copy.width) as f32;
+            let y1 = (copy.y0 + copy.height) as f32;
+            for point in [[x0, y0], [x1, y0], [x0, y1], [x1, y1]] {
+                self.vertex_phys(point, [point[0] / pw, point[1] / ph], [1.0; 4], phys);
+            }
+            for index in [0, 1, 2, 2, 1, 3] {
+                self.index(base + index);
+            }
+        }
+        let end = (self.indices.len() / 4) as u32;
+        self.batches.push(Batch { device, kind: Kind::Brush { op, copies }, indices: first..end });
         Ok(())
     }
     pub fn media(&mut self, shared: &SharedMedia, view: &Viewport, hash: AssetHash) -> Result<()> {

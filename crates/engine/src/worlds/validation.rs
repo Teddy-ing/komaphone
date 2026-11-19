@@ -99,8 +99,10 @@ pub(super) fn response(response: &wire::Response, request: Option<&wire::Action>
                             width: style.width,
                             color: style.color,
                             erase: style.erase,
+                            brush: style.brush.clone(),
+                            samples: style.samples.clone(),
                         }
-                        .validate()
+                        .validate_preview()
                         .map_err(error)?;
                     }
                 } else if !peer.preview.is_empty() {

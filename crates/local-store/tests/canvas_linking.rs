@@ -73,6 +73,8 @@ fn fixture(path: &Path) -> CanvasStore {
                         width: 3.,
                         color: Srgba { rgba: [0.2, 0.4, 0.6, 1.] },
                         erase: sequence == 2,
+                        brush: None,
+                        samples: None,
                     },
                     info.revision,
                 )

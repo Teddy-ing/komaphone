@@ -177,6 +177,10 @@ struct Draw {
     color: Srgba,
     #[serde(default)]
     erase: bool,
+    #[serde(default)]
+    brush: Option<Box<photocraft_scene::brush::StrokeBrush>>,
+    #[serde(default)]
+    samples: Option<Vec<photocraft_scene::brush::StrokeSample>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,7 +327,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "komaphone.world.stroke",
             "Draw on shared canvas",
-            r#"{"canvas":id,"id":stroke_id?,"anchor":region,"points":[[x,y]],"width":diameter,"color":{"rgba":[r,g,b,1]},"erase":false}"#,
+            r#"{"canvas":id,"id":stroke_id?,"anchor":region,"points":[[x,y]],"width":diameter,"color":{"rgba":[r,g,b,a]},"erase":false,"brush":stroke_brush?,"samples":[stroke_sample]?}"#,
             opened,
             |s, p| {
                 if p.get("points").and_then(Value::as_array).is_none_or(|p| p.is_empty() || p.len() > photocraft_scene::MAX_POINTS) {
@@ -344,8 +348,13 @@ pub fn specs() -> Vec<CommandSpec> {
                     width: p.width,
                     color: p.color,
                     erase: p.erase,
+                    brush: p.brush,
+                    samples: p.samples,
                 };
                 stroke.validate().map_err(error)?;
+                if let Some(brush) = stroke.brush.as_deref() {
+                    crate::world_brush::validate_stroke_brush_assets(brush)?;
+                }
                 photocraft_scene::render::spatial_cells(&stroke, photocraft_scene::MAX_SPATIAL_CELLS).map_err(error)?;
                 s.worlds.tour_playback = None;
                 edit(s, Edit::AddStroke { stroke })
@@ -376,18 +385,29 @@ pub fn specs() -> Vec<CommandSpec> {
                     photocraft_scene::coordinates::validate_point(cursor).map_err(error)?;
                 }
                 if let Some(style) = &p.stroke {
+                    let points = if p.preview.is_empty() { vec![[0., 0.]] } else { p.preview.clone() };
+                    let samples = if p.preview.is_empty() {
+                        style.samples.as_ref().map(|_| vec![photocraft_scene::brush::StrokeSample::default()])
+                    } else {
+                        style.samples.clone()
+                    };
                     let stroke = Stroke {
                         id: style.id,
                         canvas: p.camera.canvas,
                         owner: identity(s)?.0,
                         revision: 0,
                         anchor: style.anchor,
-                        points: if p.preview.is_empty() { vec![[0., 0.]] } else { p.preview.clone() },
+                        points,
                         width: style.width,
                         color: style.color,
                         erase: style.erase,
+                        brush: style.brush.clone(),
+                        samples,
                     };
-                    stroke.validate().map_err(error)?;
+                    stroke.validate_preview().map_err(error)?;
+                    if let Some(brush) = style.brush.as_deref() {
+                        crate::world_brush::validate_stroke_brush_assets(brush)?;
+                    }
                 }
                 pending(
                     s,

@@ -73,6 +73,8 @@ fn stroke() -> SharedStroke {
             width: 3.,
             color: scene::Srgba { rgba: [0., 0., 0., 1.] },
             erase: false,
+            brush: None,
+            samples: None,
         },
         device: DeviceId::new("66666666666666666666666666666666").unwrap(),
         provenance: None,

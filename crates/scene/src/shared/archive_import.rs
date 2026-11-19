@@ -99,10 +99,15 @@ impl ArchiveManifest {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 {
+        let expected_world_schema = match self.schema {
+            1 => super::SHARED_SCHEMA,
+            2 => super::SHARED_SCHEMA_BRUSH,
+            _ => return Err(Error::Schema),
+        };
+        self.world.validate()?;
+        if self.world.schema != expected_world_schema {
             return Err(Error::Schema);
         }
-        self.world.validate()?;
         self.world.validate_complete_import()?;
         if self.assets.len() > self.world.limits().max_media_frames {
             return Err(Error::Limit("archive assets"));

@@ -573,6 +573,8 @@ fn drawing_area(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             width: draft.width,
             color: draft.color,
             erase: draft.erase,
+            brush: None,
+            samples: None,
         };
         if let Err(error) = paint_stroke(&painter, rect.min, &stroke, &viewport, &mut counts) {
             render_error.get_or_insert(error);
@@ -1272,6 +1274,8 @@ mod tests {
             width: -1.0,
             color: Srgba { rgba: [0.1, 0.2, 0.3, 1.0] },
             erase: false,
+            brush: None,
+            samples: None,
         };
         app.session.canvases.view = Some(scene::SceneView { viewport: view, revision: 1, strokes: vec![stroke.clone()], stats: Default::default() });
         let ctx = egui::Context::default();
@@ -1402,6 +1406,8 @@ mod tests {
             width: 5.0,
             color: Srgba { rgba: [0.1, 0.2, 0.3, 1.0] },
             erase: false,
+            brush: None,
+            samples: None,
         };
         let ctx = egui::Context::default();
         let mut counts = (1, scene::round::MAX_MESH_VERTICES - 1);
@@ -1440,6 +1446,8 @@ mod tests {
                 width: 5.0,
                 color: Srgba { rgba: [0.1, 0.2, 0.3, 1.0] },
                 erase: false,
+                brush: None,
+                samples: None,
             })
             .collect();
         let source_counts: Vec<_> = strokes.iter().map(|stroke| stroke.points.len()).collect();

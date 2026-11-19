@@ -5,7 +5,7 @@ use crate::shared::media::{AssetHash, MediaFrame, Provenance};
 use crate::shared::{AcceptedOp, DeviceId, MediaId, OpId, SourceId, WorldOp};
 use crate::{Camera, CanvasId, OwnerId, Point, RegionKey, Srgba, StrokeId};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PAGE: u32 = 128;
@@ -253,7 +253,7 @@ pub struct Peer {
     pub expires_at_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewStyle {
     pub id: StrokeId,
@@ -261,6 +261,10 @@ pub struct PreviewStyle {
     pub width: f64,
     pub color: Srgba,
     pub erase: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush: Option<Box<crate::brush::StrokeBrush>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samples: Option<Vec<crate::brush::StrokeSample>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -333,6 +333,7 @@ impl PhotocraftApp {
         let tabbed_in = !chrome && self.ui.panels.full_screen_chrome;
         if self.ui.world.open {
             crate::komaphone_world::show(self, ui);
+            crate::paint_mouse::show_picker(self, &ctx);
         } else if self.ui.canvas.open {
             crate::komaphone_canvas::show(self, ui);
         } else if self.ui.komaphone.enabled && (chrome || tabbed_in) {

@@ -170,6 +170,8 @@ fn slow_http_upload_does_not_delay_second_local_durable_save() {
             width: 3.,
             color: Srgba { rgba: [0., 0., 0., 1.] },
             erase: false,
+            brush: None,
+            samples: None,
         },
     };
     worker.send(Command::Edit { canvas, action: stroke(100) }).unwrap();
@@ -309,6 +311,8 @@ fn three_held_presence_http_requests_leave_local_saves_responsive() {
         width: 3.,
         color: Srgba { rgba: [0., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     let start = Instant::now();
     let sequence = worker.send(Command::Edit { canvas, action: Edit::AddStroke { stroke } }).unwrap();

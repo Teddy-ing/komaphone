@@ -45,6 +45,8 @@ fn populated(artists: u128) -> WorldState {
             width: 5.,
             color: Srgba { rgba: [0.2, 0.3, 0.4, 1.] },
             erase: n == 2,
+            brush: None,
+            samples: None,
         };
         // Device order intentionally differs from event/author order.
         append(&mut world, 10 + n, 1000 + artists - n, Edit::AddStroke { stroke });
@@ -296,6 +298,8 @@ fn import_then_new_edits_then_reimport_retains_ultimate_credits_and_all_owner_re
         width: 3.,
         color: Srgba { rgba: [1., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     append(&mut first, 10, 7000, Edit::AddStroke { stroke });
     let archived = ArchiveManifest { schema: 1, world: first.clone(), assets: vec![] };

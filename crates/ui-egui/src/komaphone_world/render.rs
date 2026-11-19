@@ -14,10 +14,12 @@ pub struct Presentation {
     worker: Option<Worker>,
     prepare_error: Option<String>,
     renderer: Option<WorldRenderer>,
-    gpu: Option<crate::komaphone_world_gpu::WorldGpu>,
+    gpu: Option<Box<crate::komaphone_world_gpu::WorldGpu>>,
     health: Option<photocraft_gpu::DeviceHealth>,
     output: OutputCache,
     texture: Option<egui::TextureId>,
+    live: Option<Box<(scene::StrokeId, photocraft_engine::world_brush::LiveWorldBrush)>>,
+    smoothing_string: Option<([f64; 2], [f64; 2])>,
     pub render_ms: f64,
     pub preparing: bool,
     pub rendered_revision: Option<u64>,
@@ -107,6 +109,12 @@ pub(super) fn paint(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &V
             }
         }
     }
+    if let Some(([bx, by], [px, py])) = presentation.smoothing_string {
+        let a = rect.min + egui::vec2(bx as f32, by as f32);
+        let b = rect.min + egui::vec2(px as f32, py as f32);
+        painter.line_segment([a, b], egui::Stroke::new(1.5, tokens.accent));
+        painter.circle_stroke(a, 3.5, egui::Stroke::new(1.5, tokens.accent));
+    }
     if presentation.preparing || presentation.stats.pending_assets > 0 {
         let message = if presentation.preparing { "Preparing the selected canvas revision…" } else { "Loading shared media…" };
         painter.text(rect.min + egui::vec2(12.0, 12.0), egui::Align2::LEFT_TOP, message, egui::FontId::proportional(13.0), tokens.text);
@@ -132,6 +140,8 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
         p.health = None;
         p.output.clear();
         p.texture = None;
+        p.live = None;
+        p.smoothing_string = None;
         p.ready = None;
         p.rendered_revision = None;
         p.stats = Default::default();
@@ -177,7 +187,7 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
             .or_else(|| app.gpu_health())
             .ok_or_else(|| "The shared canvas GPU is unavailable".to_owned())?;
         p.output.clear();
-        p.gpu = Some(crate::komaphone_world_gpu::WorldGpu::new(rs, health.clone())?);
+        p.gpu = Some(Box::new(crate::komaphone_world_gpu::WorldGpu::new(rs, health.clone())?));
         p.health = Some(health);
     }
     if let Some(fault) = p.health.as_ref().and_then(photocraft_gpu::DeviceHealth::fault) {
@@ -192,6 +202,7 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
         app.session.world_media_bytes(frame).map_err(|e| e.to_string())?;
     }
     let mut previews = Vec::new();
+    let mut local_brush_draft: Option<(scene::StrokeId, bool, scene::Stroke)> = None;
     if cursor.is_none() {
         for peer in &app.session.worlds.peers {
             if peer.camera.canvas != view.camera.canvas || app.session.worlds.account.as_ref().is_some_and(|a| a.device == peer.device) {
@@ -211,6 +222,8 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
                         width: style.width,
                         color: style.color,
                         erase: style.erase,
+                        brush: style.brush.clone(),
+                        samples: style.samples.clone(),
                     },
                     device: peer.device,
                     provenance: None,
@@ -225,18 +238,24 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
             && draft.stroke.viewport.camera.canvas == view.camera.canvas
         {
             let s = &draft.stroke;
+            let draft_stroke = scene::Stroke {
+                id: draft.id,
+                canvas: view.camera.canvas,
+                owner: draft.account.profile,
+                revision: 0,
+                anchor: s.anchor,
+                points: s.points.clone(),
+                width: s.width,
+                color: s.color,
+                erase: s.erase,
+                brush: draft.brush.clone(),
+                samples: (draft.samples.len() == s.points.len()).then(|| draft.samples.clone()),
+            };
+            if draft_stroke.brush.is_some() {
+                local_brush_draft = Some((draft.id, draft.drawing, draft_stroke.clone()));
+            }
             previews.push(SharedStroke {
-                stroke: scene::Stroke {
-                    id: draft.id,
-                    canvas: view.camera.canvas,
-                    owner: draft.account.profile,
-                    revision: 0,
-                    anchor: s.anchor,
-                    points: s.points.clone(),
-                    width: s.width,
-                    color: s.color,
-                    erase: s.erase,
-                },
+                stroke: draft_stroke,
                 device: draft.account.device,
                 provenance: None,
                 visible: true,
@@ -245,18 +264,41 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
             });
         }
     }
-    let gpu = p.gpu.as_mut().ok_or_else(|| "Canvas GPU unavailable".to_owned())?;
     let density = ui.ctx().pixels_per_point();
+    let mut live_raster = None;
+    p.smoothing_string = None;
+    if let Some((draft_id, drawing, draft_stroke)) = local_brush_draft {
+        let reuse = p.live.as_deref().is_some_and(|(id, live)| *id == draft_id && live.matches_view(view, density));
+        if reuse {
+            if let Some((_, live)) = p.live.as_deref_mut() {
+                live.sync_points(&draft_stroke.points, draft_stroke.samples.as_deref()).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let live = photocraft_engine::world_brush::LiveWorldBrush::new(&draft_stroke, view, density).map_err(|e| e.to_string())?;
+            p.live = Some(Box::new((draft_id, live)));
+        }
+        if let Some((_, live)) = p.live.as_deref() {
+            live_raster = live.preview_raster().map_err(|e| e.to_string())?.map(|raster| (draft_id, raster));
+            if drawing {
+                p.smoothing_string = live.smoothing_string();
+            }
+        }
+    } else {
+        p.live = None;
+    }
+    let gpu = p.gpu.as_mut().ok_or_else(|| "Canvas GPU unavailable".to_owned())?;
     let output_key = OutputKey::new(ready, view.clone(), density, frames);
     let reusable = previews.is_empty() && p.stats.pending_assets == 0;
+    let live_arg = live_raster.as_ref().map(|(id, raster)| (*id, raster));
     let (texture, stats) = p.output.render(output_key, reusable, || {
-        let texture = gpu.render_available(
+        let texture = gpu.render_with_live(
             renderer,
             view,
             density,
             elapsed_ms,
             &mut |frame| app.session.worlds.assets.bytes(frame).map(|bytes| bytes.map(|b| b.as_ref().clone())),
             &previews,
+            live_arg,
         )?;
         Ok((texture, gpu.stats.clone()))
     })?;

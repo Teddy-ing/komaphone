@@ -23,6 +23,8 @@ fn add(world: &mut WorldState, writer: u32, author: u32, id: u32) {
         width: 4.,
         color: Srgba { rgba: [0., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     apply(world, writer, author, Edit::AddStroke { stroke });
 }

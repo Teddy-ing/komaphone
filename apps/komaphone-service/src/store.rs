@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 const APPLICATION_ID: u32 = 0x4b504852;
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
 const MAX_IDENTITIES: u64 = 256;
 const MAX_ROOMS: u64 = 128;
 const MAX_RECEIPTS: u64 = 65536;

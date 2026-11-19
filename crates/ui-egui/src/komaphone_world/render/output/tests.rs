@@ -41,6 +41,8 @@ fn world() -> WorldState {
                             width: 8.,
                             color: Srgba { rgba: color },
                             erase: false,
+                            brush: None,
+                            samples: None,
                         },
                     },
                 },
@@ -150,7 +152,7 @@ fn draw(p: &mut Presentation, key: OutputKey, calls: &Cell<u64>) -> egui::Textur
 fn exact_output_gpu_pixels_survive_hits_and_change_for_view_revision_and_review() {
     let _lock = photocraft_testkit::gpu_lock();
     let rs = egui_kittest::wgpu::create_render_state(crate::gpu_canvas::wgpu_setup(), Default::default());
-    let mut p = Presentation { gpu: Some(WorldGpu::new(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device)).unwrap()), ..Default::default() };
+    let mut p = Presentation { gpu: Some(Box::new(WorldGpu::new(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device)).unwrap())), ..Default::default() };
     let complete = world();
     let earlier = complete.replay_to(1).unwrap();
     let original = key(&earlier);

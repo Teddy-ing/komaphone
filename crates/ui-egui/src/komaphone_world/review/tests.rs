@@ -75,6 +75,8 @@ fn copied_stroke_navigation_and_hidden_history_use_exact_retained_bounds() {
         width: 2.,
         color: scene::Srgba { rgba: [0., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     append(&mut world, Edit::AddStroke { stroke: stroke.clone() });
     let copied_id = StrokeId::new(&format!("{:032x}", 7)).unwrap();

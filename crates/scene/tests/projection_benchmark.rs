@@ -26,6 +26,8 @@ fn fixture() -> (CanvasId, Vec<Stroke>) {
                 width: 6.0,
                 color: Srgba { rgba: [0.1, 0.2, 0.5, 1.0] },
                 erase: false,
+                brush: None,
+                samples: None,
             });
         }
     }

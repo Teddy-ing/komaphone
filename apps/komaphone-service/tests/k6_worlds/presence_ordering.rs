@@ -42,6 +42,8 @@ fn sample(stream: OpId, serial: u64, id: Option<u32>) -> Action {
             width: 3.,
             color: Srgba { rgba: [0., 0., 0., 1.] },
             erase: false,
+            brush: None,
+            samples: None,
         }),
     }
 }

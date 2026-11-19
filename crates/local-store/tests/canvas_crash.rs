@@ -50,6 +50,8 @@ fn canvas_crash_child() {
             width: 5.0,
             color: Srgba { rgba: [0.2, 0.4, 0.6, 1.0] },
             erase: false,
+            brush: None,
+            samples: None,
         };
         let ack = store.append_observed(&stroke, info.revision, &mut observe).unwrap();
         assert_eq!(ack.stroke_count, 1);

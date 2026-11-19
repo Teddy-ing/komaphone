@@ -36,6 +36,8 @@ fn fixture(root: &Path) -> (Job, WorldState, Vec<u8>) {
                         width: 2.,
                         color: Srgba { rgba: [0., 0., 0., 1.] },
                         erase: false,
+                        brush: None,
+                        samples: None,
                     },
                 },
             },

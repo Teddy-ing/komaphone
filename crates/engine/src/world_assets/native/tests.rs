@@ -186,6 +186,8 @@ fn selected_png_pins_review_cursor_offthread_and_preserves_latest_scene_for_arch
         width: 16.,
         color: Srgba { rgba: [0., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     for (index, action) in [Edit::AddStroke { stroke }, Edit::SetStrokeVisible { stroke: id, visible: false }].into_iter().enumerate() {
         let revision = index as u64 + 1;

@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 mod input;
 mod panels;
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod qol009_evidence;
+#[cfg(not(target_arch = "wasm32"))]
 mod render;
 mod review;
 mod thumbnails;
@@ -81,7 +84,9 @@ pub struct WorldUi {
     #[serde(skip)]
     selected: Option<CanvasId>,
     #[serde(skip)]
-    draft: Option<Draft>,
+    world_locked_width: Option<(u8, f64)>,
+    #[serde(skip)]
+    draft: Option<Box<Draft>>,
     #[serde(skip)]
     pan: Option<Pan>,
     #[serde(skip)]
@@ -115,6 +120,7 @@ impl Default for WorldUi {
             close_prompt: false,
             close_approval: None,
             selected: None,
+            world_locked_width: None,
             draft: None,
             pan: None,
             next_view_checkpoint: 0.0,
@@ -128,6 +134,12 @@ struct Draft {
     account: photocraft_engine::worlds::Account,
     id: StrokeId,
     stroke: crate::komaphone_canvas::DraftStroke,
+    brush: Option<Box<scene::brush::StrokeBrush>>,
+    preview_brush: Option<Box<scene::brush::StrokeBrush>>,
+    samples: Vec<scene::brush::StrokeSample>,
+    start_time: f64,
+    last_screen: [f64; 2],
+    last_tick_time: f64,
     drawing: bool,
     submitted: bool,
 }
@@ -139,7 +151,7 @@ struct Pan {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DrawingSnapshot {
-    draft: Option<Draft>,
+    draft: Option<Box<Draft>>,
 }
 impl WorldUi {
     pub(crate) fn unfinished(&self) -> bool {
@@ -264,8 +276,8 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 crate::titlebar::caption_buttons(app, ui, full);
             }
         });
-    panels::sidebar(app, ui);
     toolbar(app, ui);
+    panels::sidebar(app, ui);
     egui::Panel::bottom("world-status").exact_size(64.0).frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(5)).show(ui, |ui| {
         ui.label(if app.ui.world.draft.is_some() { "Current stroke has not been saved".into() } else { app.session.worlds.status() });
         if let Some(message) = app.ui.world.message.as_ref().or(app.session.worlds.error.as_ref()) {
@@ -274,7 +286,10 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.label(notice);
         } else {
             ui.label(
-                egui::RichText::new("Wheel: zoom · Middle drag or Space: pan · Eraser and undo affect your device’s drawing layer").color(tokens.text_dim),
+                egui::RichText::new(
+                    "Wheel: zoom · Middle drag or Space: pan · Right-click: brush presets · Eraser and undo affect your device’s drawing layer",
+                )
+                .color(tokens.text_dim),
             );
         }
     });
@@ -402,43 +417,187 @@ fn sync(app: &mut PhotocraftApp, ui: &egui::Ui) {
         }
     }
 }
+pub(super) fn active_world_tool(app: &PhotocraftApp) -> crate::Tool {
+    if app.ui.world.tools.erase {
+        crate::Tool::Eraser
+    } else if app.ui.tool == crate::Tool::Pencil {
+        crate::Tool::Pencil
+    } else {
+        crate::Tool::Brush
+    }
+}
+
+pub(super) fn sync_world_tool(app: &mut PhotocraftApp) {
+    if !app.ui.world.tools.pan {
+        let wanted = match app.ui.tool {
+            crate::Tool::Brush | crate::Tool::Pencil | crate::Tool::Eraser => app.ui.tool,
+            _ if app.ui.world.tools.erase => crate::Tool::Eraser,
+            _ => crate::Tool::Brush,
+        };
+        if app.ui.tool != wanted {
+            crate::tool_memory::select(app, wanted);
+        }
+        crate::paint_mouse::sync_tool_brush(app);
+        app.ui.world.tools.erase = app.ui.tool == crate::Tool::Eraser;
+    }
+    app.ui.world.tools.brush_width = f64::from(app.session.tools.brush.size).clamp(1.0, f64::from(photocraft_paint::MAX_BRUSH_SIZE));
+    app.ui.world.tools.color = app.session.tools.foreground;
+}
+
+fn select_world_tool(app: &mut PhotocraftApp, tool: crate::Tool) {
+    app.ui.world.tools.pan = false;
+    app.ui.world.tools.erase = tool == crate::Tool::Eraser;
+    crate::tool_memory::select(app, tool);
+    crate::paint_mouse::sync_tool_brush(app);
+    sync_world_tool(app);
+}
+
+fn percent_control(ui: &mut egui::Ui, value: &mut f32, name: &str) -> bool {
+    let mut percentage = (*value * 100.0).round();
+    let response = ui.add(egui::DragValue::new(&mut percentage).range(0.0..=100.0).speed(1.0).suffix("%"));
+    remember(ui, name, &response);
+    let changed = response.changed();
+    if changed {
+        *value = (percentage / 100.0).clamp(0.0, 1.0);
+    }
+    changed
+}
+
 fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    sync_world_tool(app);
     let tokens = Tokens::get(ui.ctx());
     egui::Panel::top("world-tools").exact_size(42.0).frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(6)).show(ui, |ui| {
-        egui::ScrollArea::horizontal().id_salt("world-tools-scroll").show(ui, |ui| {
-            ui.horizontal(|ui| {
+        egui::ScrollArea::horizontal().id_salt("world-tools-scroll").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding.x = 5.0;
+                ui.spacing_mut().interact_size.x = 34.0;
                 let idle = !app.ui.world.unfinished();
                 let editing = idle && !reviewing(app);
-                for (label, erase, pan) in [("Brush", false, false), ("Eraser", true, false), ("Pan", false, true)] {
-                    let response = ui.add_enabled(
-                        idle && (pan || editing),
-                        egui::Button::new(label).selected(app.ui.world.tools.erase == erase && app.ui.world.tools.pan == pan),
-                    );
-                    remember(ui, &format!("world.tool.{}", label.to_ascii_lowercase()), &response);
+                let tool = active_world_tool(app);
+                for (label, target, id) in [
+                    ("Brush", Some(crate::Tool::Brush), "world.tool.brush"),
+                    ("Pencil", Some(crate::Tool::Pencil), "world.tool.pencil"),
+                    ("Eraser", Some(crate::Tool::Eraser), "world.tool.eraser"),
+                    ("Pan", None, "world.tool.pan"),
+                ] {
+                    let selected = match target {
+                        Some(t) => !app.ui.world.tools.pan && tool == t,
+                        None => app.ui.world.tools.pan,
+                    };
+                    let response = ui.add_enabled(idle && (target.is_none() || editing), egui::Button::new(label).selected(selected));
+                    remember(ui, id, &response);
                     if response.clicked() {
-                        app.ui.world.tools.erase = erase;
-                        app.ui.world.tools.pan = pan;
+                        match target {
+                            Some(t) => select_world_tool(app, t),
+                            None => app.ui.world.tools.pan = true,
+                        }
                     }
                 }
-                let response = ui.add(egui::DragValue::new(&mut app.ui.world.tools.brush_width).range(1.0..=128.0).suffix(" px"));
-                remember(ui, "world.width", &response);
-                let [red, green, blue, _] = app.ui.world.tools.color;
-                let mut color = [red, green, blue].map(|value| (value * 255.0).round() as u8);
-                if ui.color_edit_button_srgb(&mut color).changed() {
-                    app.ui.world.tools.color = [f32::from(color[0]) / 255.0, f32::from(color[1]) / 255.0, f32::from(color[2]) / 255.0, 1.0];
+                ui.separator();
+                let before = app.session.tools.brush.clone();
+                let mut brush = before.clone();
+                let active_tool = active_world_tool(app);
+                ui.label("Size");
+                let size_resp =
+                    ui.add_enabled(editing, egui::DragValue::new(&mut brush.size).range(1.0..=photocraft_paint::MAX_BRUSH_SIZE).speed(1.0).suffix(" px"));
+                remember(ui, "world.width", &size_resp);
+                let size_changed = size_resp.changed();
+                ui.label("Opacity");
+                ui.add_enabled_ui(editing, |ui| {
+                    percent_control(ui, &mut brush.opacity, "world.opacity");
+                });
+                if active_tool != crate::Tool::Pencil {
+                    ui.label("Flow");
+                    ui.add_enabled_ui(editing, |ui| {
+                        percent_control(ui, &mut brush.flow, "world.flow");
+                    });
                 }
+                if active_tool != crate::Tool::Pencil && matches!(brush.tip, photocraft_paint::TipShape::Round) {
+                    ui.label("Hard").on_hover_text("Brush hardness");
+                    ui.add_enabled_ui(editing, |ui| {
+                        percent_control(ui, &mut brush.hardness, "world.hardness");
+                    });
+                }
+                ui.label("Smooth").on_hover_text("Stroke smoothing");
+                let mut smoothing = if brush.smoothing.enabled { brush.smoothing.amount } else { 0.0 };
+                ui.add_enabled_ui(editing, |ui| {
+                    if percent_control(ui, &mut smoothing, "world.smoothing") {
+                        brush.smoothing.enabled = smoothing > 0.0;
+                        brush.smoothing.amount = smoothing;
+                    }
+                });
+                let presets_resp = ui.add_enabled(editing, egui::Button::new("Presets")).on_hover_text("Brush presets (or right-click canvas)");
+                remember(ui, "world.brush.presets", &presets_resp);
+                if presets_resp.clicked() {
+                    crate::brush_picker::open(&mut app.ui, ui.ctx(), [presets_resp.rect.left(), presets_resp.rect.bottom()]);
+                }
+                let settings_resp =
+                    ui.add_enabled(editing, egui::Button::new("Settings").selected(app.ui.panels.brush_settings)).on_hover_text("Open Brush Settings (F5)");
+                remember(ui, "world.brush.settings", &settings_resp);
+                if settings_resp.clicked() {
+                    app.ui.panels.brush_settings = !app.ui.panels.brush_settings;
+                }
+                crate::brush_panel::commit_gesture(app, ui.ctx(), &before, &brush);
+                ui.separator();
+                let [fg_r, fg_g, fg_b, _] = app.session.tools.foreground;
+                let mut fg = [fg_r, fg_g, fg_b].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                let fg_resp = ui.color_edit_button_srgb(&mut fg).on_hover_text("Foreground color");
+                remember(ui, "world.color", &fg_resp);
+                if fg_resp.changed() {
+                    let _ =
+                        app.run("tools.setColors", json!({"foreground": [f32::from(fg[0]) / 255.0, f32::from(fg[1]) / 255.0, f32::from(fg[2]) / 255.0, 1.0]}));
+                }
+                let swap_resp = ui.button("Swap").on_hover_text("Swap foreground and background colors (X)");
+                remember(ui, "world.color.swap", &swap_resp);
+                if swap_resp.clicked() {
+                    let _ = app.run("tools.swapColors", json!({}));
+                }
+                let [bg_r, bg_g, bg_b, _] = app.session.tools.background;
+                let mut bg = [bg_r, bg_g, bg_b].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                let bg_resp = ui.color_edit_button_srgb(&mut bg).on_hover_text("Background color");
+                remember(ui, "world.color.bg", &bg_resp);
+                if bg_resp.changed() {
+                    let _ =
+                        app.run("tools.setColors", json!({"background": [f32::from(bg[0]) / 255.0, f32::from(bg[1]) / 255.0, f32::from(bg[2]) / 255.0, 1.0]}));
+                }
+                let colors_resp = ui.button("Colors").on_hover_text("Color picker and palette");
+                remember(ui, "world.colors.panel", &colors_resp);
+                egui::Popup::from_toggle_button_response(&colors_resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_min_width(240.0);
+                    ui.set_max_width(260.0);
+                    ui.data_mut(|data| data.insert_temp(crate::panels::color_field_fill_id(), 160.0));
+                    crate::panels::color_field(app, ui);
+                    ui.separator();
+                    ui.collapsing("Palette", |ui| crate::panels::swatches_ui::panel(app, ui));
+                });
+                let lock_resp = ui
+                    .add_enabled(editing, egui::Checkbox::new(&mut app.ui.world.tools.lock_width, "Lock"))
+                    .on_hover_text("Keep this stroke thickness in canvas coordinates while zooming.");
+                remember(ui, "world.lockWidth", &lock_resp);
+                if (lock_resp.changed() || size_changed)
+                    && let Some(active) = app.session.worlds.active.as_ref()
+                {
+                    let cam = &active.viewer.camera;
+                    app.ui.world.world_locked_width =
+                        app.ui.world.tools.lock_width.then_some((cam.region.depth, f64::from(app.session.tools.brush.size) / cam.zoom));
+                }
+                ui.separator();
                 button(app, ui, "Undo mine", "komaphone.world.undo", json!({}), editing);
                 button(app, ui, "Redo mine", "komaphone.world.redo", json!({}), editing);
                 button(app, ui, "Home", "komaphone.world.home", json!({}), idle);
                 if app.ui.world.draft.as_ref().is_some_and(|d| !d.drawing) && ui.button("Retry unfinished stroke").clicked() {
                     input::finish(app);
                 }
+                app.ui.world.tools.brush_width = f64::from(app.session.tools.brush.size).clamp(1.0, f64::from(photocraft_paint::MAX_BRUSH_SIZE));
+                app.ui.world.tools.color = app.session.tools.foreground;
             });
         });
     });
 }
 fn drawing_area(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size().max(egui::vec2(1.0, 1.0)), Sense::click_and_drag());
+    app.last_canvas_rect = rect;
     remember(ui, "world.drawing", &response);
     let Some(camera) = app.session.worlds.active.as_ref().map(|a| a.viewer.camera.clone()) else { return };
     let viewport = Viewport {
@@ -467,13 +626,39 @@ pub fn shortcuts(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() || app.ui.world.unfinished() || reviewing(app) {
         return;
     }
+    let redo_shift = ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z));
     let undo = ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
     let redo = ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Y));
     if undo {
         run(app, "komaphone.world.undo", json!({}));
     }
-    if redo {
+    if redo || redo_shift {
         run(app, "komaphone.world.redo", json!({}));
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::B)) {
+        select_world_tool(app, crate::Tool::Brush);
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
+        select_world_tool(app, crate::Tool::Eraser);
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::X)) {
+        let _ = app.run("tools.swapColors", json!({}));
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::D)) {
+        let _ = app.run("tools.defaultColors", json!({}));
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::OpenBracket)) {
+        let _ = app.run("tools.decreaseBrushHardness", json!({}));
+    } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)) {
+        let _ = app.run("tools.decreaseBrushSize", json!({}));
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::CloseBracket)) {
+        let _ = app.run("tools.increaseBrushHardness", json!({}));
+    } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)) {
+        let _ = app.run("tools.increaseBrushSize", json!({}));
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+        app.ui.panels.brush_settings = !app.ui.panels.brush_settings;
     }
 }
 fn reviewing(app: &PhotocraftApp) -> bool {

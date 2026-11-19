@@ -167,6 +167,8 @@ fn same_stroke_identity_on_another_canvas_never_consumes_the_retained_original_d
                             width: draft.stroke.width,
                             color: draft.stroke.color,
                             erase: draft.stroke.erase,
+                            brush: draft.brush.clone(),
+                            samples: None,
                         },
                     },
                 },
@@ -225,4 +227,84 @@ fn same_stroke_identity_on_another_canvas_never_consumes_the_retained_original_d
     app.session.worlds.active = Some(accepted_canvas(a, &original));
     sync_frame(&mut app, &ctx, 0.6);
     assert!(app.ui.world.draft.is_none(), "Only canvas A's matching accepted display completes the retained draft");
+}
+
+#[test]
+fn world_brush_draft_captures_opacity_preset_pencil_and_eraser_from_session_brush() {
+    let (mut app, ctx, view) = fixture();
+    let rect = frame(&mut app, &ctx, &view, 0.0, vec![]);
+    let pos = rect.center();
+
+    // 1. Brush with 40% opacity, 35% flow, 25% hardness, red foreground.
+    app.run("tools.setColors", json!({"foreground": [0.9, 0.1, 0.2, 1.0]})).unwrap();
+    app.run("tools.setBrush", json!({"brush": {"size": 30.0, "opacity": 0.4, "flow": 0.35, "hardness": 0.25}})).unwrap();
+    frame(&mut app, &ctx, &view, 0.1, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+    let draft = app.ui.world.draft.as_ref().unwrap();
+    let brush = draft.brush.as_deref().expect("world brush draft must attach StrokeBrush");
+    assert!((brush.opacity - 0.4).abs() < 1e-5);
+    assert!((brush.flow - 0.35).abs() < 1e-5);
+    assert!((brush.hardness - 0.25).abs() < 1e-5);
+    assert!(!draft.stroke.erase);
+    assert!((draft.stroke.color.rgba[3] - 0.4).abs() < 1e-5);
+    assert!(draft.preview_brush.is_some());
+    assert_eq!(draft.samples.len(), draft.stroke.points.len());
+    app.ui.world.draft = None;
+
+    // 2. Pencil tool forces aliased hard tip with 100% flow.
+    super::super::select_world_tool(&mut app, crate::Tool::Pencil);
+    app.run("tools.setBrush", json!({"brush": {"size": 10.0, "opacity": 0.5, "flow": 0.2, "hardness": 0.0}})).unwrap();
+    frame(&mut app, &ctx, &view, 0.2, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+    let draft = app.ui.world.draft.as_ref().unwrap();
+    let brush = draft.brush.as_deref().unwrap();
+    assert!(brush.aliased);
+    assert_eq!(brush.hardness, 1.0);
+    assert_eq!(brush.flow, 1.0);
+    assert!((brush.opacity - 0.5).abs() < 1e-5);
+    assert!(!draft.stroke.erase);
+    app.ui.world.draft = None;
+
+    // 3. Eraser tool preserves partial opacity & softness while forcing erase=true, behind=false, Normal mode.
+    super::super::select_world_tool(&mut app, crate::Tool::Eraser);
+    app.run("tools.setBrush", json!({"brush": {"size": 24.0, "opacity": 0.6, "hardness": 0.1, "behind": true}})).unwrap();
+    frame(&mut app, &ctx, &view, 0.3, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+    let draft = app.ui.world.draft.as_ref().unwrap();
+    let brush = draft.brush.as_deref().unwrap();
+    assert!(draft.stroke.erase);
+    assert!(!brush.behind);
+    assert!((brush.opacity - 0.6).abs() < 1e-5);
+    assert!((brush.hardness - 0.1).abs() < 1e-5);
+}
+
+#[test]
+fn world_airbrush_stationary_hold_appends_timed_samples_and_right_click_opens_brush_picker() {
+    let (mut app, ctx, view) = fixture();
+    let rect = frame(&mut app, &ctx, &view, 0.0, vec![]);
+    let pos = rect.center();
+
+    // Right-click opens Brush Preset picker at the pointer.
+    assert!(app.ui.brush_picker.is_none());
+    frame(
+        &mut app,
+        &ctx,
+        &view,
+        0.05,
+        vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE }],
+    );
+    assert!(app.ui.brush_picker.is_some());
+    app.ui.brush_picker = None;
+
+    // Select Airbrush Soft preset and hold stationary across multiple frames.
+    app.run("tools.setBrush", json!({"preset": "Airbrush Soft"})).unwrap();
+    frame(&mut app, &ctx, &view, 0.10, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+    assert_eq!(app.ui.world.draft.as_ref().unwrap().stroke.points.len(), 1);
+    assert_eq!(app.ui.world.draft.as_ref().unwrap().samples.len(), 1);
+
+    // Holding still for 50ms then 100ms advances timed stationary samples for airbrush build-up.
+    frame(&mut app, &ctx, &view, 0.15, vec![]);
+    frame(&mut app, &ctx, &view, 0.20, vec![]);
+    let draft = app.ui.world.draft.as_ref().unwrap();
+    assert!(draft.stroke.points.len() >= 3, "stationary airbrush hold must emit advancing points");
+    assert_eq!(draft.samples.len(), draft.stroke.points.len());
+    assert!(draft.samples.last().unwrap().time_ms >= 90.0);
+    assert!(draft.samples.windows(2).all(|w| w[1].time_ms >= w[0].time_ms));
 }

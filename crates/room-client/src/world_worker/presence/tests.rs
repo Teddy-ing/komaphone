@@ -23,6 +23,8 @@ fn sample(canvas: CanvasId, x: f64) -> Action {
             width: 3.0,
             color: photocraft_scene::Srgba { rgba: [0., 0., 0., 1.] },
             erase: false,
+            brush: None,
+            samples: None,
         }),
     }
 }
@@ -216,6 +218,8 @@ fn all_presence_slots_held_do_not_block_local_durability_and_commit_clears_queue
         width: style.width,
         color: style.color,
         erase: false,
+        brush: style.brush,
+        samples: style.samples,
     };
     let start = Instant::now();
     state.command(5, Command::Edit { canvas, action: Edit::AddStroke { stroke } }).unwrap();

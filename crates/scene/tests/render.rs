@@ -11,6 +11,8 @@ fn stroke(points: Vec<[f64; 2]>, width: f64) -> Stroke {
         width,
         color: Srgba { rgba: [0.1, 0.2, 0.3, 1.0] },
         erase: false,
+        brush: None,
+        samples: None,
     }
 }
 fn view(stroke: &Stroke, local: [f64; 2], depth: u8) -> Viewport {

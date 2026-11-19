@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod brush;
 pub mod coordinates;
 pub mod render;
 pub mod round;
@@ -170,6 +171,13 @@ pub struct Stroke {
     pub width: f64,
     pub color: Srgba,
     pub erase: bool,
+    /// Optional brush engine specification (schema v2 shared-canvas strokes).
+    /// Omitted on legacy opaque strokes so their canonical encoding is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush: Option<Box<brush::StrokeBrush>>,
+    /// Optional per-point timing and stylus sample metadata matching `points` 1:1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samples: Option<Vec<brush::StrokeSample>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,7 +240,27 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 impl Stroke {
+    pub fn uses_brush_v2(&self) -> bool {
+        self.brush.is_some() || self.samples.is_some()
+    }
+
+    pub fn effective_opacity(&self) -> f32 {
+        match &self.brush {
+            Some(brush) if self.erase => brush.opacity.clamp(0.0, 1.0),
+            Some(brush) => (brush.opacity * self.color.rgba[3]).clamp(0.0, 1.0),
+            None => self.color.rgba[3].clamp(0.0, 1.0),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_inner(false)
+    }
+
+    pub fn validate_preview(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, preview: bool) -> Result<()> {
         coordinates::region_span(self.anchor.depth)?;
         coordinates::point(&self.anchor, [0.0, 0.0])?;
         if self.points.is_empty() || self.points.len() > MAX_POINTS {
@@ -247,8 +275,35 @@ impl Stroke {
         if self.color.rgba.iter().any(|n| !n.is_finite() || !(0.0..=1.0).contains(n)) {
             return Err(Error::Invalid("sRGB color"));
         }
-        if self.color.rgba[3] != 1.0 {
-            return Err(Error::Invalid("canvas brush opacity (this prototype supports opaque strokes)"));
+        if let Some(brush) = &self.brush {
+            if preview {
+                brush.validate_preview()?;
+            } else {
+                brush.validate()?;
+            }
+            if self.erase && brush.behind {
+                return Err(Error::Invalid("eraser stroke cannot use behind mode"));
+            }
+            if let Some(samples) = &self.samples {
+                if samples.len() != self.points.len() {
+                    return Err(Error::Invalid("stroke sample count"));
+                }
+                let mut prev_time = 0.0f64;
+                for (index, sample) in samples.iter().enumerate() {
+                    sample.validate()?;
+                    if index > 0 && sample.time_ms < prev_time {
+                        return Err(Error::Invalid("stroke sample timestamps must be non-decreasing"));
+                    }
+                    prev_time = sample.time_ms;
+                }
+            }
+        } else {
+            if self.samples.is_some() {
+                return Err(Error::Invalid("stroke samples require brush settings"));
+            }
+            if self.color.rgba[3] != 1.0 {
+                return Err(Error::Invalid("canvas brush opacity (this prototype supports opaque strokes)"));
+            }
         }
         if self.revision > i64::MAX as u64 {
             return Err(Error::Limit("revision"));

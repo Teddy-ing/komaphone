@@ -322,7 +322,7 @@ fn render_scene(
         let target = source
             .strokes
             .values()
-            .find(|stroke| stroke.visible && !stroke.stroke.erase && stroke.stroke.color.rgba[3] > 0.0)
+            .find(|stroke| stroke.visible && !stroke.stroke.erase && stroke.stroke.effective_opacity() > 0.0)
             .and_then(|stroke| stroke.stroke.points.first().map(|point| (stroke.stroke.anchor, *point)))
             .or_else(|| source.media.values().find(|media| media.visible).map(|media| (media.media.anchor, media.media.offset)));
         if let Some((region, local)) = target {
@@ -345,11 +345,12 @@ fn visible_at_thumbnail_scale(renderer: &mut world_media::WorldRenderer, view: &
     for object in renderer.visible_content(view)? {
         match object {
             world_media::VisibleObject::Stroke(shared) => {
-                if shared.stroke.erase || shared.stroke.color.rgba[3] == 0.0 {
+                if shared.stroke.erase || shared.stroke.effective_opacity() == 0.0 {
                     continue;
                 }
                 let Some(projected) = photocraft_scene::render::project(&shared.stroke, view).map_err(error)? else { continue };
-                for (shapes, padding) in [(&projected.paths, f64::from(projected.width) * 0.5), (&projected.fills, 0.0)] {
+                let reach = shared.stroke.brush.as_ref().map_or(1.0, |brush| brush.reach_factor());
+                for (shapes, padding) in [(&projected.paths, f64::from(projected.width) * 0.5 * reach), (&projected.fills, 0.0)] {
                     let mut min = [f64::INFINITY; 2];
                     let mut max = [f64::NEG_INFINITY; 2];
                     for &[x, y] in shapes.iter().flatten() {

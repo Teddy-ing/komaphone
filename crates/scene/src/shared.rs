@@ -23,6 +23,7 @@ pub use stroke_copy::{StrokeCopyTarget, StrokeProvenance, stroke_copy};
 pub use tours::{Tour, TourFrame, TourStop};
 
 pub const SHARED_SCHEMA: u32 = 1;
+pub const SHARED_SCHEMA_BRUSH: u32 = 2;
 pub const MAX_EVENT_PAGE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -313,7 +314,7 @@ impl WorldState {
         self.events.get(start..end).ok_or(Error::Invalid("event range"))
     }
     pub fn apply(&mut self, accepted: &AcceptedOp) -> Result<Applied> {
-        if self.schema != SHARED_SCHEMA {
+        if self.schema != SHARED_SCHEMA && self.schema != SHARED_SCHEMA_BRUSH {
             return Err(Error::Schema);
         }
         accepted.op.validate()?;
@@ -431,6 +432,9 @@ impl WorldState {
                 existing.changed_revision = accepted.revision;
             }
             Edit::AddStroke { stroke } | Edit::CopyStroke { stroke, .. } => {
+                if stroke.uses_brush_v2() {
+                    self.schema = self.schema.max(SHARED_SCHEMA_BRUSH);
+                }
                 self.points += stroke.points.len();
                 self.strokes.insert(
                     stroke.id,
@@ -479,7 +483,7 @@ impl WorldState {
     /// Validate untrusted/deserialized checkpoints once at the storage boundary.
     /// Transport adapters must additionally cap encoded/decompressed input bytes.
     pub fn validate(&self) -> Result<()> {
-        if self.schema != SHARED_SCHEMA {
+        if self.schema != SHARED_SCHEMA && self.schema != SHARED_SCHEMA_BRUSH {
             return Err(Error::Schema);
         }
         self.limits.validate()?;

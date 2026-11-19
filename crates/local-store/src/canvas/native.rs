@@ -353,6 +353,9 @@ impl CanvasStore {
     }
     pub fn append_observed(&mut self, stroke: &Stroke, expected: u64, mut observe: impl FnMut(CanvasStage)) -> Result<CanvasInfo> {
         stroke.validate().map_err(invalid)?;
+        if stroke.uses_brush_v2() {
+            return Err(invalid("local prototype canvas supports opaque round strokes only"));
+        }
         if stroke.owner != self.owner || stroke.revision != 0 {
             return Err(invalid("stroke owner or uncommitted revision"));
         }

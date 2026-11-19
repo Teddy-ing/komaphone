@@ -372,8 +372,10 @@ fn validate_peers(canvas: CanvasId, peers: &[wire::Peer]) -> Result<()> {
                     width: style.width,
                     color: style.color,
                     erase: style.erase,
+                    brush: style.brush.clone(),
+                    samples: style.samples.clone(),
                 }
-                .validate()
+                .validate_preview()
                 .map_err(other)?;
             }
         } else if !peer.preview.is_empty() {

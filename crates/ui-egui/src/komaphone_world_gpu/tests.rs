@@ -39,6 +39,8 @@ fn fixture() -> WorldState {
                             width,
                             color: Srgba { rgba: color },
                             erase,
+                            brush: None,
+                            samples: None,
                         },
                     },
                 },
@@ -203,5 +205,121 @@ fn unavailable_verified_media_keeps_other_art_visible_and_reports_pending_assets
     gpu.render_available(&mut indexed, &view, 1., 0, &mut |_| Ok(None), &[]).unwrap();
     assert_eq!(gpu.stats.pending_assets, 1);
     assert_eq!(readback(&gpu)[32 * 64 + 32], [255, 0, 0, 255]);
+    assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
+}
+
+#[test]
+fn shared_gpu_brush_strokes_match_cpu_oracle_across_opacity_overlap_presets_and_modes() {
+    use photocraft_engine::paint::{BrushSettings, presets};
+    use photocraft_engine::scene::brush::StrokeSample;
+    use photocraft_engine::world_brush::to_stroke_brush;
+    let _lock = photocraft_testkit::gpu_lock();
+    let rs = egui_kittest::wgpu::create_render_state(crate::gpu_canvas::wgpu_setup(), Default::default());
+    let mut gpu = WorldGpu::new(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device)).unwrap();
+
+    let canvas = CanvasId::new(&hex(9)).unwrap();
+    let author1 = OwnerId::new(&hex(11)).unwrap();
+    let author2 = OwnerId::new(&hex(12)).unwrap();
+    let dev1 = DeviceId::new(&hex(21)).unwrap();
+    let dev2 = DeviceId::new(&hex(22)).unwrap();
+    let mut world = WorldState::new(canvas, author1, "GPU brush parity".into()).unwrap();
+    let all = presets::builtin();
+    let by_name = |name: &str| presets::find(&all, name).unwrap().brush.clone();
+
+    let mut add = |id: u128, author: OwnerId, device: DeviceId, brush: &BrushSettings, pts: Vec<[f64; 2]>, times: Option<Vec<f64>>| {
+        let rev = world.revision + 1;
+        let sb = to_stroke_brush(brush, 1.0, false).unwrap();
+        let samples = times.map(|ts| ts.into_iter().map(|t| StrokeSample { time_ms: t, ..Default::default() }).collect());
+        world
+            .apply(&AcceptedOp {
+                revision: rev,
+                op: WorldOp {
+                    id: OpId::new(&hex(500 + id)).unwrap(),
+                    canvas,
+                    author,
+                    device,
+                    sequence: world.next_sequence(device).unwrap(),
+                    authority_epoch: 1,
+                    action: Edit::AddStroke {
+                        stroke: Stroke {
+                            id: StrokeId::new(&hex(600 + id)).unwrap(),
+                            canvas,
+                            owner: author,
+                            revision: 0,
+                            anchor: RegionKey::default(),
+                            points: pts,
+                            width: f64::from(brush.size),
+                            color: Srgba { rgba: brush.color },
+                            erase: brush.erase,
+                            brush: Some(Box::new(sb)),
+                            samples,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+    };
+
+    // Device 1: 50% Hard Round self-overlapping stroke (stays 50%) + crossing 50% Soft Round + 50% Soft Eraser + Behind + Chalk.
+    let mut half_hard = by_name("Hard Round");
+    half_hard.size = 24.0;
+    half_hard.opacity = 0.5;
+    half_hard.color = [0.0, 0.0, 1.0, 1.0];
+    add(1, author1, dev1, &half_hard, vec![[-32., -16.], [32., -16.], [-32., -16.]], None);
+
+    let mut half_soft = by_name("Soft Round");
+    half_soft.size = 32.0;
+    half_soft.opacity = 0.5;
+    half_soft.color = [0.0, 0.8, 0.2, 1.0];
+    add(2, author1, dev1, &half_soft, vec![[0., -40.], [0., 40.]], None);
+
+    let mut eraser = by_name("Soft Round");
+    eraser.size = 20.0;
+    eraser.opacity = 0.5;
+    eraser.erase = true;
+    add(3, author1, dev1, &eraser, vec![[-20., -16.], [20., -16.]], None);
+
+    let mut behind = by_name("Hard Round");
+    behind.size = 24.0;
+    behind.opacity = 1.0;
+    behind.behind = true;
+    behind.color = [1.0, 0.8, 0.0, 1.0];
+    add(4, author1, dev1, &behind, vec![[-24., 16.], [24., 16.]], None);
+
+    // Device 2: Chalk + Multiply blend mode + Airbrush hold + Hard Pencil (cannot be erased by device 1).
+    let mut chalk = by_name("Chalk");
+    chalk.size = 24.0;
+    chalk.color = [0.9, 0.2, 0.1, 1.0];
+    chalk.seed = 99;
+    add(5, author2, dev2, &chalk, vec![[-40., 24.], [40., 24.]], None);
+
+    let mut mult = by_name("Hard Round");
+    mult.size = 20.0;
+    mult.mode = photocraft_color::BlendMode::Multiply;
+    mult.color = [0.2, 0.6, 1.0, 1.0];
+    add(6, author2, dev2, &mult, vec![[-10., 14.], [10., 34.]], None);
+
+    let mut pencil = by_name("Hard Pencil");
+    pencil.size = 3.0;
+    pencil.opacity = 0.7;
+    pencil.color = [0.0, 0.0, 0.0, 1.0];
+    add(7, author2, dev2, &pencil, vec![[-40., -36.], [40., -36.]], None);
+
+    let mut indexed = WorldRenderer::new(&world).unwrap();
+    let view = Viewport { camera: coordinates::home(canvas), width: 128, height: 128 };
+    gpu.render(&mut indexed, &view, 1.0, 0, &mut |_| panic!("No media")).unwrap();
+    let gpu_px = readback(&gpu);
+    let cpu = photocraft_engine::world_media::render_view(&world, &view, 0, &mut |_| panic!("No media")).unwrap();
+    let cpu_px = photocraft_engine::world_media::rgba8(&cpu).unwrap();
+
+    let mut max_diff = 0i32;
+    for i in 0..(128 * 128) {
+        for ch in 0..3 {
+            let d = (i32::from(gpu_px[i][ch]) - i32::from(cpu_px[i * 4 + ch])).abs();
+            max_diff = max_diff.max(d);
+        }
+    }
+    // 8-bit premul rounding + dither allows at most ±3 levels across multi-stroke composition.
+    assert!(max_diff <= 3, "GPU vs CPU brush parity diverged: max channel diff = {max_diff}");
     assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
 }

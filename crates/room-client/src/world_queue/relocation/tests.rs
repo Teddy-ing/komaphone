@@ -54,7 +54,7 @@ fn moves_exact_operations_sequences_snapshots_review_and_rejects_retired_source_
     queue.relocate_endpoint(&plan, &verified).unwrap();
     assert!(queue.ensure_current(&lease).is_err());
     assert!(queue.activate(lease.scope.clone()).is_err());
-    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 2);
+    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
     drop(queue);
     let mut queue = WorldOutbox::open(temp.path().join("world.db")).unwrap();
     queue.relocate_endpoint(&plan, &verified).unwrap();
@@ -125,7 +125,16 @@ fn old_schema_gets_readable_backup_before_version_two_retirement_rules() {
     queue.db.execute_batch("DROP TABLE scope_moves; PRAGMA user_version=1;").unwrap();
     drop(queue);
     let queue = WorldOutbox::open(&path).unwrap();
-    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 2);
+    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
     let backup = Connection::open(path.with_file_name("old.db.pre-relocation-schema-v1.sqlite3")).unwrap();
     assert_eq!(backup.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 1);
+    drop(queue);
+    let path2 = temp.path().join("old2.db");
+    let queue2 = WorldOutbox::open(&path2).unwrap();
+    queue2.db.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(queue2);
+    let queue2 = WorldOutbox::open(&path2).unwrap();
+    assert_eq!(queue2.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
+    let backup2 = Connection::open(path2.with_file_name("old2.db.pre-brush-schema-v2.sqlite3")).unwrap();
+    assert_eq!(backup2.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 2);
 }

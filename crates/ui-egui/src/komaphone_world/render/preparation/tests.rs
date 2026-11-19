@@ -35,6 +35,8 @@ fn world(n: u128) -> Arc<WorldState> {
                             width: 2.,
                             color: Srgba { rgba: [0., 0., 0., 1.] },
                             erase: false,
+                            brush: None,
+                            samples: None,
                         },
                     },
                 },

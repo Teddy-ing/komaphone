@@ -38,6 +38,8 @@ fn draw(world: &mut WorldState, key: &Key, depth: u8, lateral: i128) {
                         width: 40.,
                         color: Srgba { rgba: [1., 0., 0., 1.] },
                         erase: false,
+                        brush: None,
+                        samples: None,
                     },
                 },
             },

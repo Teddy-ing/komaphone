@@ -214,7 +214,8 @@ pub fn export_archive(
         }
         crate::gallery_media::write_new_file(&staging.path().join(format!("{}.png", frame.hash.as_str())), &data)?;
     }
-    let manifest = serde_json::to_vec(&ArchiveManifest { schema: 1, world: world.clone(), assets: assets.into_values().collect() }).map_err(other)?;
+    let schema = if world.schema >= photocraft_scene::shared::SHARED_SCHEMA_BRUSH { 2 } else { 1 };
+    let manifest = serde_json::to_vec(&ArchiveManifest { schema, world: world.clone(), assets: assets.into_values().collect() }).map_err(other)?;
     if manifest.len() as u64 > MAX_ARCHIVE_MANIFEST || bytes.saturating_add(manifest.len() as u64) > MAX_EXPORT_BYTES {
         return Err(error("World archive manifest or total exceeds its output budget"));
     }
@@ -329,10 +330,15 @@ fn read_archive_impl(path: &Path, retain_assets: bool) -> Result<(WorldState, BT
         return Err(error("World archive manifest exceeds 32 MiB"));
     }
     let manifest: ArchiveManifest = serde_json::from_slice(&bytes).map_err(other)?;
-    if manifest.schema != 1 {
+    let expected_world = match manifest.schema {
+        1 => photocraft_scene::shared::SHARED_SCHEMA,
+        2 => photocraft_scene::shared::SHARED_SCHEMA_BRUSH,
+        _ => return Err(error("Unsupported world archive schema")),
+    };
+    manifest.world.validate().map_err(other)?;
+    if manifest.world.schema != expected_world {
         return Err(error("Unsupported world archive schema"));
     }
-    manifest.world.validate().map_err(other)?;
     if manifest.assets.len() > manifest.world.limits().max_media_frames {
         return Err(error("Too many world archive assets"));
     }

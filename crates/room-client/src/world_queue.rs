@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
 const APPLICATION_ID: u32 = 0x4b575151;
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 const MAX_PENDING: u64 = 8192;
 const MAX_QUEUE_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -198,7 +198,7 @@ impl WorldOutbox {
         db.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(sql)?;
         let app: u32 = db.pragma_query_value(None, "application_id", |r| r.get(0)).map_err(sql)?;
-        if (version != 0 && (!matches!(version, 1 | SCHEMA) || app != APPLICATION_ID)) || (version == 0 && app != 0) {
+        if (version != 0 && (!matches!(version, 1 | 2 | SCHEMA) || app != APPLICATION_ID)) || (version == 0 && app != 0) {
             return Err(invalid("Unsupported canvas queue database; preserve it and upgrade"));
         }
         if version == 0 {
@@ -224,6 +224,8 @@ impl WorldOutbox {
         }
         if version == 1 {
             relocation::backup_schema_one(&db, path)?;
+        } else if version == 2 {
+            relocation::backup_schema_two(&db, path)?;
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         if version == 0 {
@@ -238,7 +240,7 @@ impl WorldOutbox {
             tx.pragma_update(None, "application_id", APPLICATION_ID).map_err(sql)?;
             tx.pragma_update(None, "user_version", SCHEMA).map_err(sql)?;
         }
-        if version < SCHEMA {
+        if version < 2 {
             relocation::initialize(&tx)?;
         } else {
             let retirement_table: bool =

@@ -80,6 +80,8 @@ pub fn stroke_copy(source: &SharedStroke, source_canvas: CanvasId, source_credit
         width: source.stroke.width * target.scale,
         color: source.stroke.color,
         erase: source.stroke.erase,
+        brush: source.stroke.brush.clone(),
+        samples: source.stroke.samples.clone(),
     };
     stroke.validate()?;
     crate::render::spatial_cells(&stroke, crate::MAX_SPATIAL_CELLS)?;

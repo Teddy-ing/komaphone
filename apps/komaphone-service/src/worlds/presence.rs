@@ -122,8 +122,10 @@ fn peer(profile: OwnerId, device: DeviceId, action: &Action, now: u64) -> Result
             width: style.width,
             color: style.color,
             erase: style.erase,
+            brush: style.brush.clone(),
+            samples: style.samples.clone(),
         };
-        candidate.validate().map_err(|_| Error::Invalid("presence stroke preview"))?;
+        candidate.validate_preview().map_err(|_| Error::Invalid("presence stroke preview"))?;
     } else if !preview.is_empty() {
         return Err(Error::Invalid("preview points require a stable stroke identity/style"));
     }
@@ -364,6 +366,8 @@ mod tests {
                     width: 1.,
                     color: Srgba { rgba: [0., 0., 0., 1.] },
                     erase: false,
+                    brush: None,
+                    samples: None,
                 }),
             };
             let sample = peer(profile, other, &action, 100).unwrap();

@@ -73,9 +73,14 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
         }
         if version == 3 {
             archive_import::migrate(db, path)?;
+            version = 4;
         }
         if version == 4 {
-            db.pragma_update(None, "user_version", 4)?;
+            migrate_v5(db, path)?;
+            version = 5;
+        }
+        if version == 5 {
+            db.pragma_update(None, "user_version", 5)?;
         }
         return Ok(());
     }
@@ -88,7 +93,7 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
         return Err(Error::Schema);
     }
     let tx = db.unchecked_transaction()?;
-    tx.execute_batch("CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=4)); INSERT INTO world_schema VALUES(4);
+    tx.execute_batch("CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=5)); INSERT INTO world_schema VALUES(5);
         CREATE TABLE worlds(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES identity_profiles(profile), name TEXT NOT NULL, initial_name TEXT NOT NULL, revision INTEGER NOT NULL, state BLOB NOT NULL, hash TEXT NOT NULL);
         CREATE TABLE world_members(canvas TEXT NOT NULL REFERENCES worlds(id), profile TEXT NOT NULL REFERENCES identity_profiles(profile), epoch INTEGER NOT NULL CHECK(epoch>0), active INTEGER NOT NULL CHECK(active IN (0,1)), PRIMARY KEY(canvas,profile));
         CREATE INDEX world_member_list ON world_members(profile,active,canvas);
@@ -97,7 +102,22 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
     tx.execute_batch(media::TABLES)?;
     tx.execute_batch(trash::TABLES)?;
     tx.execute_batch(archive_import::TABLES)?;
-    tx.pragma_update(None, "user_version", 4)?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v5(db: &Connection, path: &std::path::Path) -> Result<()> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let mut name = path.file_name().ok_or(Error::Invalid("canvas migration path"))?.to_os_string();
+    name.push(format!(".before-world-v5-{suffix}.sqlite3"));
+    crate::backup::copy(db, &path.with_file_name(name))?;
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch("DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=5)); INSERT INTO world_schema VALUES(5);")?;
+    tx.pragma_update(None, "user_version", 5)?;
+    verify(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -114,7 +134,7 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         return if partial == 0 { Ok(()) } else { Err(Error::Schema) };
     }
     let versions: Vec<u32> = db.prepare("SELECT version FROM world_schema LIMIT 2")?.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-    if versions != [1] && versions != [2] && versions != [3] && versions != [4] {
+    if versions != [1] && versions != [2] && versions != [3] && versions != [4] && versions != [5] {
         return Err(Error::Schema);
     }
     let media_tables: u32 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('world_media_sources','world_blobs')", [], |r| r.get(0))?;
@@ -125,10 +145,11 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         media::verify(db)?;
     }
     let trash_tables: u32 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='world_trash'", [], |r| r.get(0))?;
-    if ((versions == [3] || versions == [4]) && trash_tables != 1) || ((versions == [1] || versions == [2]) && trash_tables != 0) {
+    let has_trash = versions == [3] || versions == [4] || versions == [5];
+    if (has_trash && trash_tables != 1) || (!has_trash && trash_tables != 0) {
         return Err(Error::Schema);
     }
-    if versions == [3] || versions == [4] {
+    if has_trash {
         trash::verify(db)?;
     }
     let import_tables: u32 = db.query_row(
@@ -136,10 +157,11 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if (versions == [4] && import_tables != 4) || (versions != [4] && import_tables != 0) {
+    let has_imports = versions == [4] || versions == [5];
+    if (has_imports && import_tables != 4) || (!has_imports && import_tables != 0) {
         return Err(Error::Schema);
     }
-    if versions == [4] {
+    if has_imports {
         archive_import::verify(db)?;
     }
     let invalid:u64=db.query_row("SELECT count(*) FROM world_members m LEFT JOIN worlds w ON w.id=m.canvas LEFT JOIN identity_profiles p ON p.profile=m.profile WHERE w.id IS NULL OR p.profile IS NULL OR typeof(m.epoch)!='integer' OR m.epoch<1 OR m.active NOT IN (0,1)",[],|r|read_u64(r,0))?;
@@ -172,8 +194,11 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         if world.import_origin.as_ref().is_some_and(|origin| world.revision < origin.source_revision) {
             return Err(Error::Storage);
         }
-        if versions == [4] && world.import_origin != archive_import::origin(db, id)? {
+        if has_imports && world.import_origin != archive_import::origin(db, id)? {
             return Err(Error::Storage);
+        }
+        if versions != [5] && world.schema != photocraft_scene::shared::SHARED_SCHEMA {
+            return Err(Error::Schema);
         }
         if versions != [1] {
             media::verify_world(db, &world)?;

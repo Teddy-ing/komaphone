@@ -245,6 +245,8 @@ pub fn specs() -> Vec<CommandSpec> {
                     width: p.width,
                     color: p.color,
                     erase: p.erase,
+                    brush: None,
+                    samples: None,
                 };
                 stroke.validate().map_err(|e| error(e.to_string()))?;
                 s.canvases.flight = None;

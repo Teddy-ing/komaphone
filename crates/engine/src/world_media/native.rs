@@ -221,7 +221,13 @@ impl WorldRenderer {
                     if self.stats.source_points > photocraft_scene::MAX_VIEW_POINTS {
                         return Err(error("Visible sample budget reached; zoom closer before exporting"));
                     }
-                    if let Some(projected) = render::project(stroke, view).map_err(other)? {
+                    if stroke.brush.is_some() {
+                        if let Some(raster) = crate::world_brush::rasterize_world_stroke(stroke, view, 1.0, &mut self.stats.raster_samples, MAX_RASTER_SAMPLES)?
+                        {
+                            layer.composite_brush(&raster, view.width);
+                            self.stats.rendered_objects += 1;
+                        }
+                    } else if let Some(projected) = render::project(stroke, view).map_err(other)? {
                         let mesh = round::mesh(&projected.paths, projected.width, [view.width, view.height], 1.0, round::MAX_MESH_VERTICES).map_err(other)?;
                         for triangle in mesh.indices.chunks_exact(3) {
                             let a = mesh.vertices.get(triangle[0] as usize).ok_or_else(|| error("Invalid stroke triangle"))?;
@@ -273,7 +279,8 @@ fn stroke_extent(stroke: &photocraft_scene::Stroke) -> f64 {
             max[axis] = max[axis].max(point[axis]);
         }
     }
-    (max[0] - min[0]).max(max[1] - min[1]) + stroke.width
+    let reach = stroke.brush.as_ref().map_or(1.0, |brush| brush.reach_factor());
+    (max[0] - min[0]).max(max[1] - min[1]) + stroke.width * reach
 }
 
 struct LayerBuffer {
@@ -294,6 +301,17 @@ impl LayerBuffer {
             *marked = true;
             self.dirty.push(index);
         }
+    }
+    fn composite_brush(&mut self, raster: &crate::world_brush::RasterizedBrushStroke, width: u32) {
+        let Self { pixels, dirty, marked, .. } = self;
+        crate::world_brush::composite_brush_onto_layer(raster, pixels, width, |index| {
+            if let Some(flag) = marked.get_mut(index)
+                && !*flag
+            {
+                *flag = true;
+                dirty.push(index);
+            }
+        });
     }
     fn triangle(&mut self, points: [[f32; 2]; 3], alpha: [f32; 3], view: &Viewport, work: &mut u64) -> Result<()> {
         let [a, b, c] = points.map(|point| [f64::from(point[0]), f64::from(point[1])]);

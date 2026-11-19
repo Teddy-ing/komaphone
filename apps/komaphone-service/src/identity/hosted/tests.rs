@@ -140,6 +140,8 @@ fn google_only_stroke_copy_preserves_attribution_without_legacy_identity() {
         width: 3.,
         color: Srgba { rgba: [0., 0., 0., 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     };
     let mut operation = WorldOp {
         id: OpId::new(&format!("{:032x}", 1)).unwrap(),

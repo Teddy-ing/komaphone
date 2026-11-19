@@ -19,8 +19,10 @@ pub fn spatial_cells(stroke: &Stroke, max_cells: usize) -> Result<Vec<RegionKey>
     }
     // The spatial envelope must round outward, unlike authored point quantization.
     // Otherwise a very thin stroke on a seam disappears when approached from the
-    // adjacent cell at a much deeper view scale.
-    let radius = Double::integer(local_unit(stroke.anchor.depth)?).mul(Double::scalar(stroke.width * 0.5));
+    // adjacent cell at a much deeper view scale. Soft tips and scattering expand
+    // the envelope by `StrokeBrush::reach_factor`.
+    let reach = stroke.brush.as_ref().map_or(1.0, |brush| brush.reach_factor());
+    let radius = Double::integer(local_unit(stroke.anchor.depth)?).mul(Double::scalar(stroke.width * 0.5 * reach));
     let radius = radius.hi as i128 + radius.lo.ceil() as i128 + 1;
     let a = Point { x: Wide(min[0] - radius), y: Wide(min[1] - radius) };
     let b = Point { x: Wide(max[0] + radius), y: Wide(max[1] + radius) };
@@ -39,11 +41,16 @@ pub fn decimate(stroke: &Stroke, max_points: usize) -> Result<Stroke> {
     }
     let mut result = stroke.clone();
     result.points.clear();
+    let mut samples = stroke.samples.as_ref().map(|_| Vec::with_capacity(max_points));
     let end = stroke.points.len() - 1;
     for i in 0..max_points {
         let index = i.checked_mul(end).ok_or(Error::Limit("summary points"))? / (max_points - 1);
         result.points.push(*stroke.points.get(index).ok_or(Error::Invalid("summary point index"))?);
+        if let (Some(out), Some(source)) = (samples.as_mut(), stroke.samples.as_ref()) {
+            out.push(*source.get(index).ok_or(Error::Invalid("summary sample index"))?);
+        }
     }
+    result.samples = samples;
     Ok(result)
 }
 

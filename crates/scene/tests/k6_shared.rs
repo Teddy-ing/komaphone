@@ -35,6 +35,8 @@ fn stroke(n: u128, owner: OwnerId) -> Stroke {
         width: 5.0,
         color: Srgba { rgba: [0.2, 0.3, 0.4, 1.0] },
         erase: false,
+        brush: None,
+        samples: None,
     }
 }
 fn accepted(revision: u64, writer: u128, sequence: u64, action: Edit) -> AcceptedOp {

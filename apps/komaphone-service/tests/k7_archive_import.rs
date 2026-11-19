@@ -51,6 +51,8 @@ fn stroke(actor: u64, target: CanvasId) -> Stroke {
         width: 4.,
         color: Srgba { rgba: [0.3, 0.4, 0.6, 1.] },
         erase: false,
+        brush: None,
+        samples: None,
     }
 }
 fn fixture_archive() -> (ArchiveManifest, BTreeMap<AssetHash, Vec<u8>>) {
@@ -358,9 +360,12 @@ fn schema_three_migration_retains_verified_backup_and_existing_world() {
     let recovered = Store::open(&restored, StoreOptions::default(), 300).unwrap();
     drop(recovered);
     assert_eq!(hash(&std::fs::read(&backup).unwrap()), before);
-    let db = rusqlite::Connection::open(path).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = db.query_row("SELECT version FROM world_schema", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
+    let user_version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+    assert_eq!(user_version, 5);
+    assert!(std::fs::read_dir(f.root.path()).unwrap().map(|e| e.unwrap().path()).any(|p| p.file_name().unwrap().to_string_lossy().contains("before-world-v5")));
 }
 
 #[test]

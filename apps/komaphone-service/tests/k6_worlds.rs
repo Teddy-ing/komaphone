@@ -77,6 +77,8 @@ fn op(n: u32, c: u32, sequence: u64, id: u32) -> WorldOp {
                 width: 3.,
                 color: Srgba { rgba: [0., 0., 0., 1.] },
                 erase: false,
+                brush: None,
+                samples: None,
             },
         },
     }

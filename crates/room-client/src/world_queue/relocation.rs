@@ -17,6 +17,12 @@ pub(super) fn backup_schema_one(db: &Connection, path: &Path) -> Result<()> {
     verify_backup(db, &backup, 1)
 }
 
+pub(super) fn backup_schema_two(db: &Connection, path: &Path) -> Result<()> {
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| invalid("Cannot name canvas schema backup"))?;
+    let backup = path.with_file_name(format!("{name}.pre-brush-schema-v2.sqlite3"));
+    verify_backup(db, &backup, 2)
+}
+
 pub(super) fn ensure_not_retired(db: &Connection, key: &str) -> Result<()> {
     let retired: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM scope_moves WHERE from_scope=?1)", [key], |row| row.get(0)).map_err(sql)?;
     if retired {

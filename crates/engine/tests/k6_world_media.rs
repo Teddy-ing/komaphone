@@ -56,6 +56,8 @@ fn stroke(id: u128, writer: u128, points: Vec<[f64; 2]>, color: [f32; 4], width:
         color: Srgba { rgba: color },
         width,
         erase,
+        brush: None,
+        samples: None,
     }
 }
 fn pixel(image: &WorldImage, x: u32, y: u32) -> [f32; 4] {
