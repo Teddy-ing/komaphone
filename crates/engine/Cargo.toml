@@ -36,7 +36,7 @@ photocraft-io = { workspace = true }
 photocraft-psd = { workspace = true }
 photocraft-format = { workspace = true }
 photocraft-plugins = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 blake3 = { version = "1.8", default-features = false, features = ["pure"] }
 photocraft-codecs = { workspace = true }
 flate2 = { workspace = true }
@@ -50,7 +50,7 @@ semver = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 image = { workspace = true, features = ["png", "gif"] }
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = { workspace = true }
 tempfile = "3"
 chrono = { workspace = true }
@@ -79,4 +79,4 @@ wat = "1.228"
 exr = { version = "1.73", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
