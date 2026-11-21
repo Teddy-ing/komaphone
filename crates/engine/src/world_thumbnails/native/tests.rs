@@ -297,3 +297,82 @@ fn completed_mailbox_backpressure_preserves_the_next_preview_and_reset_keeps_onl
     drop(state);
     join.join().unwrap();
 }
+
+#[test]
+fn forward_revision_retains_prior_thumbnail_while_revocation_epoch_and_rollback_purge() {
+    let root = tempfile::tempdir().unwrap();
+    let access = access(root.path());
+    let shared = Arc::new(Shared::default());
+    let mut state = State { worker: Some(Worker { shared: Arc::clone(&shared) }), ..Default::default() };
+    state.access(Some(&access));
+    let generation = lock(&shared).generation;
+
+    let mut base = key(1);
+    base.scope = access.scope().clone();
+    base.info.owner = base.scope.profile;
+    base.info.revision = 1;
+    let canvas = base.info.canvas;
+
+    state.catalog(std::slice::from_ref(&base.info));
+    let rev1_rgba = vec![42u8; (WIDTH * HEIGHT * 4) as usize];
+    lock(&shared).completed.push_back(Completed {
+        key: base.clone(),
+        generation,
+        result: Ok(Thumbnail { width: WIDTH, height: HEIGHT, rgba: rev1_rgba.clone(), revision: 1 }),
+    });
+    state.poll();
+    assert_eq!(state.get(canvas, None).unwrap().unwrap().revision, 1);
+    assert!(!state.is_pending(canvas));
+
+    // 1. Forward revision update via `observe`: prior thumbnail stays visible while rev 2 is queued.
+    let mut rev2_info = base.info.clone();
+    rev2_info.revision = 2;
+    state.observe(&rev2_info);
+    let shown = state.get(canvas, None).unwrap().expect("forward revision must retain prior thumbnail without Loading flash");
+    assert_eq!(shown.revision, 1);
+    assert_eq!(shown.rgba, rev1_rgba);
+    assert!(state.is_pending(canvas), "rev 2 thumbnail must be queued in background");
+
+    // 2. Forward revision update via `catalog`: prior thumbnail still stays visible.
+    let mut rev3_info = base.info.clone();
+    rev3_info.revision = 3;
+    state.catalog(std::slice::from_ref(&rev3_info));
+    let shown = state.get(canvas, None).unwrap().expect("catalog forward revision must retain prior thumbnail");
+    assert_eq!(shown.revision, 1);
+
+    // 3. Revision rollback MUST purge immediately (never keep newer thumbnail for rolled-back/reset state).
+    let mut rollback_info = base.info.clone();
+    rollback_info.revision = 0;
+    state.catalog(std::slice::from_ref(&rollback_info));
+    assert!(state.get(canvas, None).unwrap().is_none(), "revision rollback must purge cached thumbnail");
+
+    // Re-seed rev 2 thumbnail, then verify epoch change purges immediately.
+    state.catalog(std::slice::from_ref(&rev2_info));
+    let mut rev2_key = base.clone();
+    rev2_key.info = rev2_info.clone();
+    lock(&shared).completed.push_back(Completed {
+        key: rev2_key,
+        generation,
+        result: Ok(Thumbnail { width: WIDTH, height: HEIGHT, rgba: rev1_rgba.clone(), revision: 2 }),
+    });
+    state.poll();
+    assert_eq!(state.get(canvas, None).unwrap().unwrap().revision, 2);
+    let mut epoch2_info = rev2_info.clone();
+    epoch2_info.epoch = 2;
+    epoch2_info.revision = 3;
+    state.catalog(std::slice::from_ref(&epoch2_info));
+    assert!(state.get(canvas, None).unwrap().is_none(), "epoch change must purge cached thumbnail");
+
+    // Re-seed, then verify explicit removal / catalog revocation purges immediately.
+    let mut epoch2_key = base.clone();
+    epoch2_key.info = epoch2_info.clone();
+    lock(&shared).completed.push_back(Completed {
+        key: epoch2_key,
+        generation,
+        result: Ok(Thumbnail { width: WIDTH, height: HEIGHT, rgba: rev1_rgba, revision: 3 }),
+    });
+    state.poll();
+    assert_eq!(state.get(canvas, None).unwrap().unwrap().revision, 3);
+    state.catalog(&[]);
+    assert!(state.get(canvas, None).unwrap().is_none(), "revocation from catalog must purge cached thumbnail");
+}

@@ -308,3 +308,34 @@ fn world_airbrush_stationary_hold_appends_timed_samples_and_right_click_opens_br
     assert!(draft.samples.last().unwrap().time_ms >= 90.0);
     assert!(draft.samples.windows(2).all(|w| w[1].time_ms >= w[0].time_ms));
 }
+
+#[test]
+fn active_drag_and_in_flight_submit_keep_chrome_visually_enabled_while_stranded_draft_disables_it() {
+    let (mut app, ctx, view) = fixture();
+    let rect = frame(&mut app, &ctx, &view, 0.0, vec![]);
+    let pos = rect.center();
+    assert!(!app.ui.world.unfinished());
+    assert!(!app.ui.world.has_stranded_draft());
+
+    // 1. Active mouse drag: `unfinished()` blocks actions/close, `has_stranded_draft()` stays false so chrome never flashes grey.
+    frame(&mut app, &ctx, &view, 0.1, vec![egui::Event::PointerMoved(pos), button(pos, true)]);
+    assert!(app.ui.world.unfinished());
+    assert!(app.ui.world.draft.as_ref().unwrap().drawing);
+    assert!(!app.ui.world.has_stranded_draft());
+
+    // 2. Submitted draft awaiting brief SQLite commit: still not stranded (no toolbar button flash).
+    if let Some(draft) = app.ui.world.draft.as_mut() {
+        draft.drawing = false;
+        draft.submitted = true;
+    }
+    assert!(app.ui.world.unfinished());
+    assert!(!app.ui.world.has_stranded_draft());
+
+    // 3. Stranded/interrupted draft (neither drawing nor submitted): visually disables chrome and exposes Retry.
+    if let Some(draft) = app.ui.world.draft.as_mut() {
+        draft.drawing = false;
+        draft.submitted = false;
+    }
+    assert!(app.ui.world.unfinished());
+    assert!(app.ui.world.has_stranded_draft());
+}

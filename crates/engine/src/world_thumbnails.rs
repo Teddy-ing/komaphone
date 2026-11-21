@@ -33,6 +33,17 @@ impl Thumbnails {
             false
         }
     }
+    pub fn is_pending(&self, canvas: CanvasId) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.inner.is_pending(canvas)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = canvas;
+            false
+        }
+    }
     pub fn reset(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         self.inner.reset();

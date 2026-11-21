@@ -32,6 +32,8 @@ pub struct Presentation {
     smoothing_string: Option<([f64; 2], [f64; 2])>,
     pub render_ms: f64,
     pub preparing: bool,
+    preparing_since: Option<web_time::Instant>,
+    can_render_current: bool,
     pub rendered_revision: Option<u64>,
     pub stats: crate::komaphone_world_gpu::Stats,
 }
@@ -165,11 +167,16 @@ fn paint_overlays(app: &mut PhotocraftApp, ui: &egui::Ui, painter: &egui::Painte
     if let Some(([bx, by], [px, py])) = presentation.smoothing_string {
         let a = rect.min + egui::vec2(bx as f32, by as f32);
         let b = rect.min + egui::vec2(px as f32, py as f32);
-        painter.line_segment([a, b], egui::Stroke::new(1.5, tokens.accent));
-        painter.circle_stroke(a, 3.5, egui::Stroke::new(1.5, tokens.accent));
+        if a.distance(b) >= 2.0 {
+            painter.line_segment([a, b], egui::Stroke::new(3.0, egui::Color32::from_black_alpha(110)));
+            painter.line_segment([a, b], egui::Stroke::new(1.0, egui::Color32::WHITE));
+            painter.circle_filled(a, 2.5, egui::Color32::WHITE);
+        }
     }
-    if presentation.preparing || presentation.stats.pending_assets > 0 {
-        let message = if presentation.preparing { "Preparing the selected canvas revision…" } else { "Loading shared media…" };
+    let show_preparing = presentation.preparing
+        && (!presentation.can_render_current || presentation.preparing_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_millis(300)));
+    if show_preparing || presentation.stats.pending_assets > 0 {
+        let message = if show_preparing { "Preparing the selected canvas revision…" } else { "Loading shared media…" };
         painter.text(rect.min + egui::vec2(12.0, 12.0), egui::Align2::LEFT_TOP, message, egui::FontId::proportional(13.0), tokens.text);
     }
 }
@@ -207,6 +214,8 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
         p.smoothing_string = None;
         p.ready = None;
         p.rendered_revision = None;
+        p.preparing_since = None;
+        p.can_render_current = false;
         p.stats = Default::default();
     }
     if p.worker.is_none() {
@@ -218,11 +227,17 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
         p.key = Some(key.clone());
         p.prepare_error = None;
         p.preparing = true;
+        if p.preparing_since.is_none() {
+            p.preparing_since = Some(web_time::Instant::now());
+        }
     }
     if let Some(completed) = p.worker.as_ref().and_then(Worker::take)
         && (completed.key == key || completed.key.may_show_before(&key))
     {
         p.preparing = completed.key != key;
+        if !p.preparing {
+            p.preparing_since = None;
+        }
         match completed.result {
             Ok(renderer) => {
                 p.install_with_dirty(renderer, completed.key, completed.dirty_rects.as_deref());
@@ -236,7 +251,8 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
     if p.preparing {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
-    if !p.can_render(&key) {
+    p.can_render_current = p.can_render(&key);
+    if !p.can_render_current {
         return Ok(None);
     }
 
@@ -505,10 +521,12 @@ fn present_cpu_fallback(
     let mut pending = 0usize;
     let mut anim_pending = 0usize;
     let mut missing = Vec::new();
+    let mut has_any_local_brush = false;
     for &tile in &visible {
         let phys = tile.physical_rect();
         let has_local_brush = live_id.is_some_and(|lsid| dynamic_items.previews.iter().any(|(r, (sid, _))| *sid == lsid && r.intersects(&phys)));
         if has_local_brush && let Some(lsid) = live_id {
+            has_any_local_brush = true;
             let live_r = match live_tile_brush.as_deref_mut() {
                 Some(lb) => {
                     lb.ensure_lod(tile.lod);
@@ -521,10 +539,14 @@ fn present_cpu_fallback(
             let batch =
                 mgr.render_live_tiles_nonblocking(&[(tile, bg_sig, has_anim, live_r)], lsid, elapsed_ms, previews, resolve_media).map_err(|e| e.to_string())?;
             if let Some((_, res)) = batch.into_iter().next() {
+                let rgba8 = Arc::new(res.rgba8);
                 if res.used_stale_anim_cache {
                     active_async.insert(tile);
                     async_jobs.push((tile, bg_sig, elapsed_ms));
                     anim_pending += 1;
+                }
+                if res.used_stale_base {
+                    pending += 1;
                 }
                 if res.used_cold_split_fallback {
                     let devs = crate::komaphone_world_gpu::tile_split_devices_for(phys, &preview_rects, None);
@@ -535,7 +557,13 @@ fn present_cpu_fallback(
                         anim_pending += 1;
                     }
                 }
-                owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], Arc::new(res.rgba8)));
+                if !res.used_stale_base && !res.used_cold_split_fallback && !res.used_stale_anim_cache && res.pending_assets.is_empty() {
+                    mgr.record_live_handoff(tile, lsid, edit_seq, Arc::clone(&rgba8));
+                }
+                if !has_anim && !mgr.has_valid_cpu_tile(tile) {
+                    static_visible.push(tile);
+                }
+                owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], rgba8));
             }
             continue;
         }
@@ -551,9 +579,13 @@ fn present_cpu_fallback(
                 anim_pending += 1;
                 if let Some(prev) = mgr.get_any_valid_dynamic_tile(tile) {
                     owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], prev.rgba8));
-                } else if let Some(stat) = mgr.get_valid_cpu_tile(tile) {
+                } else if let Some(stat) = mgr.get_any_cpu_tile(tile) {
                     owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], stat.rgba8));
                     pending += 1;
+                } else if let Some(fb) = mgr.synthesize_fallback_rgba8(tile) {
+                    owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], fb));
+                    pending += 1;
+                    missing.push(tile);
                 } else {
                     pending += 1;
                     missing.push(tile);
@@ -566,7 +598,14 @@ fn present_cpu_fallback(
             owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], hit.rgba8));
         } else {
             pending += 1;
-            missing.push(tile);
+            if let Some(stale) = mgr.get_any_cpu_tile(tile) {
+                owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], stale.rgba8));
+            } else if let Some(fb) = mgr.synthesize_fallback_rgba8(tile) {
+                owned_tiles.push((tile.logical_rect(), [u0, u0, u1, u1], fb));
+                missing.push(tile);
+            } else {
+                missing.push(tile);
+            }
         }
     }
     if let Some(lsid) = live_id {
@@ -577,7 +616,7 @@ fn present_cpu_fallback(
         mgr.schedule_dynamic_tiles(active_async, &async_jobs, previews);
         mgr.schedule_split_warm_tiles(std::collections::BTreeSet::new(), &[], &[]);
     }
-    mgr.schedule_view(view, target_lod, &static_visible, &missing);
+    mgr.schedule_view_interactive(view, target_lod, &static_visible, &missing, !has_any_local_brush);
     let refs: Vec<(WorldRect, [f32; 4], &[u8])> = owned_tiles.iter().map(|(r, uv, b)| (*r, *uv, b.as_slice())).collect();
     let tex = presenter.present_tiles(ctx, view, density, &refs)?;
     *stats = crate::komaphone_world_gpu::Stats {

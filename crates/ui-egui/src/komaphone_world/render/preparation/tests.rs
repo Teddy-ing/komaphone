@@ -189,3 +189,122 @@ fn installed_review_and_quarantined_future_projection_cannot_masquerade_as_live_
     presentation.ready = Some(reduced);
     assert!(presentation.can_render(&live), "Older same-scope live progress remains explicitly labelled while preparing");
 }
+
+#[test]
+fn ack_with_identical_display_state_skips_rebuild_and_emits_zero_dirty_rects() {
+    let source = world(1);
+    let worker = Worker::start().unwrap();
+    let mut pending_key = key(&source, 1);
+    pending_key.revision = Revision::Live { canonical: 2, display: 3, pending: 1 };
+    worker.request(pending_key.clone(), source.clone()).unwrap();
+    let initial = wait(&worker);
+    assert_eq!(initial.key, pending_key);
+    assert!(initial.result.is_ok());
+    assert!(initial.dirty_rects.is_none());
+
+    // Server ACK transitions canonical 2->3 and pending 1->0 with identical display history.
+    let mut acked_key = pending_key.clone();
+    acked_key.revision = Revision::Live { canonical: 3, display: 3, pending: 0 };
+    worker.request(acked_key.clone(), source.clone()).unwrap();
+    let acked = wait(&worker);
+    assert_eq!(acked.key, acked_key);
+    assert_eq!(acked.dirty_rects, Some(Vec::new()), "identical ACK must not invalidate any tiles");
+    assert_eq!(acked.result.unwrap().world(), &*source);
+}
+
+#[test]
+fn ack_plus_peer_stroke_takes_incremental_path_while_conflicting_ack_rebuilds() {
+    let base = world(1);
+    let worker = Worker::start().unwrap();
+    let mut pending_key = key(&base, 1);
+    pending_key.revision = Revision::Live { canonical: 2, display: 3, pending: 1 };
+    worker.request(pending_key.clone(), base.clone()).unwrap();
+    let _ = wait(&worker);
+
+    // 1. ACK + concurrent peer stroke on rev 4: prefix 1..=3 matches, so apply incrementally.
+    let mut with_peer = (*base).clone();
+    let peer_device = DeviceId::new(&format!("{:032x}", 301)).unwrap();
+    with_peer
+        .apply(&AcceptedOp {
+            revision: 4,
+            op: WorldOp {
+                id: OpId::new(&format!("{:032x}", 1004)).unwrap(),
+                canvas: with_peer.canvas,
+                author: with_peer.owner,
+                device: peer_device,
+                sequence: 1,
+                authority_epoch: 1,
+                action: Edit::AddStroke {
+                    stroke: Stroke {
+                        id: StrokeId::new(&format!("{:032x}", 1004)).unwrap(),
+                        canvas: with_peer.canvas,
+                        owner: with_peer.owner,
+                        revision: 0,
+                        anchor: Default::default(),
+                        points: vec![[40., 40.], [60., 60.]],
+                        width: 4.,
+                        color: Srgba { rgba: [0., 0., 1., 1.] },
+                        erase: false,
+                        brush: None,
+                        samples: None,
+                    },
+                },
+            },
+        })
+        .unwrap();
+    let with_peer = Arc::new(with_peer);
+    let mut peer_key = pending_key.clone();
+    peer_key.revision = Revision::Live { canonical: 4, display: 4, pending: 0 };
+    worker.request(peer_key.clone(), with_peer.clone()).unwrap();
+    let inc = wait(&worker);
+    assert_eq!(inc.key, peer_key);
+    assert!(inc.dirty_rects.as_ref().is_some_and(|rects| !rects.is_empty()), "matching prefix ACK + peer stroke must apply incrementally");
+    assert_eq!(inc.result.unwrap().world(), &*with_peer);
+
+    // 2. Conflicting/reordered history at the same display rev (op ID differs): MUST fall back to full rebuild.
+    let mut diverged = with_peer.replay_to(2).unwrap();
+    for (rev, op_num) in [(3u64, 9003u128), (4u64, 9004u128)] {
+        let seq = diverged.next_sequence(peer_device).unwrap();
+        diverged
+            .apply(&AcceptedOp {
+                revision: rev,
+                op: WorldOp {
+                    id: OpId::new(&format!("{op_num:032x}")).unwrap(),
+                    canvas: diverged.canvas,
+                    author: diverged.owner,
+                    device: peer_device,
+                    sequence: seq,
+                    authority_epoch: 1,
+                    action: Edit::AddStroke {
+                        stroke: Stroke {
+                            id: StrokeId::new(&format!("{op_num:032x}")).unwrap(),
+                            canvas: diverged.canvas,
+                            owner: diverged.owner,
+                            revision: 0,
+                            anchor: Default::default(),
+                            points: vec![[-20., -20.]],
+                            width: 4.,
+                            color: Srgba { rgba: [1., 0., 0., 1.] },
+                            erase: false,
+                            brush: None,
+                            samples: None,
+                        },
+                    },
+                },
+            })
+            .unwrap();
+    }
+    let diverged = Arc::new(diverged);
+    let mut conflict_key = pending_key;
+    conflict_key.revision = Revision::Live { canonical: 4, display: 4, pending: 0 };
+    // First re-install pending rev 4 from `with_peer` as pending=2 so next transition tests conflict check.
+    let mut pending2_key = conflict_key.clone();
+    pending2_key.revision = Revision::Live { canonical: 2, display: 4, pending: 2 };
+    worker.request(pending2_key, with_peer).unwrap();
+    let _ = wait(&worker);
+    worker.request(conflict_key.clone(), diverged.clone()).unwrap();
+    let rebuilt = wait(&worker);
+    assert_eq!(rebuilt.key, conflict_key);
+    assert!(rebuilt.dirty_rects.is_none(), "diverged op IDs on ACK must trigger full rebuild");
+    assert_eq!(rebuilt.result.unwrap().world(), &*diverged);
+}

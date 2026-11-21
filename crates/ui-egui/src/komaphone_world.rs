@@ -160,6 +160,14 @@ impl WorldUi {
     pub(crate) fn unfinished(&self) -> bool {
         self.draft.is_some()
     }
+    /// True only when an unfinished stroke is stranded (interrupted or failed
+    /// to save) rather than actively being drawn or briefly awaiting its local
+    /// SQLite commit. Used for visual control disabling so the chrome does not
+    /// grey out and flash on every normal stroke while `unfinished()` still
+    /// blocks clicks, shortcuts, and close-time exits.
+    pub(crate) fn has_stranded_draft(&self) -> bool {
+        self.draft.as_ref().is_some_and(|draft| !draft.drawing && !draft.submitted)
+    }
     pub(crate) fn cancel_gesture_for_switch(&mut self) {
         self.pan = None;
         if let Some(draft) = self.draft.as_mut() {
@@ -202,7 +210,7 @@ fn remember(ui: &egui::Ui, id: &str, response: &egui::Response) {
 fn button(app: &mut PhotocraftApp, ui: &mut egui::Ui, label: &str, id: &str, params: Value, enabled: bool) {
     let response = ui.add_enabled(enabled && app.session.is_enabled(id), egui::Button::new(label));
     remember(ui, id, &response);
-    if response.clicked() {
+    if response.clicked() && (id == "komaphone.world.export.cancel" || !app.ui.world.unfinished()) {
         run(app, id, params);
     }
 }
@@ -257,16 +265,16 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.horizontal_centered(|ui| {
                 ui.add_space(left);
                 ui.strong("Komaphone · Shared canvases");
-                let enabled = !app.ui.world.unfinished();
-                let response = ui.add_enabled(enabled, egui::Button::new("Local canvases"));
+                let visual_enabled = !app.ui.world.has_stranded_draft();
+                let response = ui.add_enabled(visual_enabled, egui::Button::new("Local canvases"));
                 remember(ui, "world.local", &response);
-                if response.clicked() {
+                if response.clicked() && !app.ui.world.unfinished() {
                     app.ui.world.open = false;
                     crate::komaphone_canvas::open(app);
                 }
-                let response = ui.add_enabled(enabled, egui::Button::new("Party & drawings"));
+                let response = ui.add_enabled(visual_enabled, egui::Button::new("Party & drawings"));
                 remember(ui, "world.return", &response);
-                if response.clicked() {
+                if response.clicked() && !app.ui.world.unfinished() {
                     app.ui.world.open = false;
                 }
                 let (rect, response) = ui.allocate_exact_size(egui::vec2((ui.available_width() - right - 6.0).max(0.0), 32.0), Sense::click_and_drag());
@@ -490,7 +498,8 @@ fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 ui.spacing_mut().button_padding.x = 5.0;
                 ui.spacing_mut().interact_size.x = 34.0;
                 let idle = !app.ui.world.unfinished();
-                let editing = idle && !reviewing(app);
+                let visual_idle = !app.ui.world.has_stranded_draft();
+                let visual_editing = visual_idle && !reviewing(app);
                 let tool = active_world_tool(app);
                 for (label, target, id) in [
                     ("Brush", Some(crate::Tool::Brush), "world.tool.brush"),
@@ -502,9 +511,9 @@ fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         Some(t) => !app.ui.world.tools.pan && tool == t,
                         None => app.ui.world.tools.pan,
                     };
-                    let response = ui.add_enabled(idle && (target.is_none() || editing), egui::Button::new(label).selected(selected));
+                    let response = ui.add_enabled(visual_idle && (target.is_none() || visual_editing), egui::Button::new(label).selected(selected));
                     remember(ui, id, &response);
-                    if response.clicked() {
+                    if response.clicked() && idle {
                         match target {
                             Some(t) => select_world_tool(app, t),
                             None => app.ui.world.tools.pan = true,
@@ -516,46 +525,49 @@ fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 let mut brush = before.clone();
                 let active_tool = active_world_tool(app);
                 ui.label("Size");
-                let size_resp =
-                    ui.add_enabled(editing, egui::DragValue::new(&mut brush.size).range(1.0..=photocraft_paint::MAX_BRUSH_SIZE).speed(1.0).suffix(" px"));
+                let size_resp = ui
+                    .add_enabled(visual_editing, egui::DragValue::new(&mut brush.size).range(1.0..=photocraft_paint::MAX_BRUSH_SIZE).speed(1.0).suffix(" px"));
                 remember(ui, "world.width", &size_resp);
                 let size_changed = size_resp.changed();
                 ui.label("Opacity");
-                ui.add_enabled_ui(editing, |ui| {
+                ui.add_enabled_ui(visual_editing, |ui| {
                     percent_control(ui, &mut brush.opacity, "world.opacity");
                 });
                 if active_tool != crate::Tool::Pencil {
                     ui.label("Flow");
-                    ui.add_enabled_ui(editing, |ui| {
+                    ui.add_enabled_ui(visual_editing, |ui| {
                         percent_control(ui, &mut brush.flow, "world.flow");
                     });
                 }
                 if active_tool != crate::Tool::Pencil && matches!(brush.tip, photocraft_paint::TipShape::Round) {
                     ui.label("Hard").on_hover_text("Brush hardness");
-                    ui.add_enabled_ui(editing, |ui| {
+                    ui.add_enabled_ui(visual_editing, |ui| {
                         percent_control(ui, &mut brush.hardness, "world.hardness");
                     });
                 }
                 ui.label("Smooth").on_hover_text("Stroke smoothing");
                 let mut smoothing = if brush.smoothing.enabled { brush.smoothing.amount } else { 0.0 };
-                ui.add_enabled_ui(editing, |ui| {
+                ui.add_enabled_ui(visual_editing, |ui| {
                     if percent_control(ui, &mut smoothing, "world.smoothing") {
                         brush.smoothing.enabled = smoothing > 0.0;
                         brush.smoothing.amount = smoothing;
                     }
                 });
-                let presets_resp = ui.add_enabled(editing, egui::Button::new("Presets")).on_hover_text("Brush presets (or right-click canvas)");
+                let presets_resp = ui.add_enabled(visual_editing, egui::Button::new("Presets")).on_hover_text("Brush presets (or right-click canvas)");
                 remember(ui, "world.brush.presets", &presets_resp);
-                if presets_resp.clicked() {
+                if presets_resp.clicked() && idle {
                     crate::brush_picker::open(&mut app.ui, ui.ctx(), [presets_resp.rect.left(), presets_resp.rect.bottom()]);
                 }
-                let settings_resp =
-                    ui.add_enabled(editing, egui::Button::new("Settings").selected(app.ui.panels.brush_settings)).on_hover_text("Open Brush Settings (F5)");
+                let settings_resp = ui
+                    .add_enabled(visual_editing, egui::Button::new("Settings").selected(app.ui.panels.brush_settings))
+                    .on_hover_text("Open Brush Settings (F5)");
                 remember(ui, "world.brush.settings", &settings_resp);
-                if settings_resp.clicked() {
+                if settings_resp.clicked() && idle {
                     app.ui.panels.brush_settings = !app.ui.panels.brush_settings;
                 }
-                crate::brush_panel::commit_gesture(app, ui.ctx(), &before, &brush);
+                if idle {
+                    crate::brush_panel::commit_gesture(app, ui.ctx(), &before, &brush);
+                }
                 ui.separator();
                 let [fg_r, fg_g, fg_b, _] = app.session.tools.foreground;
                 let mut fg = [fg_r, fg_g, fg_b].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
@@ -588,22 +600,24 @@ fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     ui.separator();
                     ui.collapsing("Palette", |ui| crate::panels::swatches_ui::panel(app, ui));
                 });
+                let mut lock_width = app.ui.world.tools.lock_width;
                 let lock_resp = ui
-                    .add_enabled(editing, egui::Checkbox::new(&mut app.ui.world.tools.lock_width, "Lock"))
+                    .add_enabled(visual_editing, egui::Checkbox::new(&mut lock_width, "Lock"))
                     .on_hover_text("Keep this stroke thickness in canvas coordinates while zooming.");
                 remember(ui, "world.lockWidth", &lock_resp);
-                if (lock_resp.changed() || size_changed)
-                    && let Some(active) = app.session.worlds.active.as_ref()
-                {
-                    let cam = &active.viewer.camera;
-                    app.ui.world.world_locked_width =
-                        app.ui.world.tools.lock_width.then_some((cam.region.depth, f64::from(app.session.tools.brush.size) / cam.zoom));
+                if idle && (lock_resp.changed() || size_changed) {
+                    app.ui.world.tools.lock_width = lock_width;
+                    if let Some(active) = app.session.worlds.active.as_ref() {
+                        let cam = &active.viewer.camera;
+                        app.ui.world.world_locked_width =
+                            app.ui.world.tools.lock_width.then_some((cam.region.depth, f64::from(app.session.tools.brush.size) / cam.zoom));
+                    }
                 }
                 ui.separator();
-                button(app, ui, "Undo mine", "komaphone.world.undo", json!({}), editing);
-                button(app, ui, "Redo mine", "komaphone.world.redo", json!({}), editing);
-                button(app, ui, "Home", "komaphone.world.home", json!({}), idle);
-                if app.ui.world.draft.as_ref().is_some_and(|d| !d.drawing) && ui.button("Retry unfinished stroke").clicked() {
+                button(app, ui, "Undo mine", "komaphone.world.undo", json!({}), visual_editing);
+                button(app, ui, "Redo mine", "komaphone.world.redo", json!({}), visual_editing);
+                button(app, ui, "Home", "komaphone.world.home", json!({}), visual_idle);
+                if app.ui.world.has_stranded_draft() && ui.button("Retry unfinished stroke").clicked() {
                     input::finish(app);
                 }
                 app.ui.world.tools.brush_width = f64::from(app.session.tools.brush.size).clamp(1.0, f64::from(photocraft_paint::MAX_BRUSH_SIZE));

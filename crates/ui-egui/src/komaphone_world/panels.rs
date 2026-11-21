@@ -23,7 +23,7 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
     egui::Panel::left("world-sidebar").exact_size(260.0).frame(egui::Frame::NONE.fill(tokens.card).inner_margin(10)).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let idle = !app.ui.world.unfinished();
+            let idle = !app.ui.world.has_stranded_draft();
             ui.heading("Your shared canvases");
             if !app.session.worlds.connected() {
                 if ui.button("Open Private room").clicked() {
@@ -48,7 +48,7 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         let response =
                             ui.add_enabled(idle, egui::Button::new(&name).selected(app.ui.world.selected == Some(canvas)).truncate()).on_hover_text(&name);
                         remember(ui, &format!("world.open.{}", canvas.as_str()), &response);
-                        if response.clicked() {
+                        if response.clicked() && !app.ui.world.unfinished() {
                             run(app, "komaphone.world.open", json!({"canvas":canvas}));
                         }
                         let owner =
@@ -67,7 +67,7 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     ui.label(&item.name);
                     let response = ui.add_enabled(idle, egui::Button::new("Restore canvas and members"));
                     remember(ui, &format!("world.undelete.{}", canvas.as_str()), &response);
-                    if response.clicked() {
+                    if response.clicked() && !app.ui.world.unfinished() {
                         run(app, "komaphone.world.undelete", json!({"canvas":canvas,"expected_epoch":epoch}));
                     }
                 });
@@ -79,7 +79,7 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 remember(ui, "world.invitation", &response);
                 let response = ui.add_enabled(idle, egui::Button::new("Accept"));
                 remember(ui, "world.invitation.accept", &response);
-                if response.clicked() {
+                if response.clicked() && !app.ui.world.unfinished() {
                     let parsed = if app.ui.world.accept_code.len() <= 3072 {
                         serde_json::from_str::<Value>(&app.ui.world.accept_code).map_err(|e| e.to_string())
                     } else {
@@ -119,7 +119,6 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             let canvas = active.info.canvas;
             let owner = app.session.worlds.account.as_ref().is_some_and(|a| a.profile == active.info.owner);
             let epoch = active.info.epoch;
-            let synced = active.pending == 0 && !app.session.worlds.busy();
             let bookmarks = active.viewer.bookmarks.clone();
             ui.separator();
             ui.heading("Canvas");
@@ -130,7 +129,9 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.text_edit_singleline(&mut app.ui.world.rename).labelled_by(label.id);
             button(app, ui, "Rename", "komaphone.world.rename", json!({"canvas":canvas,"name":app.ui.world.rename}), idle && owner);
             if owner {
-                button(app, ui, "Move canvas to Trash", "komaphone.world.delete", json!({"canvas":canvas,"expected_epoch":epoch}), idle && synced);
+                // `komaphone.world.delete` refuses while requests/edits are pending;
+                // keeping the button visually enabled avoids blinking on every stroke ACK.
+                button(app, ui, "Move canvas to Trash", "komaphone.world.delete", json!({"canvas":canvas,"expected_epoch":epoch}), idle);
             }
             let section = ui.collapsing("People and invitations", |ui| members(app, ui, idle, owner));
             remember(ui, "world.section.people", &section.header_response);
@@ -282,7 +283,7 @@ fn tours(app: &mut PhotocraftApp, ui: &mut egui::Ui, idle: bool) {
     let tours = world.tours.values().collect::<Vec<_>>();
     let label = ui.label("Tour name");
     ui.text_edit_singleline(&mut app.ui.world.tour_name).labelled_by(label.id);
-    if ui.add_enabled(idle && app.ui.world.tour_stops.len() < 128, egui::Button::new("Add this view as a stop")).clicked() {
+    if ui.add_enabled(idle && app.ui.world.tour_stops.len() < 128, egui::Button::new("Add this view as a stop")).clicked() && !app.ui.world.unfinished() {
         let travel_ms = if app.ui.world.tour_stops.is_empty() { 0 } else { 1500 };
         app.ui.world.tour_stops.push(TourStop { camera, travel_ms, pause_ms: 1000, target: None });
     }
@@ -324,7 +325,7 @@ fn tours(app: &mut PhotocraftApp, ui: &mut egui::Ui, idle: bool) {
     let response =
         ui.add_enabled(idle && !app.ui.world.tour_stops.is_empty() && app.session.is_enabled("komaphone.world.tour.put"), egui::Button::new("Save tour"));
     remember(ui, "komaphone.world.tour.put", &response);
-    if response.clicked() {
+    if response.clicked() && !app.ui.world.unfinished() {
         let mut params = json!({"name":app.ui.world.tour_name,"stops":app.ui.world.tour_stops});
         if let Some((id, revision)) = app.ui.world.tour_edit {
             params["id"] = json!(id);
@@ -443,7 +444,7 @@ fn media(app: &mut PhotocraftApp, ui: &mut egui::Ui, idle: bool) {
             }
             let response = ui.add_enabled(ready && (!matches!(format, "gif" | "sequence") || app.ui.world.export_tour.is_some()), egui::Button::new(label));
             remember(ui, &format!("world.export.{format}"), &response);
-            if response.clicked() {
+            if response.clicked() && !app.ui.world.unfinished() {
                 run(app, "komaphone.world.export", params);
             }
         }
@@ -504,7 +505,7 @@ fn media(app: &mut PhotocraftApp, ui: &mut egui::Ui, idle: bool) {
         ui.label(format!("{} · stroke {}", credit_name(app, source.stroke.owner), id.as_str().get(..8).unwrap_or_default()));
         let response = ui.add_enabled(idle, egui::Button::new("Copy stroke"));
         remember(ui, &format!("world.stroke.copy.{}", id.as_str()), &response);
-        if response.clicked() {
+        if response.clicked() && !app.ui.world.unfinished() {
             run(app, "komaphone.world.stroke.copy", json!({"stroke":id}));
         }
     });

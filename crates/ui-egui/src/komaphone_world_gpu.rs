@@ -36,7 +36,7 @@ mod geometry;
 pub(crate) mod tests;
 
 pub use geometry::CpuTilePresenter;
-use geometry::{ALIGNED_ROW_BYTES, STAGING_TILE_BYTES, SlotKind, TileAtlas, TileQuadBatch, pad_tile_rows};
+use geometry::{ALIGNED_ROW_BYTES, STAGING_TILE_BYTES, SlotKind, SlotMeta, TileAtlas, TileQuadBatch, pad_tile_rows};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const MAX_PIXELS: u64 = 8_388_608;
@@ -333,8 +333,7 @@ impl WorldGpu {
         let mut async_jobs_to_schedule: Vec<(TileKey, u64, u64)> = Vec::new();
         let edit_seq = mgr.edit_seq();
 
-        // 1. Local active-brush dynamic tiles (non-blocking: never rasterizes committed static bands
-        // on the UI thread; schedules off-thread `WarmSplitBands` + neighbor prefetch for cold W4 tiles).
+        let _ = retain_stale_for_review;
         let local_counts = self.present_local_brush_tiles(
             mgr,
             view,
@@ -355,6 +354,7 @@ impl WorldGpu {
         )?;
         pending_assets = pending_assets.saturating_add(local_counts.pending_assets);
         anim_pending_tiles = anim_pending_tiles.saturating_add(local_counts.anim_pending_tiles);
+        pending_tiles = pending_tiles.saturating_add(local_counts.pending_tiles);
 
         // 2. Async dynamic tiles (animated media & peer previews): NEVER block the UI thread!
         // Present exact match if ready, otherwise keep the last valid presentation while
@@ -368,7 +368,6 @@ impl WorldGpu {
             elapsed_ms,
             &async_dynamic_tiles,
             &dynamic_items,
-            retain_stale_for_review,
             &mut uploads,
             &mut static_uploads_used,
             &mut async_dyn_uploads_used,
@@ -416,36 +415,57 @@ impl WorldGpu {
                 }
             }
 
-            // 3c. Target tile is not yet uploaded: draw temporary fallback (never blank white if avoidable).
+            // 3c. Target tile is not yet uploaded: hold fresher same-tile resident GPU pixels
+            // (never dropping out to white during live edits or review!) or draw layered fallback.
             pending_tiles += 1;
-            let mut drew_fallback = false;
-            if retain_stale_for_review
-                && let Some((layer, meta)) = self.atlas.get_slot(tile, false, frame)
-                && meta.scope_gen == scope_gen
+            let stat_peek = self.atlas.peek_slot(tile, false).filter(|(_, m)| m.scope_gen == scope_gen);
+            let dyn_peek = self.atlas.peek_slot(tile, true).filter(|(_, m)| m.scope_gen == scope_gen);
+            let (drew_fallback, fully_covered) = if let Some((_, dmeta)) = dyn_peek
+                && !dmeta.provisional
+                && stat_peek.is_none_or(|(_, smeta)| dmeta.validated_seq >= smeta.validated_seq)
+                && let Some((layer, _)) = self.atlas.get_slot(tile, true, frame)
             {
+                // Seamless bridge right after mouse-up while committed static tile finishes.
                 self.quads.push_tile(tile, layer, view)?;
-                drew_fallback = true;
-            }
-            if !drew_fallback
-                && let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
-                && meta.scope_gen == scope_gen
+                (true, true)
+            } else if stat_peek.is_some()
+                && let Some((layer, _)) = self.atlas.get_slot(tile, false, frame)
             {
-                // Seamless 1-frame bridge after mouse-up while committed static tile finishes.
+                // Hold the tile's own previous resident VRAM pixels instead of flashing white!
                 self.quads.push_tile(tile, layer, view)?;
-                drew_fallback = true;
-            }
-            if !drew_fallback {
-                drew_fallback = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, &mut uploads, &mut static_uploads_used)?;
-            }
+                (true, true)
+            } else {
+                let fb = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, &mut uploads, &mut static_uploads_used)?;
+                let mut drew = fb.drew_any;
+                if !drew
+                    && dyn_peek.is_some()
+                    && let Some((layer, _)) = self.atlas.get_slot(tile, true, frame)
+                {
+                    self.quads.push_tile(tile, layer, view)?;
+                    drew = true;
+                }
+                (drew, fb.fully_covered)
+            };
             if drew_fallback {
                 fallback_tiles += 1;
-            } else {
+            }
+            if !fully_covered {
                 missing_no_fallback.push(tile);
             }
         }
 
-        // Schedule missing static visible tiles, cold `lod + 2` preview tiles, and 1-tile pan prefetch ring.
-        mgr.schedule_view(view, target_lod, &static_visible, &missing_no_fallback);
+        // Keep static workers alive for non-animated `local_brush_tiles` missing a valid committed base
+        // so rapid consecutive strokes never cancel the previous stroke's static tile render!
+        let mut static_schedule = static_visible;
+        for &tile in &local_brush_tiles {
+            let phys = tile.physical_rect();
+            let has_anim = dynamic_items.anim_media.iter().any(|(r, _)| r.intersects(&phys));
+            if !has_anim && !mgr.has_valid_cpu_tile(tile) {
+                static_schedule.push(tile);
+            }
+        }
+        // Schedule missing static tiles, cold `lod + 2` preview tiles, and (when idle) zoom-out parents + pan ring.
+        mgr.schedule_view_interactive(view, target_lod, &static_schedule, &missing_no_fallback, local_brush_tiles.is_empty());
 
         let uploads_count = uploads.len();
         let id = self.submit_uploads_and_quads(size, &uploads)?;
@@ -539,12 +559,15 @@ impl WorldGpu {
             for ((tile, dyn_sig, bg_sig, _), (_, composed)) in dirty_local.into_iter().zip(composed_batch) {
                 counts.pending_assets = counts.pending_assets.saturating_add(composed.pending_assets.len());
                 let rgba8 = Arc::new(composed.rgba8);
-                let cached_sig =
-                    if composed.pending_assets.is_empty() && !composed.used_stale_anim_cache && !composed.used_cold_split_fallback { dyn_sig } else { 0 };
+                let is_provisional = composed.used_stale_base || composed.used_cold_split_fallback;
+                let cached_sig = if composed.pending_assets.is_empty() && !composed.used_stale_anim_cache && !is_provisional { dyn_sig } else { 0 };
                 if composed.used_stale_anim_cache {
                     active_async_set.insert(tile);
                     async_jobs_to_schedule.push((tile, bg_sig, elapsed_ms));
                     counts.anim_pending_tiles += 1;
+                }
+                if composed.used_stale_base {
+                    counts.pending_tiles += 1;
                 }
                 if composed.used_cold_split_fallback {
                     any_needs_split = true;
@@ -556,8 +579,12 @@ impl WorldGpu {
                         counts.anim_pending_tiles += 1;
                     }
                 }
+                if !is_provisional && composed.pending_assets.is_empty() && !composed.used_stale_anim_cache {
+                    mgr.record_live_handoff(tile, lsid, edit_seq, Arc::clone(&rgba8));
+                }
                 if let Some(layer) = self.atlas.allocate(tile, true, SlotKind::Dynamic, edit_seq, scope_gen, frame) {
                     self.atlas.set_dynamic_sig(layer, cached_sig);
+                    self.atlas.set_provisional(layer, is_provisional);
                     uploads.push(PendingUpload { layer, rgba8 });
                     self.quads.push_tile(tile, layer, view)?;
                 }
@@ -619,7 +646,6 @@ impl WorldGpu {
         elapsed_ms: u64,
         async_dynamic_tiles: &[TileKey],
         dynamic_items: &DynamicItems,
-        retain_stale_for_review: bool,
         uploads: &mut Vec<PendingUpload>,
         static_uploads_used: &mut usize,
         async_dyn_uploads_used: &mut usize,
@@ -665,6 +691,7 @@ impl WorldGpu {
             // Prefer the last valid GPU dynamic slot for this scope & edit_seq (seamless animation tick).
             if let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
                 && meta.scope_gen == scope_gen
+                && !meta.provisional
                 && mgr.is_tile_valid_at(tile, meta.validated_seq)
             {
                 self.quads.push_tile(tile, layer, view)?;
@@ -682,29 +709,30 @@ impl WorldGpu {
                 continue;
             }
             // Cold/post-edit tile with no valid dynamic presentation yet: hold previous GPU slot
-            // (during edit/review swap) or coarse/fine static fallback while first dynamic frame builds.
+            // (during live edits or review swaps) or layered coarse/fine fallback while first frame builds.
             counts.pending_tiles += 1;
-            let mut drew_fallback = false;
-            if let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
-                && meta.scope_gen == scope_gen
+            let stat_peek = self.atlas.peek_slot(tile, false).filter(|(_, m)| m.scope_gen == scope_gen);
+            let dyn_peek = self.atlas.peek_slot(tile, true).filter(|(_, m)| m.scope_gen == scope_gen);
+            let (drew_fallback, fully_covered) = if let Some((_, dmeta)) = dyn_peek
+                && !dmeta.provisional
+                && stat_peek.is_none_or(|(_, smeta)| dmeta.validated_seq >= smeta.validated_seq)
+                && let Some((layer, _)) = self.atlas.get_slot(tile, true, frame)
             {
                 self.quads.push_tile(tile, layer, view)?;
-                drew_fallback = true;
-            }
-            if !drew_fallback
-                && let Some((layer, meta)) = self.atlas.get_slot(tile, false, frame)
-                && meta.scope_gen == scope_gen
-                && (retain_stale_for_review || mgr.is_tile_valid_at(tile, meta.validated_seq))
+                (true, true)
+            } else if stat_peek.is_some()
+                && let Some((layer, _)) = self.atlas.get_slot(tile, false, frame)
             {
                 self.quads.push_tile(tile, layer, view)?;
-                drew_fallback = true;
-            }
-            if !drew_fallback {
-                drew_fallback = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, uploads, static_uploads_used)?;
-            }
+                (true, true)
+            } else {
+                let fb = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, uploads, static_uploads_used)?;
+                (fb.drew_any, fb.fully_covered)
+            };
             if drew_fallback {
                 counts.fallback_tiles += 1;
-            } else {
+            }
+            if !fully_covered {
                 missing_no_fallback.push(tile);
             }
         }
@@ -721,53 +749,171 @@ impl WorldGpu {
         frame: u64,
         uploads: &mut Vec<PendingUpload>,
         static_uploads_used: &mut usize,
-    ) -> Result<bool> {
-        // Search coarser ancestors (`lod + 1 ..= lod + 6`) first.
-        let max_up = target.lod.saturating_add(6).min(MAX_TILE_LOD);
+    ) -> Result<FallbackResult> {
+        let cur_seq = mgr.edit_seq();
+        // Layer A: pick the best coarse ancestor level (`lod + 1 ..= lod + 8`) without mutating
+        // `atlas` during candidate search, strictly ranking valid ancestors above stale ones so
+        // an ancient rev-0 white tile can never mask newer artwork.
+        struct BackdropCandidate {
+            valid_full: bool,
+            full: bool,
+            all_valid: bool,
+            min_seq: u64,
+            lod: u8,
+            quads: Vec<(TileKey, WorldRect, [f32; 4])>,
+        }
+
+        let max_up = target.lod.saturating_add(8).min(MAX_TILE_LOD);
+        let remaining_uploads = self.budget.max_uploads_per_frame.saturating_sub(*static_uploads_used);
+        let mut best_backdrop: Option<BackdropCandidate> = None;
         for f_lod in (target.lod + 1)..=max_up {
             let quads = fallback_quads(target, f_lod, 4);
             if quads.is_empty() {
                 continue;
             }
-            let mut resolved = Vec::with_capacity(quads.len());
+            let mut resolved_count = 0usize;
+            let mut all_valid = true;
+            let mut min_seq = u64::MAX;
+            let mut uploads_needed = 0usize;
+            for &(fkey, _, _) in &quads {
+                let stat = self.atlas.peek_slot(fkey, false).filter(|(_, m)| m.scope_gen == scope_gen);
+                let dynm = self.atlas.peek_slot(fkey, true).filter(|(_, m)| m.scope_gen == scope_gen && !m.provisional);
+                let stat_valid = stat.is_some_and(|(_, m)| mgr.is_tile_valid_at(fkey, m.validated_seq));
+                let dyn_valid = dynm.is_some_and(|(_, m)| mgr.is_tile_valid_at(fkey, m.validated_seq));
+                if stat_valid || dyn_valid {
+                    resolved_count += 1;
+                    min_seq = min_seq.min(cur_seq);
+                } else if uploads_needed < remaining_uploads && mgr.has_valid_cpu_tile(fkey) {
+                    resolved_count += 1;
+                    uploads_needed += 1;
+                    min_seq = min_seq.min(cur_seq);
+                } else if let Some((_, m)) = best_resident_meta(stat, dynm) {
+                    resolved_count += 1;
+                    all_valid = false;
+                    min_seq = min_seq.min(m.validated_seq);
+                } else {
+                    all_valid = false;
+                }
+            }
+            if resolved_count == 0 {
+                continue;
+            }
+            let full = resolved_count == quads.len();
+            let valid_full = full && all_valid;
+            let rank = (valid_full, full, all_valid, min_seq, std::cmp::Reverse(f_lod));
+            let better = best_backdrop.as_ref().is_none_or(|b| rank > (b.valid_full, b.full, b.all_valid, b.min_seq, std::cmp::Reverse(b.lod)));
+            if better {
+                best_backdrop = Some(BackdropCandidate { valid_full, full, all_valid, min_seq, lod: f_lod, quads });
+                if valid_full {
+                    break;
+                }
+            }
+        }
+
+        let mut backdrop_quads: Vec<(WorldRect, [f32; 4], u32)> = Vec::new();
+        let mut backdrop_all_valid = false;
+        let mut backdrop_min_seq = 0u64;
+        if let Some(BackdropCandidate { quads, .. }) = best_backdrop {
+            let expected = quads.len();
+            let mut all_valid = true;
+            let mut min_seq = u64::MAX;
             for (fkey, rect, uv) in quads {
-                if let Some((layer, meta)) = self.atlas.get_slot(fkey, false, frame)
-                    && meta.scope_gen == scope_gen
+                let stat = self.atlas.peek_slot(fkey, false).filter(|(_, m)| m.scope_gen == scope_gen);
+                let dynm = self.atlas.peek_slot(fkey, true).filter(|(_, m)| m.scope_gen == scope_gen && !m.provisional);
+                if let Some((_, m)) = stat
+                    && mgr.is_tile_valid_at(fkey, m.validated_seq)
+                    && let Some((layer, _)) = self.atlas.get_slot(fkey, false, frame)
                 {
-                    resolved.push((rect, uv, layer));
+                    backdrop_quads.push((rect, uv, layer));
+                    min_seq = min_seq.min(cur_seq);
+                } else if let Some((_, m)) = dynm
+                    && mgr.is_tile_valid_at(fkey, m.validated_seq)
+                    && let Some((layer, _)) = self.atlas.get_slot(fkey, true, frame)
+                {
+                    backdrop_quads.push((rect, uv, layer));
+                    min_seq = min_seq.min(cur_seq);
                 } else if *static_uploads_used < self.budget.max_uploads_per_frame
                     && let Some(cpu) = mgr.get_valid_cpu_tile(fkey)
                     && let Some(layer) = self.atlas.allocate(fkey, false, SlotKind::CoarseFallback, cpu.validated_seq, scope_gen, frame)
                 {
                     uploads.push(PendingUpload { layer, rgba8: cpu.rgba8 });
                     *static_uploads_used += 1;
-                    resolved.push((rect, uv, layer));
-                }
-            }
-            if !resolved.is_empty() {
-                for (rect, uv, layer) in resolved {
-                    self.quads.push_rect(rect, uv, layer, view)?;
-                }
-                return Ok(true);
-            }
-        }
-        // Search resident finer children (`lod - 1`) when zooming out.
-        if target.lod > 0 {
-            let quads = fallback_quads(target, target.lod - 1, 4);
-            let mut drew_any = false;
-            for (fkey, rect, uv) in quads {
-                if let Some((layer, meta)) = self.atlas.get_slot(fkey, false, frame)
-                    && meta.scope_gen == scope_gen
+                    backdrop_quads.push((rect, uv, layer));
+                    min_seq = min_seq.min(cpu.validated_seq);
+                } else if let Some((_, meta)) = best_resident_meta(stat, dynm)
+                    && let Some((layer, _)) = self.atlas.get_slot(fkey, meta.dynamic, frame)
                 {
-                    self.quads.push_rect(rect, uv, layer, view)?;
-                    drew_any = true;
+                    backdrop_quads.push((rect, uv, layer));
+                    all_valid = false;
+                    min_seq = min_seq.min(meta.validated_seq);
+                } else {
+                    all_valid = false;
                 }
             }
-            if drew_any {
-                return Ok(true);
+            let backdrop_full = backdrop_quads.len() == expected && expected > 0;
+            backdrop_all_valid = backdrop_full && all_valid;
+            backdrop_min_seq = if backdrop_quads.is_empty() { 0 } else { min_seq };
+        }
+
+        // Layer B: paint sharper/fresher finer children (`lod - 1`, or `lod - 2` on fast wheel zoom-out)
+        // ON TOP of the coarse backdrop using `max_quads = 16` so `1.5625×` cross-depth boundaries
+        // (`3×3 = 9` children) never silently return empty!
+        let mut child_quads: Vec<(WorldRect, [f32; 4], u32)> = Vec::new();
+        let mut children_full = false;
+        let mut children_all_valid = false;
+        for step in [1u8, 2u8] {
+            let Some(child_lod) = target.lod.checked_sub(step) else {
+                continue;
+            };
+            let quads = fallback_quads(target, child_lod, 16);
+            if quads.is_empty() {
+                continue;
+            }
+            let expected = quads.len();
+            let mut all_valid = true;
+            for (fkey, rect, uv) in quads {
+                let stat = self.atlas.peek_slot(fkey, false).filter(|(_, m)| m.scope_gen == scope_gen);
+                let dynm = self.atlas.peek_slot(fkey, true).filter(|(_, m)| m.scope_gen == scope_gen && !m.provisional);
+                let stat_valid = stat.is_some_and(|(_, m)| mgr.is_tile_valid_at(fkey, m.validated_seq));
+                let dyn_valid = dynm.is_some_and(|(_, m)| mgr.is_tile_valid_at(fkey, m.validated_seq));
+                if stat_valid && let Some((layer, _)) = self.atlas.get_slot(fkey, false, frame) {
+                    child_quads.push((rect, uv, layer));
+                } else if dyn_valid && let Some((layer, _)) = self.atlas.get_slot(fkey, true, frame) {
+                    child_quads.push((rect, uv, layer));
+                } else if *static_uploads_used < self.budget.max_uploads_per_frame
+                    && let Some(cpu) = mgr.get_valid_cpu_tile(fkey)
+                    && let Some(layer) = self.atlas.allocate(fkey, false, SlotKind::Static, cpu.validated_seq, scope_gen, frame)
+                {
+                    uploads.push(PendingUpload { layer, rgba8: cpu.rgba8 });
+                    *static_uploads_used += 1;
+                    child_quads.push((rect, uv, layer));
+                } else if let Some((_, meta)) = best_resident_meta(stat, dynm)
+                    && (backdrop_quads.is_empty() || (!backdrop_all_valid && meta.validated_seq > backdrop_min_seq))
+                    && let Some((layer, _)) = self.atlas.get_slot(fkey, meta.dynamic, frame)
+                {
+                    child_quads.push((rect, uv, layer));
+                    all_valid = false;
+                } else {
+                    all_valid = false;
+                }
+            }
+            if !child_quads.is_empty() {
+                children_full = child_quads.len() == expected;
+                children_all_valid = children_full && all_valid;
+                break;
             }
         }
-        Ok(false)
+
+        // Emit Layer A backdrop (unless children already cover 100% of `target`), then Layer B on top.
+        if !children_full {
+            for (rect, uv, layer) in &backdrop_quads {
+                self.quads.push_rect(*rect, *uv, *layer, view)?;
+            }
+        }
+        for (rect, uv, layer) in &child_quads {
+            self.quads.push_rect(*rect, *uv, *layer, view)?;
+        }
+        Ok(FallbackResult { drew_any: !backdrop_quads.is_empty() || !child_quads.is_empty(), fully_covered: backdrop_all_valid || children_all_valid })
     }
 
     #[cfg(test)]
@@ -1195,6 +1341,27 @@ struct AsyncDynCounts {
     anim_pending_tiles: usize,
     pending_tiles: usize,
     fallback_tiles: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FallbackResult {
+    drew_any: bool,
+    fully_covered: bool,
+}
+
+fn best_resident_meta(stat: Option<(u32, SlotMeta)>, dynm: Option<(u32, SlotMeta)>) -> Option<(u32, SlotMeta)> {
+    match (stat, dynm) {
+        (Some(s), Some(d)) => {
+            if d.1.validated_seq >= s.1.validated_seq {
+                Some(d)
+            } else {
+                Some(s)
+            }
+        }
+        (Some(s), None) => Some(s),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    }
 }
 
 fn preregister_visible_anim_frames(

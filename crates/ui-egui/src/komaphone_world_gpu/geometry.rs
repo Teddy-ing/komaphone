@@ -28,6 +28,7 @@ pub(super) struct SlotMeta {
     pub last_frame: u64,
     pub kind: SlotKind,
     pub dynamic_sig: u64,
+    pub provisional: bool,
 }
 
 /// Manages `N` (`256` desktop / `128` conservative) array layers of the `260×260×N`
@@ -52,6 +53,11 @@ impl TileAtlas {
         self.lookup.len()
     }
 
+    pub fn peek_slot(&self, tile: TileKey, dynamic: bool) -> Option<(u32, SlotMeta)> {
+        let layer = *self.lookup.get(&(tile, dynamic))?;
+        self.slots.get(layer as usize).and_then(|slot| *slot).map(|meta| (layer, meta))
+    }
+
     pub fn get_slot(&mut self, tile: TileKey, dynamic: bool, frame: u64) -> Option<(u32, SlotMeta)> {
         let layer = *self.lookup.get(&(tile, dynamic))?;
         if let Some(Some(meta)) = self.slots.get_mut(layer as usize) {
@@ -74,19 +80,25 @@ impl TileAtlas {
         }
     }
 
+    pub fn set_provisional(&mut self, layer: u32, provisional: bool) {
+        if let Some(Some(meta)) = self.slots.get_mut(layer as usize) {
+            meta.provisional = provisional;
+        }
+    }
+
     /// Allocate or reuse a GPU texture array layer for `(tile, dynamic)`.
     /// Never evicts a layer touched during `frame`; protects reserved fallback and dynamic quotas.
     pub fn allocate(&mut self, tile: TileKey, dynamic: bool, kind: SlotKind, validated_seq: u64, scope_gen: u64, frame: u64) -> Option<u32> {
         if let Some(&existing) = self.lookup.get(&(tile, dynamic)) {
             if let Some(slot) = self.slots.get_mut(existing as usize) {
-                *slot = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0 });
+                *slot = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0, provisional: false });
             }
             return Some(existing);
         }
         // 1. Prefer any completely free slot.
         if let Some(idx) = self.slots.iter().position(Option::is_none) {
             let layer = idx as u32;
-            self.slots[idx] = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0 });
+            self.slots[idx] = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0, provisional: false });
             self.lookup.insert((tile, dynamic), layer);
             return Some(layer);
         }
@@ -106,7 +118,7 @@ impl TileAtlas {
         }
         let layer = victim as u32;
         if let Some(slot) = self.slots.get_mut(victim) {
-            *slot = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0 });
+            *slot = Some(SlotMeta { tile, dynamic, validated_seq, scope_gen, last_frame: frame, kind, dynamic_sig: 0, provisional: false });
         }
         self.lookup.insert((tile, dynamic), layer);
         Some(layer)

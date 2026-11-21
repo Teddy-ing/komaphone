@@ -35,6 +35,9 @@ pub(super) fn prune(app: &PhotocraftApp, ctx: &egui::Context) {
 pub(super) fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui, canvas: scene::CanvasId) {
     let image = app.session.world_thumbnail(canvas).ok().flatten();
     let response = if let Some(image) = image.filter(|image| image.width == 160 && image.height == 100 && image.rgba.len() == 64_000) {
+        if app.session.worlds.thumbnails.is_pending(canvas) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         let cached = ui.ctx().data(|data| data.get_temp::<Cache>(cache_id()).and_then(|cache| cache.images.get(&canvas).cloned()));
         let handle = match cached {
             Some(cached) if Arc::ptr_eq(&cached.image, &image) => cached.handle,

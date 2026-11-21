@@ -135,13 +135,19 @@ fn prepare_incremental(request: &Request, cached: &mut Option<(Key, WorldRendere
         && prev_key.scope == request.key.scope
     {
         match (&prev_key.revision, &request.key.revision) {
-            (Revision::Live { display: old_disp, pending: old_pending, .. }, Revision::Live { display: new_disp, pending: new_pending, .. })
+            (Revision::Live { display: old_disp, pending: old_pending, .. }, Revision::Live { display: new_disp, .. })
                 if request.source.revision == *new_disp
-                    && *new_disp > *old_disp
+                    && *new_disp >= *old_disp
                     && *new_disp - *old_disp <= 64
-                    && (*old_pending == 0 || *new_pending >= *old_pending)
-                    && same_history_tip(prev_renderer.world(), &request.source, *old_disp) =>
+                    && same_history_prefix(prev_renderer.world(), &request.source, *old_disp, *old_pending) =>
             {
+                if *new_disp == *old_disp {
+                    // Server ACK of an already-displayed optimistic revision with bit-identical
+                    // history: skip full WorldRenderer rebuild and emit zero dirty rects so all
+                    // GPU/CPU tiles and DynamicSplitCache bands stay 100% warm and valid!
+                    *prev_key = request.key.clone();
+                    return (Ok(prev_renderer.clone()), Some(Vec::new()));
+                }
                 let delta = (*new_disp - *old_disp) as usize;
                 if let Ok(events) = request.source.events_after(*old_disp, delta) {
                     let mut dirty = Vec::new();
@@ -186,13 +192,42 @@ fn prepare_incremental(request: &Request, cached: &mut Option<(Key, WorldRendere
     }
 }
 
-fn same_history_tip(old: &WorldState, new: &WorldState, rev: u64) -> bool {
-    if rev == 0 {
-        return true;
+/// Verify that `old` (at revision `rev`, with `old_pending` optimistic ops) and `new` share the
+/// exact same history through `rev` so incremental apply or zero-dirty ACK reuse cannot mask a
+/// reordered, conflicted, or checkpoint-rebased history.
+fn same_history_prefix(old: &WorldState, new: &WorldState, rev: u64, old_pending: usize) -> bool {
+    if old.canvas != new.canvas || old.owner != new.owner || old.base_revision() != new.base_revision() || old.revision != rev || new.revision < rev {
+        return false;
     }
-    let old_tip = old.events_after(rev - 1, 1).ok().and_then(|s| s.first()).map(|e| e.op.id);
-    let new_tip = new.events_after(rev - 1, 1).ok().and_then(|s| s.first()).map(|e| e.op.id);
-    old_tip.is_some() && old_tip == new_tip
+    let base = old.base_revision();
+    if rev == base {
+        return old_pending == 0
+            && old.schema == new.schema
+            && old.name == new.name
+            && old.strokes.len() == new.strokes.len()
+            && old.media.len() == new.media.len()
+            && old.tours.len() == new.tours.len()
+            && old.point_count() == new.point_count();
+    }
+    // Conservatively rebuild if more than one bounded event page of pending ops existed.
+    if old_pending >= 255 {
+        return false;
+    }
+    let check_count = (old_pending as u64).saturating_add(1);
+    let start = rev.saturating_sub(check_count).max(base);
+    let Ok(count) = usize::try_from(rev.saturating_sub(start)) else {
+        return false;
+    };
+    if count == 0 {
+        return false;
+    }
+    let Ok(old_tail) = old.events_after(start, count) else {
+        return false;
+    };
+    let Ok(new_tail) = new.events_after(start, count) else {
+        return false;
+    };
+    old_tail.len() == count && new_tail.len() == count && old_tail.iter().zip(new_tail).all(|(a, b)| a.revision == b.revision && a.op.id == b.op.id)
 }
 
 fn prepare(request: &Request) -> Result<WorldRenderer, String> {

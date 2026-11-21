@@ -60,6 +60,11 @@ pub struct TileComposeResult {
     /// peer previews, or Erase/Behind/non-Normal blend modes) and returned a fast non-blocking
     /// preview while `WarmSplitBands` populates the exact `[f32; 4]` bands off-thread.
     pub used_cold_split_fallback: bool,
+    /// True when a UI-thread live-brush composition did not yet have an exact valid committed
+    /// base tile for the current `edit_seq` and composited onto a non-white provisional fallback
+    /// (live handoff, previous cached tile, or resampled ancestor/child) while the static tile
+    /// finishes rasterizing off-thread.
+    pub used_stale_base: bool,
 }
 
 /// Double-double (`106`-bit) helper matching `world_brush.rs` and `photocraft_scene::render`
@@ -317,16 +322,18 @@ pub(crate) fn compose_world_tile_shared_prefer_cached_anim(
 pub struct LiveColdBase<'a> {
     pub rgba8: Option<&'a [u8]>,
     pub is_exact_anim: bool,
+    pub is_exact_static: bool,
 }
 
 /// UI-thread non-blocking live-brush composition:
 /// - Fast path A: associative `SrcOver` on topmost `local_dev` with no peer previews composites
-///   directly onto `base.rgba8` in `~0.1 ms` (exact W4 order, zero `DynamicSplitCache` churn).
+///   directly onto `base.rgba8` in `~0.1 ms` (exact W4 order when `is_exact_static`, or immediate
+///   non-white provisional preview while the static tile finishes off-thread; zero `DynamicSplitCache` churn).
 /// - Fast path B: when all required `DynamicSplitCache` split bands are warm, runs bit-exact
 ///   `[f32; 4]` W4 composition in `~0.5–1.5 ms`.
 /// - Cold path C: never rasterizes committed static bands on the UI thread; returns an immediate
-///   non-blocking preview (`used_cold_split_fallback = true`) so the caller schedules off-thread
-///   `WarmSplitBands` and snaps to bit-exact W4 output as soon as the worker finishes.
+///   non-blocking preview (`used_cold_split_fallback = true`) using the best non-white base while
+///   `WarmSplitBands` populates the exact `[f32; 4]` bands off-thread.
 pub(crate) fn compose_world_tile_nonblocking_live(
     params: &TileComposeParams<'_>,
     local_stroke_id: StrokeId,
@@ -337,6 +344,8 @@ pub(crate) fn compose_world_tile_nonblocking_live(
     let query = params.index.query_tile(params.tile);
     let tile_rect = params.tile.physical_rect();
     let per_device = build_device_plan(params.index, &query, tile_rect, params.previews)?;
+    let any_committed = per_device.values().any(|w| w.items.iter().any(|&(_, kind, _)| kind != 3));
+    let base_is_exact_static = base.is_exact_static || !any_committed;
     let Some(local_shared) = params.previews.iter().find(|p| p.visible && p.stroke.id == local_stroke_id) else {
         let rgba8 = base.rgba8.map_or_else(|| vec![255u8; TILE_PIXELS * 4], |b| b.to_vec());
         return Ok(TileComposeResult {
@@ -347,13 +356,13 @@ pub(crate) fn compose_world_tile_nonblocking_live(
             cancelled: false,
             used_stale_anim_cache: !base.is_exact_anim,
             used_cold_split_fallback: false,
+            used_stale_base: !base_is_exact_static,
         });
     };
     let local_dev = local_shared.device;
     let has_devices_after_local = per_device.keys().any(|&d| d > local_dev);
     let has_peer_previews = per_device.iter().any(|(&d, w)| d != local_dev && w.has_preview);
     let local_has_committed = per_device.get(&local_dev).is_some_and(|w| w.items.iter().any(|&(_, kind, _)| kind != 3));
-    let any_committed = per_device.values().any(|w| w.items.iter().any(|&(_, kind, _)| kind != 3));
     let is_pure_src_over =
         !local_shared.stroke.erase
             && local_shared.stroke.brush.as_deref().is_none_or(|b| {
@@ -375,16 +384,17 @@ pub(crate) fn compose_world_tile_nonblocking_live(
             cancelled: false,
             used_stale_anim_cache: !base.is_exact_anim,
             used_cold_split_fallback: false,
+            used_stale_base: !base_is_exact_static,
         });
     }
 
     // Associative pure SrcOver on topmost device with no overlapping peer previews:
     // `SrcOver(committed_tile, live_stroke)` is W4-exact and never touches `DynamicSplitCache`.
-    if is_pure_src_over
-        && !has_devices_after_local
-        && !has_peer_previews
-        && let Some(base_bytes) = base.rgba8
-    {
+    // Even if the static committed tile for `edit_seq` is still rendering off-thread, composite
+    // onto our non-white fallback base (`used_stale_base = true`) instead of falling into
+    // `WarmSplitBands` or painting onto blank white!
+    if is_pure_src_over && !has_devices_after_local && !has_peer_previews {
+        let base_bytes = base.rgba8.unwrap_or(&[]);
         let rgba8 = composite_live_stroke_onto_rgba8(params.tile, &local_shared.stroke, params.live_brush, base_bytes, all_aliased)?;
         return Ok(TileComposeResult {
             rgba8,
@@ -394,6 +404,7 @@ pub(crate) fn compose_world_tile_nonblocking_live(
             cancelled: false,
             used_stale_anim_cache: !base.is_exact_anim,
             used_cold_split_fallback: false,
+            used_stale_base: !base_is_exact_static,
         });
     }
 
@@ -425,6 +436,7 @@ pub(crate) fn compose_world_tile_nonblocking_live(
         cancelled: false,
         used_stale_anim_cache: !base.is_exact_anim,
         used_cold_split_fallback: true,
+        used_stale_base: !base_is_exact_static,
     })
 }
 
@@ -583,6 +595,7 @@ fn compose_world_tile_inner(
             cancelled: false,
             used_stale_anim_cache: false,
             used_cold_split_fallback: false,
+            used_stale_base: false,
         });
     }
 
@@ -636,6 +649,7 @@ fn compose_world_tile_inner(
         cancelled: false,
         used_stale_anim_cache,
         used_cold_split_fallback: false,
+        used_stale_base: false,
     })
 }
 
@@ -648,6 +662,7 @@ fn cancelled_result() -> TileComposeResult {
         cancelled: true,
         used_stale_anim_cache: false,
         used_cold_split_fallback: false,
+        used_stale_base: false,
     }
 }
 

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use photocraft_scene::shared::media::{AssetHash, MediaFrame};
 use photocraft_scene::shared::{DeviceId, SharedStroke};
 use photocraft_scene::spatial::{
-    GPU_LAYERS_CONSERVATIVE, GPU_LAYERS_DESKTOP, MAX_TILE_LOD, MAX_VISIBLE_TILES_CONSERVATIVE, MAX_VISIBLE_TILES_DESKTOP, TILE_PHYSICAL, TileKey, WorldRect,
-    tile_bounds_for_rect, viewport_world_rect,
+    GPU_LAYERS_CONSERVATIVE, GPU_LAYERS_DESKTOP, MAX_TILE_LOD, MAX_VISIBLE_TILES_CONSERVATIVE, MAX_VISIBLE_TILES_DESKTOP, TILE_APRON, TILE_PHYSICAL, TileKey,
+    WorldRect, fallback_quads, pixel_ticks, tile_bounds_for_rect, tile_span, viewport_world_rect,
 };
 use photocraft_scene::{CanvasId, StrokeId, Viewport};
 
@@ -24,6 +24,7 @@ const TILE_RGBA_BYTES: usize = (TILE_PHYSICAL * TILE_PHYSICAL * 4) as usize;
 const MAX_DIRTY_LOG: usize = 256;
 const MAX_QUEUED_JOBS: usize = 256;
 const MAX_QUEUED_DYNAMIC_JOBS: usize = 64;
+const MAX_COARSE_PREFETCH_TILES: usize = 16;
 
 /// Process-wide monotonic scope generation so distinct `WorldTileManager` instances
 /// never collide on `scope_gen` when sharing a `WorldGpu` presenter.
@@ -59,9 +60,9 @@ impl TileBudget {
             max_visible_tiles: MAX_VISIBLE_TILES_DESKTOP,
             reserved_fallback_slots: 32,
             reserved_dynamic_slots: 32,
-            max_uploads_per_frame: 6,
+            max_uploads_per_frame: 12,
             staging_ring_bytes: 4 * 1024 * 1024,
-            cpu_cache_bytes: 112 * 1024 * 1024,
+            cpu_cache_bytes: 104 * 1024 * 1024,
             dynamic_split_bytes: 64 * 1024 * 1024,
             dynamic_tile_cache_bytes: 16 * 1024 * 1024,
             decoded_media_bytes: 32 * 1024 * 1024,
@@ -77,9 +78,9 @@ impl TileBudget {
             max_visible_tiles: MAX_VISIBLE_TILES_CONSERVATIVE,
             reserved_fallback_slots: 16,
             reserved_dynamic_slots: 16,
-            max_uploads_per_frame: 4,
+            max_uploads_per_frame: 6,
             staging_ring_bytes: 2 * 1024 * 1024,
-            cpu_cache_bytes: 56 * 1024 * 1024,
+            cpu_cache_bytes: 52 * 1024 * 1024,
             dynamic_split_bytes: 44 * 1024 * 1024,
             dynamic_tile_cache_bytes: 12 * 1024 * 1024,
             decoded_media_bytes: 16 * 1024 * 1024,
@@ -883,6 +884,12 @@ pub struct WorldTileManager {
     dynamic_cache: BTreeMap<TileKey, CachedDynamicTile>,
     dynamic_lru: VecDeque<TileKey>,
     dynamic_bytes: usize,
+    /// Bounded handoff of the most recent non-provisional local live-brush RGBA8 per tile,
+    /// keyed with the stroke ID that produced it so rapid consecutive strokes paint onto
+    /// the just-finished artwork while the static worker finishes off-thread (never double-applying
+    /// the same `StrokeId`).
+    live_handoff: BTreeMap<TileKey, (StrokeId, u64, Arc<Vec<u8>>)>,
+    live_handoff_lru: VecDeque<TileKey>,
     split_cache: Arc<std::sync::Mutex<DynamicSplitCache>>,
     #[cfg(not(target_arch = "wasm32"))]
     pool: pool::WorkerPool,
@@ -930,6 +937,8 @@ impl WorldTileManager {
             dynamic_cache: BTreeMap::new(),
             dynamic_lru: VecDeque::new(),
             dynamic_bytes: 0,
+            live_handoff: BTreeMap::new(),
+            live_handoff_lru: VecDeque::new(),
             split_cache,
             #[cfg(not(target_arch = "wasm32"))]
             pool,
@@ -1009,6 +1018,8 @@ impl WorldTileManager {
         self.dynamic_cache.clear();
         self.dynamic_lru.clear();
         self.dynamic_bytes = 0;
+        self.live_handoff.clear();
+        self.live_handoff_lru.clear();
         self.split_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
@@ -1025,6 +1036,8 @@ impl WorldTileManager {
             }
             None => {
                 self.dirty_log.invalidate_all();
+                self.live_handoff.clear();
+                self.live_handoff_lru.clear();
                 self.split_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
             }
         }
@@ -1091,6 +1104,14 @@ impl WorldTileManager {
         if TILE_RGBA_BYTES > self.budget.cpu_cache_bytes {
             return;
         }
+        if let Some((_, handoff_seq, _)) = self.live_handoff.get(&tile)
+            && entry.validated_seq > *handoff_seq
+        {
+            self.live_handoff.remove(&tile);
+            if let Some(pos) = self.live_handoff_lru.iter().position(|t| *t == tile) {
+                self.live_handoff_lru.remove(pos);
+            }
+        }
         let already = self.cpu_cache.contains_key(&tile);
         if !already {
             while self.cpu_bytes.saturating_add(TILE_RGBA_BYTES) > self.budget.cpu_cache_bytes {
@@ -1105,6 +1126,168 @@ impl WorldTileManager {
         }
         self.cpu_cache.insert(tile, entry);
         self.touch_lru(tile);
+    }
+
+    /// Read-only check whether `tile` currently has a valid entry in `cpu_cache`.
+    pub fn has_valid_cpu_tile(&self, tile: TileKey) -> bool {
+        self.cpu_cache.get(&tile).is_some_and(|c| self.dirty_log.is_tile_valid(tile, c.validated_seq))
+    }
+
+    /// Record a freshly composed non-provisional local live-brush tile so a rapid follow-up
+    /// stroke on the same tile paints onto the just-finished artwork while the static worker
+    /// renders the committed tile off-thread.
+    pub fn record_live_handoff(&mut self, tile: TileKey, stroke_id: StrokeId, base_seq: u64, rgba8: Arc<Vec<u8>>) {
+        if rgba8.len() != TILE_RGBA_BYTES {
+            return;
+        }
+        let max_entries = if self.budget.gpu_layers >= GPU_LAYERS_DESKTOP { 30usize } else { 15usize };
+        let already = self.live_handoff.contains_key(&tile);
+        if !already {
+            while self.live_handoff.len() >= max_entries {
+                let Some(oldest) = self.live_handoff_lru.pop_front() else {
+                    break;
+                };
+                self.live_handoff.remove(&oldest);
+            }
+        }
+        self.live_handoff.insert(tile, (stroke_id, base_seq, rgba8));
+        if let Some(pos) = self.live_handoff_lru.iter().position(|t| *t == tile) {
+            self.live_handoff_lru.remove(pos);
+        }
+        self.live_handoff_lru.push_back(tile);
+    }
+
+    fn get_live_handoff_for_next_stroke(&self, tile: TileKey, current_stroke_id: StrokeId) -> Option<(u64, Arc<Vec<u8>>)> {
+        let (sid, base_seq, rgba8) = self.live_handoff.get(&tile)?;
+        if *sid == current_stroke_id || *base_seq < self.dirty_log.full_invalidation_seq {
+            return None;
+        }
+        Some((*base_seq, Arc::clone(rgba8)))
+    }
+
+    /// Synthesize a temporary `260×260` RGBA8 base for `tile` by sampling the freshest cached
+    /// coarse ancestor (`lod + 1 ..= lod + 6`) or finer children (`lod - 1`) in `cpu_cache`.
+    /// Prevents live drawing from ever flashing blank white when entering a freshly zoomed tile.
+    pub fn synthesize_fallback_rgba8(&self, tile: TileKey) -> Option<Arc<Vec<u8>>> {
+        let side = TILE_PHYSICAL as usize;
+        let pt = pixel_ticks(tile.lod);
+        let span = tile_span(tile.lod);
+        let apron_ticks = pt.saturating_mul(i128::from(TILE_APRON));
+        let ox = tile.tx.saturating_mul(span).saturating_sub(apron_ticks);
+        let oy = tile.ty.saturating_mul(span).saturating_sub(apron_ticks);
+        let half_pt = pt / 2;
+
+        struct FallbackCandidate {
+            valid: bool,
+            full: bool,
+            min_seq: u64,
+            lod: u8,
+            sources: Vec<(TileKey, Arc<Vec<u8>>)>,
+        }
+
+        // 1. Prefer the nearest coarse ancestor level (`lod + 1 ..= lod + 6`) with cached tiles,
+        //    ranking valid ancestors strictly ahead of stale ones.
+        let max_up = tile.lod.saturating_add(6).min(MAX_TILE_LOD);
+        let mut best_sources: Option<FallbackCandidate> = None;
+        for f_lod in (tile.lod + 1)..=max_up {
+            let quads = fallback_quads(tile, f_lod, 4);
+            if quads.is_empty() {
+                continue;
+            }
+            let mut found = Vec::with_capacity(quads.len());
+            let mut all_valid = true;
+            let mut min_seq = u64::MAX;
+            for (fkey, _, _) in &quads {
+                if let Some(cached) = self.cpu_cache.get(fkey)
+                    && cached.rgba8.len() == TILE_RGBA_BYTES
+                {
+                    if !self.dirty_log.is_tile_valid(*fkey, cached.validated_seq) {
+                        all_valid = false;
+                    }
+                    min_seq = min_seq.min(cached.validated_seq);
+                    found.push((*fkey, Arc::clone(&cached.rgba8)));
+                }
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let full = found.len() == quads.len();
+            let valid = full && all_valid;
+            let cand_rank = (valid, full, min_seq);
+            let better = best_sources.as_ref().is_none_or(|b| (cand_rank, std::cmp::Reverse(f_lod)) > ((b.valid, b.full, b.min_seq), std::cmp::Reverse(b.lod)));
+            if better {
+                best_sources = Some(FallbackCandidate { valid, full, min_seq, lod: f_lod, sources: found });
+                if valid {
+                    break;
+                }
+            }
+        }
+
+        // 2. Also consider cached `lod - 1` children when no valid ancestor exists.
+        if best_sources.as_ref().is_none_or(|b| !b.valid) && tile.lod > 0 {
+            let child_lod = tile.lod - 1;
+            let quads = fallback_quads(tile, child_lod, 16);
+            if !quads.is_empty() {
+                let mut found = Vec::with_capacity(quads.len());
+                let mut all_valid = true;
+                let mut min_seq = u64::MAX;
+                for (fkey, _, _) in &quads {
+                    if let Some(cached) = self.cpu_cache.get(fkey)
+                        && cached.rgba8.len() == TILE_RGBA_BYTES
+                    {
+                        if !self.dirty_log.is_tile_valid(*fkey, cached.validated_seq) {
+                            all_valid = false;
+                        }
+                        min_seq = min_seq.min(cached.validated_seq);
+                        found.push((*fkey, Arc::clone(&cached.rgba8)));
+                    }
+                }
+                if !found.is_empty() {
+                    let full = found.len() == quads.len();
+                    let valid = full && all_valid;
+                    let take_children = best_sources.as_ref().is_none_or(|b| (valid, full, min_seq) > (b.valid, b.full, b.min_seq));
+                    if take_children {
+                        best_sources = Some(FallbackCandidate { valid, full, min_seq, lod: child_lod, sources: found });
+                    }
+                }
+            }
+        }
+
+        let FallbackCandidate { lod: src_lod, sources, .. } = best_sources?;
+        let src_pt = pixel_ticks(src_lod);
+        let src_span = tile_span(src_lod);
+        let src_apron = src_pt.saturating_mul(i128::from(TILE_APRON));
+        if src_pt <= 0 || src_span <= 0 {
+            return None;
+        }
+        let mut out = vec![255u8; TILE_RGBA_BYTES];
+        let mut sampled_any = false;
+        let max_idx = i128::from(TILE_PHYSICAL.saturating_sub(1));
+
+        for py in 0..side {
+            let wy = oy.saturating_add((py as i128).saturating_mul(pt)).saturating_add(half_pt);
+            let fty = wy.div_euclid(src_span);
+            let row_off = py * side * 4;
+            for px in 0..side {
+                let wx = ox.saturating_add((px as i128).saturating_mul(pt)).saturating_add(half_pt);
+                let ftx = wx.div_euclid(src_span);
+                let key = TileKey { lod: src_lod, tx: ftx, ty: fty };
+                let Some((_, src_rgba)) = sources.iter().find(|(k, _)| *k == key) else {
+                    continue;
+                };
+                let f_ox = ftx.saturating_mul(src_span).saturating_sub(src_apron);
+                let f_oy = fty.saturating_mul(src_span).saturating_sub(src_apron);
+                let sx = wx.saturating_sub(f_ox).div_euclid(src_pt).clamp(0, max_idx) as usize;
+                let sy = wy.saturating_sub(f_oy).div_euclid(src_pt).clamp(0, max_idx) as usize;
+                let src_off = (sy * side + sx) * 4;
+                let dst_off = row_off + px * 4;
+                if let (Some(src), Some(dst)) = (src_rgba.get(src_off..src_off + 4), out.get_mut(dst_off..dst_off + 4)) {
+                    dst.copy_from_slice(src);
+                    sampled_any = true;
+                }
+            }
+        }
+        sampled_any.then(|| Arc::new(out))
     }
 
     fn touch_dynamic_lru(&mut self, tile: TileKey) {
@@ -1300,8 +1483,14 @@ impl WorldTileManager {
     }
 
     /// Schedule missing visible tiles, cold `lod + 2` preview tiles (when no fallback exists),
-    /// and a 1-tile pan prefetch ring around `view` without blocking the UI thread.
+    /// and a 1-tile pan prefetch ring + coarse zoom-out parents around `view` without blocking the UI thread.
     pub fn schedule_view(&mut self, view: &Viewport, target_lod: u8, visible: &[TileKey], missing_no_fallback: &[TileKey]) {
+        self.schedule_view_interactive(view, target_lod, visible, missing_no_fallback, true);
+    }
+
+    /// Schedule missing visible tiles and (when `allow_prefetch` is true and visible tiles are
+    /// already crisp) warm covering `lod + 1` / `lod + 2` zoom-out parents plus a 1-tile pan ring.
+    pub fn schedule_view_interactive(&mut self, view: &Viewport, target_lod: u8, visible: &[TileKey], missing_no_fallback: &[TileKey], allow_prefetch: bool) {
         let Some(scene) = self.scene.as_ref().map(Arc::clone) else {
             return;
         };
@@ -1311,9 +1500,33 @@ impl WorldTileManager {
 
         let mut active_set: BTreeSet<TileKey> = visible.iter().copied().collect();
 
-        // Compute 1-tile prefetch ring around viewport at `target_lod`.
+        // Compute coarse zoom-out parents (`lod + 1`, `lod + 2`, bounded) and 1-tile pan prefetch ring.
         let mut prefetch = Vec::new();
-        if let Ok(rect) = viewport_world_rect(view) {
+        if allow_prefetch && let Ok(rect) = viewport_world_rect(view) {
+            let mut coarse_added = 0usize;
+            for delta in [1u8, 2u8] {
+                let Some(c_lod) = target_lod.checked_add(delta).filter(|&l| l <= MAX_TILE_LOD) else {
+                    continue;
+                };
+                let (cx0, cx1, cy0, cy1) = tile_bounds_for_rect(rect, c_lod);
+                let nx = cx1.saturating_sub(cx0).saturating_add(1);
+                let ny = cy1.saturating_sub(cy0).saturating_add(1);
+                if nx <= 0 || ny <= 0 || nx.saturating_mul(ny) > MAX_COARSE_PREFETCH_TILES as i128 {
+                    continue;
+                }
+                for cy in cy0..=cy1 {
+                    for cx in cx0..=cx1 {
+                        if coarse_added >= MAX_COARSE_PREFETCH_TILES {
+                            break;
+                        }
+                        let k = TileKey { lod: c_lod, tx: cx, ty: cy };
+                        if active_set.insert(k) {
+                            prefetch.push(k);
+                            coarse_added += 1;
+                        }
+                    }
+                }
+            }
             let (tx0, tx1, ty0, ty1) = tile_bounds_for_rect(rect, target_lod);
             for ty in (ty0 - 1)..=(ty1 + 1) {
                 for tx in (tx0 - 1)..=(tx1 + 1) {
@@ -1327,7 +1540,7 @@ impl WorldTileManager {
             }
         }
 
-        // Compute cold coarse `lod + 2` preview tiles ONLY for visible tiles lacking any fallback.
+        // Compute cold coarse `lod + 2` preview tiles ONLY for visible tiles lacking any valid full fallback.
         let mut cold_coarse = BTreeSet::new();
         if !missing_no_fallback.is_empty() && target_lod.saturating_add(2) <= MAX_TILE_LOD {
             let coarse_lod = target_lod.saturating_add(2);
@@ -1372,7 +1585,7 @@ impl WorldTileManager {
                     kind: pool::JobKind::Static,
                 });
             }
-            if missing_visible_count == 0 {
+            if missing_visible_count == 0 && allow_prefetch {
                 for (rank, &pkey) in prefetch.iter().enumerate() {
                     if self.get_valid_cpu_tile(pkey).is_some() {
                         continue;
@@ -1627,34 +1840,50 @@ impl WorldTileManager {
         let cur_seq = self.dirty_log.current_seq();
 
         // Snapshot each tile's cached committed RGBA8 base before dispatching (touches LRU cleanly).
-        let prepared: Vec<(TileKey, Option<Arc<Vec<u8>>>, bool, Option<(StrokeId, &'a RasterizedBrushStroke)>)> = items
+        // When `tile` does not yet have a valid committed tile for `cur_seq` (e.g., rapid consecutive
+        // strokes or drawing right after zoom), fall back to the prior live-stroke handoff, stale
+        // cached tile, or resampled ancestor/child so we NEVER composite a live stroke onto pure white!
+        let prepared: Vec<(TileKey, Option<Arc<Vec<u8>>>, bool, bool, Option<(StrokeId, &'a RasterizedBrushStroke)>)> = items
             .iter()
             .map(|&(tile, bg_sig, has_anim, live_brush)| {
-                let (base_arc, exact_anim) = if has_anim {
+                let (base_arc, exact_anim, exact_static) = if has_anim {
                     if bg_sig != 0
                         && let Some(hit) = self.get_valid_dynamic_tile(tile, bg_sig)
                     {
-                        (Some(hit.rgba8), true)
+                        (Some(hit.rgba8), true, true)
                     } else if let Some(prev) = self.get_any_valid_dynamic_tile(tile) {
-                        (Some(prev.rgba8), false)
+                        (Some(prev.rgba8), false, true)
                     } else if let Some(cpu) = self.get_valid_cpu_tile(tile) {
-                        (Some(cpu.rgba8), false)
+                        (Some(cpu.rgba8), false, true)
                     } else {
-                        (None, false)
+                        let fallback = self
+                            .get_live_handoff_for_next_stroke(tile, local_stroke_id)
+                            .map(|(_, b)| b)
+                            .or_else(|| self.get_any_cpu_tile(tile).map(|c| c.rgba8))
+                            .or_else(|| self.synthesize_fallback_rgba8(tile));
+                        (fallback, false, false)
                     }
                 } else if let Some(cpu) = self.get_valid_cpu_tile(tile) {
-                    (Some(cpu.rgba8), true)
+                    (Some(cpu.rgba8), true, true)
                 } else {
-                    (None, true)
+                    let stale_cpu = self.get_any_cpu_tile(tile);
+                    let cpu_seq = stale_cpu.as_ref().map_or(0, |c| c.validated_seq);
+                    let fallback = self
+                        .get_live_handoff_for_next_stroke(tile, local_stroke_id)
+                        .filter(|(h_seq, _)| *h_seq >= cpu_seq)
+                        .map(|(_, b)| b)
+                        .or_else(|| stale_cpu.map(|c| c.rgba8))
+                        .or_else(|| self.synthesize_fallback_rgba8(tile));
+                    (fallback, true, false)
                 };
-                (tile, base_arc, exact_anim, live_brush)
+                (tile, base_arc, exact_anim, exact_static, live_brush)
             })
             .collect();
 
         #[cfg(not(target_arch = "wasm32"))]
         if prepared.len() >= 2 {
             use rayon::prelude::*;
-            for &(tile, _, _, _) in &prepared {
+            for &(tile, _, _, _, _) in &prepared {
                 for id in scene.query_world_rect_media(tile.physical_rect()) {
                     if let Some(shared) = scene.world().media.get(&id)
                         && let Ok((_, frame)) = shared.media.frame_at(elapsed_ms)
@@ -1669,7 +1898,7 @@ impl WorldTileManager {
             let split_cache = &self.split_cache;
             let results: Vec<Result<(TileKey, TileComposeResult)>> = prepared
                 .par_iter()
-                .map(|(tile, base_arc, exact_anim, live_brush)| {
+                .map(|(tile, base_arc, exact_anim, exact_static, live_brush)| {
                     let params = TileComposeParams {
                         index: &scene,
                         tile: *tile,
@@ -1681,7 +1910,7 @@ impl WorldTileManager {
                         allow_parallel_brush: false,
                         cancel: None,
                     };
-                    let base = LiveColdBase { rgba8: base_arc.as_deref().map(Vec::as_slice), is_exact_anim: *exact_anim };
+                    let base = LiveColdBase { rgba8: base_arc.as_deref().map(Vec::as_slice), is_exact_anim: *exact_anim, is_exact_static: *exact_static };
                     let mut resolver = |mf: &MediaFrame| Ok(media_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&mf.hash));
                     let res = compose_world_tile_nonblocking_live(&params, local_stroke_id, base, split_cache, &mut resolver)?;
                     Ok((*tile, res))
@@ -1695,7 +1924,7 @@ impl WorldTileManager {
         }
 
         let mut out = Vec::with_capacity(prepared.len());
-        for (tile, base_arc, exact_anim, live_brush) in prepared {
+        for (tile, base_arc, exact_anim, exact_static, live_brush) in prepared {
             let params = TileComposeParams {
                 index: &scene,
                 tile,
@@ -1707,7 +1936,7 @@ impl WorldTileManager {
                 allow_parallel_brush: false,
                 cancel: None,
             };
-            let base = LiveColdBase { rgba8: base_arc.as_deref().map(Vec::as_slice), is_exact_anim: exact_anim };
+            let base = LiveColdBase { rgba8: base_arc.as_deref().map(Vec::as_slice), is_exact_anim: exact_anim, is_exact_static: exact_static };
             let res = compose_world_tile_nonblocking_live(&params, local_stroke_id, base, &self.split_cache, resolve_media)?;
             out.push((tile, res));
         }

@@ -784,3 +784,356 @@ fn cold_tile_live_draw_with_non_overlapping_peer_preview_converges() {
     assert!(!gpu.stats.is_refining);
     assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
 }
+
+#[test]
+fn rapid_consecutive_strokes_on_invalidated_tile_never_flash_white_and_converge() {
+    use photocraft_engine::paint::presets;
+    use photocraft_engine::world_brush::{LiveTileBrush, to_stroke_brush};
+    use photocraft_engine::world_tiles::{ScopeKey, TileBudget, WorldTileManager};
+    let _lock = photocraft_testkit::gpu_lock();
+    let rs = egui_kittest::wgpu::create_render_state(crate::gpu_canvas::wgpu_setup(), Default::default());
+    let mut gpu = WorldGpu::new_with_budget(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device), TileBudget::conservative()).unwrap();
+
+    let canvas = CanvasId::new(&hex(71)).unwrap();
+    let author = OwnerId::new(&hex(72)).unwrap();
+    let device = DeviceId::new(&hex(73)).unwrap();
+    let mut world = WorldState::new(canvas, author, "Rapid Consecutive Strokes".into()).unwrap();
+    let all = presets::builtin();
+    let mk_stroke = |id: u128, pts: Vec<[f64; 2]>, size: f32, color: [f32; 4]| {
+        let mut b = presets::find(&all, "Hard Round").unwrap().brush.clone();
+        b.size = size;
+        b.color = color;
+        let sb = to_stroke_brush(&b, 1.0, false).unwrap();
+        Stroke {
+            id: StrokeId::new(&hex(id)).unwrap(),
+            canvas,
+            owner: author,
+            revision: 0,
+            anchor: RegionKey::default(),
+            points: pts,
+            width: f64::from(size),
+            color: Srgba { rgba: color },
+            erase: false,
+            brush: Some(Box::new(sb)),
+            samples: None,
+        }
+    };
+    let append = |world: &mut WorldState, id: u128, stroke: Stroke| -> AcceptedOp {
+        let rev = world.revision + 1;
+        let seq = world.next_sequence(device).unwrap();
+        let ev = AcceptedOp {
+            revision: rev,
+            op: WorldOp {
+                id: OpId::new(&hex(7000 + id)).unwrap(),
+                canvas,
+                author,
+                device,
+                sequence: seq,
+                authority_epoch: 1,
+                action: Edit::AddStroke { stroke },
+            },
+        };
+        world.apply(&ev).unwrap();
+        ev
+    };
+
+    // Rev 1: Solid red coverage across the entire 256x256 viewport.
+    let _ = append(&mut world, 1, mk_stroke(701, vec![[-220.0, 0.0], [220.0, 0.0]], 400.0, [0.95, 0.08, 0.08, 1.0]));
+    let mut renderer = WorldRenderer::new(&world).unwrap();
+    let mut mgr = WorldTileManager::new(TileBudget::conservative(), None);
+    mgr.set_scope(ScopeKey::new(1, "https://rapid.invalid", author.as_str(), device.as_str(), canvas, None), Arc::clone(renderer.index()));
+    let view = Viewport { camera: coordinates::home(canvas), width: 256, height: 256 };
+    let mut resolve = |_: &MediaFrame| -> photocraft_engine::Result<Option<Arc<RgbaFrame>>> { Ok(None) };
+
+    for _ in 0..100 {
+        gpu.present_interactive(&mut mgr, &view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        if !gpu.stats.is_refining {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!gpu.stats.is_refining);
+    let count_white_center = |pixels: &[[u8; 4]]| -> usize {
+        let mut white = 0usize;
+        for y in 64..192 {
+            for x in 64..192 {
+                let p = pixels[y * 256 + x];
+                if p[0] >= 250 && p[1] >= 250 && p[2] >= 250 {
+                    white += 1;
+                }
+            }
+        }
+        white
+    };
+    assert_eq!(count_white_center(&readback(&gpu)), 0, "baseline red tile must have zero white pixels");
+
+    // Rev 2: Commit Stroke 1 (blue bar) and invalidate the center tile immediately via `update_scene`.
+    let stroke1 = mk_stroke(702, vec![[-80.0, -30.0], [80.0, -30.0]], 24.0, [0.05, 0.15, 0.95, 1.0]);
+    let ev1 = append(&mut world, 2, stroke1);
+    let dirty: Vec<_> = renderer.apply_accepted(&ev1).unwrap().into_iter().collect();
+    mgr.update_scene(Arc::clone(renderer.index()), Some(&dirty));
+
+    // IMMEDIATELY start Stroke 2 (green line) on the invalidated tile BEFORE Stroke 1's static tile finishes!
+    let stroke2 = mk_stroke(703, vec![[-70.0, 20.0], [70.0, 40.0]], 24.0, [0.05, 0.85, 0.15, 1.0]);
+    let preview2 = SharedStroke { stroke: stroke2.clone(), device, provenance: None, visible: true, created_revision: 3, changed_revision: 3 };
+    let target_lod = gpu.target_lod(&view, 1.0).unwrap();
+    let mut live_brush = LiveTileBrush::new(&stroke2, target_lod).unwrap();
+
+    for frame_idx in 0..6 {
+        gpu.present_interactive(&mut mgr, &view, 1.0, 0, std::slice::from_ref(&preview2), Some(&mut live_brush), &mut resolve, false).unwrap();
+        let white = count_white_center(&readback(&gpu));
+        assert_eq!(white, 0, "rapid consecutive stroke frame {frame_idx} must never paint onto a pure-white base");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    // Release Stroke 2, commit it, and verify zero white dropout frames while settling to exact W4 oracle.
+    let ev2 = append(&mut world, 3, stroke2);
+    let dirty2: Vec<_> = renderer.apply_accepted(&ev2).unwrap().into_iter().collect();
+    mgr.update_scene(Arc::clone(renderer.index()), Some(&dirty2));
+    for frame_idx in 0..150 {
+        gpu.present_interactive(&mut mgr, &view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        let white = count_white_center(&readback(&gpu));
+        assert_eq!(white, 0, "post-release frame {frame_idx} must never flash pure-white dropout");
+        if !gpu.stats.is_refining && gpu.stats.anim_pending_tiles == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    assert!(!gpu.stats.is_refining);
+    let settled = readback(&gpu);
+    let mut gpu_ref = WorldGpu::new_with_budget(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device), TileBudget::conservative()).unwrap();
+    gpu_ref.render_available(&mut renderer, &view, 1.0, 0, &mut |_| Ok(None), &[]).unwrap();
+    let expected = readback(&gpu_ref);
+    let max_delta = settled.iter().zip(&expected).flat_map(|(a, b)| (0..4).map(move |c| a[c].abs_diff(b[c]))).max().unwrap_or(0);
+    assert!(max_delta <= 1, "settled rapid-stroke frame diverged from blocking oracle by {max_delta}/255");
+    assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
+}
+
+#[test]
+fn zoom_out_across_depth_boundary_prefers_fresh_finer_tiles_over_stale_white_ancestors() {
+    use photocraft_engine::paint::presets;
+    use photocraft_engine::world_brush::to_stroke_brush;
+    use photocraft_engine::world_tiles::{ScopeKey, TileBudget, WorldTileManager};
+    let _lock = photocraft_testkit::gpu_lock();
+    let rs = egui_kittest::wgpu::create_render_state(crate::gpu_canvas::wgpu_setup(), Default::default());
+    let mut gpu = WorldGpu::new_with_budget(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device), TileBudget::conservative()).unwrap();
+
+    let canvas = CanvasId::new(&hex(81)).unwrap();
+    let author = OwnerId::new(&hex(82)).unwrap();
+    let device = DeviceId::new(&hex(83)).unwrap();
+    let mut world = WorldState::new(canvas, author, "Depth Boundary Fallback".into()).unwrap();
+    let mut renderer = WorldRenderer::new(&world).unwrap();
+    let mut mgr = WorldTileManager::new(TileBudget::conservative(), None);
+    mgr.set_scope(ScopeKey::new(1, "https://depth-boundary.invalid", author.as_str(), device.as_str(), canvas, None), Arc::clone(renderer.index()));
+    let mut resolve = |_: &MediaFrame| -> photocraft_engine::Result<Option<Arc<RgbaFrame>>> { Ok(None) };
+
+    // 1. Warm rev-0 blank white coarse tiles at depth 0, zoom 1.0 (`lod = 94`).
+    let coarse_view = Viewport { camera: coordinates::home(canvas), width: 256, height: 256 };
+    for _ in 0..80 {
+        gpu.present_interactive(&mut mgr, &coarse_view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        if !gpu.stats.is_refining {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!gpu.stats.is_refining);
+
+    // 2. Zoom into depth 1 (`lod = 87`, centered off-origin at `(600, 600)` so `lod 88` overlaps 3x3 = 9 `lod 87` tiles!)
+    //    and paint a huge solid red stroke covering the zoomed-in viewport.
+    let deep_region = RegionKey { depth: 1, x: photocraft_engine::scene::Wide(0), y: photocraft_engine::scene::Wide(0) };
+    let center_pt = coordinates::point(&deep_region, [600.0, 600.0]).unwrap();
+    let deep_cam = coordinates::target(canvas, center_pt, 1, 1.0).unwrap();
+    let deep_view = Viewport { camera: deep_cam, width: 512, height: 512 };
+    let boundary_cam = coordinates::target(canvas, center_pt, 0, 64.0).unwrap();
+    let boundary_view = Viewport { camera: boundary_cam, width: 256, height: 256 };
+
+    let lod_deep = gpu.target_lod(&deep_view, 1.0).unwrap();
+    let lod_boundary = gpu.target_lod(&boundary_view, 1.0).unwrap();
+    assert_eq!(lod_deep, 87, "expected depth-1 zoom-1 LOD 87");
+    assert_eq!(lod_boundary, 88, "expected cross-depth 1.5625x boundary LOD 88");
+
+    let all = presets::builtin();
+    let mut b = presets::find(&all, "Hard Round").unwrap().brush.clone();
+    b.size = 500.0;
+    b.color = [0.95, 0.06, 0.06, 1.0];
+    let sb = to_stroke_brush(&b, 1.0, false).unwrap();
+    let red_stroke = Stroke {
+        id: StrokeId::new(&hex(801)).unwrap(),
+        canvas,
+        owner: author,
+        revision: 0,
+        anchor: deep_region,
+        points: vec![[300.0, 600.0], [900.0, 600.0]],
+        width: 500.0,
+        color: Srgba { rgba: [0.95, 0.06, 0.06, 1.0] },
+        erase: false,
+        brush: Some(Box::new(sb)),
+        samples: None,
+    };
+    let ev = AcceptedOp {
+        revision: 1,
+        op: WorldOp {
+            id: OpId::new(&hex(8001)).unwrap(),
+            canvas,
+            author,
+            device,
+            sequence: 1,
+            authority_epoch: 1,
+            action: Edit::AddStroke { stroke: red_stroke },
+        },
+    };
+    world.apply(&ev).unwrap();
+    let dirty: Vec<_> = renderer.apply_accepted(&ev).unwrap().into_iter().collect();
+    mgr.update_scene(Arc::clone(renderer.index()), Some(&dirty));
+
+    // Settle the fresh rev-1 red `lod 87` tiles in TileAtlas (while `lod 94` still holds stale rev-0 blank white!).
+    for _ in 0..120 {
+        gpu.present_interactive(&mut mgr, &deep_view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        if !gpu.stats.is_refining {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!gpu.stats.is_refining);
+
+    // 3. Immediately zoom OUT across the 1.5625x depth boundary (`lod 87 -> lod 88`) and inspect Frame 1!
+    //    `lod 88` tile(s) are not rendered yet; TileAtlas has BOTH stale rev-0 white `lod 94` AND fresh rev-1 red `lod 87`.
+    //    Frame 1 MUST paint the fresh rev-1 red `lod 87` children (spanning 3x3 = 9 tiles) on top, with ZERO stale-white center box!
+    gpu.present_interactive(&mut mgr, &boundary_view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+    let frame1 = readback(&gpu);
+    let mut non_red_center = 0usize;
+    for y in 64..192 {
+        for x in 64..192 {
+            let p = frame1[y * 256 + x];
+            if !(p[0] > 200 && p[1] < 50 && p[2] < 50) {
+                non_red_center += 1;
+            }
+        }
+    }
+    assert_eq!(
+        non_red_center, 0,
+        "Frame 1 zooming out across 1.5625x depth boundary must show fresh red finer children, not stale rev-0 white ancestor squares"
+    );
+
+    // 4. Drive until settled and verify exact match with blocking oracle.
+    for _ in 0..120 {
+        gpu.present_interactive(&mut mgr, &boundary_view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        if !gpu.stats.is_refining {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!gpu.stats.is_refining);
+    let settled = readback(&gpu);
+    let mut gpu_ref = WorldGpu::new_with_budget(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device), TileBudget::conservative()).unwrap();
+    gpu_ref.render_available(&mut renderer, &boundary_view, 1.0, 0, &mut |_| Ok(None), &[]).unwrap();
+    let expected = readback(&gpu_ref);
+    let max_delta = settled.iter().zip(&expected).flat_map(|(a, b)| (0..4).map(move |c| a[c].abs_diff(b[c]))).max().unwrap_or(0);
+    assert!(max_delta <= 1, "settled boundary-zoom frame diverged from blocking oracle by {max_delta}/255");
+    assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
+}
+
+#[test]
+fn live_mode_invalidated_static_tile_retains_resident_gpu_slot_without_white_dropout() {
+    use photocraft_engine::paint::presets;
+    use photocraft_engine::world_brush::to_stroke_brush;
+    use photocraft_engine::world_tiles::{ScopeKey, TileBudget, WorldTileManager};
+    let _lock = photocraft_testkit::gpu_lock();
+    let rs = egui_kittest::wgpu::create_render_state(crate::gpu_canvas::wgpu_setup(), Default::default());
+    let mut gpu = WorldGpu::new_with_budget(&rs, photocraft_gpu::DeviceHealth::watch(&rs.device), TileBudget::conservative()).unwrap();
+
+    let canvas = CanvasId::new(&hex(91)).unwrap();
+    let author = OwnerId::new(&hex(92)).unwrap();
+    let device = DeviceId::new(&hex(93)).unwrap();
+    let mut world = WorldState::new(canvas, author, "Live Stale Hold".into()).unwrap();
+    let all = presets::builtin();
+    let mut b = presets::find(&all, "Hard Round").unwrap().brush.clone();
+    b.size = 400.0;
+    b.color = [0.92, 0.10, 0.12, 1.0];
+    let sb = to_stroke_brush(&b, 1.0, false).unwrap();
+    world
+        .apply(&AcceptedOp {
+            revision: 1,
+            op: WorldOp {
+                id: OpId::new(&hex(9001)).unwrap(),
+                canvas,
+                author,
+                device,
+                sequence: 1,
+                authority_epoch: 1,
+                action: Edit::AddStroke {
+                    stroke: Stroke {
+                        id: StrokeId::new(&hex(901)).unwrap(),
+                        canvas,
+                        owner: author,
+                        revision: 0,
+                        anchor: RegionKey::default(),
+                        points: vec![[-220.0, 0.0], [220.0, 0.0]],
+                        width: 400.0,
+                        color: Srgba { rgba: [0.92, 0.10, 0.12, 1.0] },
+                        erase: false,
+                        brush: Some(Box::new(sb)),
+                        samples: None,
+                    },
+                },
+            },
+        })
+        .unwrap();
+
+    let mut renderer = WorldRenderer::new(&world).unwrap();
+    let mut mgr = WorldTileManager::new(TileBudget::conservative(), None);
+    mgr.set_scope(ScopeKey::new(1, "https://stale-hold.invalid", author.as_str(), device.as_str(), canvas, None), Arc::clone(renderer.index()));
+    let view = Viewport { camera: coordinates::home(canvas), width: 256, height: 256 };
+    let mut resolve = |_: &MediaFrame| -> photocraft_engine::Result<Option<Arc<RgbaFrame>>> { Ok(None) };
+
+    for _ in 0..80 {
+        gpu.present_interactive(&mut mgr, &view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+        if !gpu.stats.is_refining {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!gpu.stats.is_refining);
+
+    // Add a small stroke at the top-left corner, invalidating the visible tile(s).
+    let mut b2 = presets::find(&all, "Hard Round").unwrap().brush.clone();
+    b2.size = 16.0;
+    b2.color = [0.05, 0.2, 0.95, 1.0];
+    let sb2 = to_stroke_brush(&b2, 1.0, false).unwrap();
+    let ev = AcceptedOp {
+        revision: 2,
+        op: WorldOp {
+            id: OpId::new(&hex(9002)).unwrap(),
+            canvas,
+            author,
+            device,
+            sequence: 2,
+            authority_epoch: 1,
+            action: Edit::AddStroke {
+                stroke: Stroke {
+                    id: StrokeId::new(&hex(902)).unwrap(),
+                    canvas,
+                    owner: author,
+                    revision: 0,
+                    anchor: RegionKey::default(),
+                    points: vec![[-100.0, -100.0], [-90.0, -100.0]],
+                    width: 16.0,
+                    color: Srgba { rgba: [0.05, 0.2, 0.95, 1.0] },
+                    erase: false,
+                    brush: Some(Box::new(sb2)),
+                    samples: None,
+                },
+            },
+        },
+    };
+    world.apply(&ev).unwrap();
+    let dirty: Vec<_> = renderer.apply_accepted(&ev).unwrap().into_iter().collect();
+    mgr.update_scene(Arc::clone(renderer.index()), Some(&dirty));
+
+    // Frame 1 immediately after invalidation in LIVE mode (`retain_stale_for_review = false`):
+    // center pixel MUST still hold the resident red static tile, NEVER drop to white!
+    gpu.present_interactive(&mut mgr, &view, 1.0, 0, &[], None, &mut resolve, false).unwrap();
+    let center = readback(&gpu)[128 * 256 + 128];
+    assert!(center[0] > 200 && center[1] < 50 && center[2] < 50, "live invalidated tile dropped to {center:?} instead of holding resident red pixels");
+    assert!(gpu.health.is_ok(), "{:?}", gpu.health.fault());
+}

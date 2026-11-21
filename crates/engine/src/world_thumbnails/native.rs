@@ -93,6 +93,16 @@ pub(super) struct State {
     pending: BTreeMap<CanvasId, Key>,
     failures: BTreeMap<CanvasId, (Instant, String)>,
 }
+fn same_grant(stored: &Key, current: &Key) -> bool {
+    stored.scope == current.scope
+        && stored.info.canvas == current.info.canvas
+        && stored.info.owner == current.info.owner
+        && stored.info.epoch == current.info.epoch
+        && stored.info.initial_name == current.info.initial_name
+        && stored.info.import_origin == current.info.import_origin
+        && stored.info.revision <= current.info.revision
+}
+
 impl State {
     pub fn start(&mut self, path: PathBuf, certificate: Option<Vec<u8>>) -> Result<()> {
         if self.worker.is_some() {
@@ -124,7 +134,7 @@ impl State {
         self.access = access.map(WorldAccess::copy_for_worker);
     }
     fn reconcile(&mut self) {
-        self.memory.retain(|canvas, (key, _)| self.catalog.get(canvas) == Some(key));
+        self.memory.retain(|canvas, (key, _)| self.catalog.get(canvas).is_some_and(|cur| same_grant(key, cur)));
         self.pending.retain(|canvas, key| self.catalog.get(canvas) == Some(key));
         self.failures.retain(|canvas, _| self.catalog.contains_key(canvas));
         self.lru.retain(|canvas| self.memory.contains_key(canvas));
@@ -152,10 +162,10 @@ impl State {
         {
             key.info = info.clone();
             let key = key.clone();
-            self.memory.remove(&info.canvas);
+            // Retain the prior authorized thumbnail image in `self.memory` so the sidebar
+            // never flashes back to "Loading…" after every stroke while the updated preview renders.
             self.pending.remove(&info.canvas);
             self.failures.remove(&info.canvas);
-            self.lru.retain(|canvas| *canvas != info.canvas);
             if let Some(worker) = &self.worker {
                 let mut state = lock(&worker.shared);
                 state.allowed.insert(info.canvas, key.clone());
@@ -167,6 +177,9 @@ impl State {
     }
     pub fn contains(&self, canvas: CanvasId) -> bool {
         self.catalog.contains_key(&canvas)
+    }
+    pub fn is_pending(&self, canvas: CanvasId) -> bool {
+        self.catalog.get(&canvas).is_some_and(|key| self.pending.get(&canvas) == Some(key))
     }
     pub fn remove(&mut self, canvas: CanvasId) {
         self.catalog.remove(&canvas);
@@ -212,26 +225,29 @@ impl State {
     }
     pub fn get(&mut self, canvas: CanvasId, source: Option<Arc<WorldState>>) -> Result<Option<Arc<Thumbnail>>> {
         let Some(key) = self.catalog.get(&canvas).cloned() else { return Ok(None) };
-        if let Some((stored, image)) = self.memory.get(&canvas)
-            && *stored == key
-        {
-            self.lru.retain(|id| *id != canvas);
-            self.lru.push_back(canvas);
-            return Ok(Some(Arc::clone(image)));
-        }
+        let fallback = if let Some((stored, image)) = self.memory.get(&canvas) {
+            if *stored == key {
+                self.lru.retain(|id| *id != canvas);
+                self.lru.push_back(canvas);
+                return Ok(Some(Arc::clone(image)));
+            }
+            same_grant(stored, &key).then(|| Arc::clone(image))
+        } else {
+            None
+        };
         if self.pending.get(&canvas) == Some(&key) || self.failures.get(&canvas).is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(10)) {
-            return Ok(None);
+            return Ok(fallback);
         }
-        let (Some(worker), Some(access)) = (&self.worker, &self.access) else { return Ok(None) };
+        let (Some(worker), Some(access)) = (&self.worker, &self.access) else { return Ok(fallback) };
         let mut state = lock(&worker.shared);
         if state.requests.len() >= JOBS || state.completed.len() >= JOBS {
-            return Ok(None);
+            return Ok(fallback);
         }
         let generation = state.generation;
         state.requests.push_back(Job { key: key.clone(), generation, access: access.copy_for_worker(), source });
         self.pending.insert(canvas, key);
         worker.shared.wake.notify_one();
-        Ok(None)
+        Ok(fallback)
     }
 }
 fn work(shared: Arc<Shared>, root: PathBuf, certificate: Option<Vec<u8>>) {
