@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -290,6 +290,109 @@ impl Drop for WorldWorker {
     }
 }
 
+const CHECKPOINT_CATCHUP_GAP: u64 = 256;
+const MAX_CHECKPOINT_RETRIES: u8 = 3;
+
+const MAX_CLIENT_CKPT_BACKLOG: usize = 4;
+
+enum CkptJob {
+    CompressLocal { generation: u64, canvas: CanvasId, world: Arc<WorldState>, chain_hash: String },
+    VerifyStaged { generation: u64, meta: Box<(wire::CanvasSummary, wire::CheckpointRef)>, compressed: Vec<u8> },
+}
+
+enum CkptResult {
+    LocalReady {
+        generation: u64,
+        result: Result<crate::world_queue::PreparedLocalCheckpoint>,
+    },
+    StagedVerified {
+        generation: u64,
+        meta: Box<(wire::CanvasSummary, wire::CheckpointRef)>,
+        compressed: Vec<u8>,
+        result: Result<Box<(photocraft_scene::shared::WorldCheckpoint, WorldState)>>,
+    },
+}
+
+#[derive(Default)]
+struct ClientCkptQueueState {
+    verify_jobs: VecDeque<CkptJob>,
+    local_jobs: BTreeMap<CanvasId, CkptJob>,
+    closed: bool,
+}
+
+impl ClientCkptQueueState {
+    fn push(&mut self, job: CkptJob) {
+        match job {
+            CkptJob::CompressLocal { canvas, .. } => {
+                if !self.local_jobs.contains_key(&canvas)
+                    && self.local_jobs.len() >= MAX_CLIENT_CKPT_BACKLOG
+                    && let Some(first) = self.local_jobs.keys().next().copied()
+                {
+                    self.local_jobs.remove(&first);
+                }
+                self.local_jobs.insert(canvas, job);
+            }
+            CkptJob::VerifyStaged { .. } => {
+                if self.verify_jobs.len() >= MAX_CLIENT_CKPT_BACKLOG {
+                    let _ = self.verify_jobs.pop_front();
+                }
+                self.verify_jobs.push_back(job);
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<CkptJob> {
+        if let Some(job) = self.verify_jobs.pop_front() {
+            return Some(job);
+        }
+        let first = self.local_jobs.keys().next().copied()?;
+        self.local_jobs.remove(&first)
+    }
+}
+
+fn spawn_client_ckpt_worker(queue: Arc<(Mutex<ClientCkptQueueState>, Condvar)>, done_tx: SyncSender<CkptResult>) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new().name("komaphone-world-ckpt".into()).spawn(move || {
+        loop {
+            let job = {
+                let mut guard = queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                while guard.verify_jobs.is_empty() && guard.local_jobs.is_empty() && !guard.closed {
+                    guard = queue.1.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if guard.closed {
+                    return;
+                }
+                guard.pop()
+            };
+            let Some(job) = job else { continue };
+            let res = match job {
+                CkptJob::CompressLocal { generation, canvas, world, chain_hash } => {
+                    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let ckpt = world.to_checkpoint();
+                        WorldOutbox::prepare_local_checkpoint(canvas, &ckpt, chain_hash)
+                    }))
+                    .unwrap_or_else(|_| Err(other("Background local checkpoint compression failed")));
+                    CkptResult::LocalReady { generation, result: prepared }
+                }
+                CkptJob::VerifyStaged { generation, meta, compressed } => {
+                    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        WorldOutbox::verify_staged_checkpoint(&meta.0, &meta.1, &compressed).map(Box::new)
+                    }))
+                    .unwrap_or_else(|_| Err(other("Background checkpoint verification failed")));
+                    CkptResult::StagedVerified { generation, meta, compressed, result: verified }
+                }
+            };
+            if done_tx.send(res).is_err() {
+                return;
+            }
+        }
+    })
+}
+
+struct CheckpointTransfer {
+    ckpt: wire::CheckpointRef,
+    retries: u8,
+}
+
 struct Coordinator {
     auth_fence: Arc<AuthFence>,
     auth_ticket: u64,
@@ -298,6 +401,9 @@ struct Coordinator {
     lease: Option<Activation>,
     generation: u64,
     replicas: BTreeMap<CanvasId, WorldReplica>,
+    checkpoint_transfers: BTreeMap<CanvasId, CheckpointTransfer>,
+    verifying_checkpoints: BTreeMap<CanvasId, wire::CheckpointRef>,
+    ckpt_jobs_out: VecDeque<CkptJob>,
     selected: Option<CanvasId>,
     requests: VecDeque<(u64, Action)>,
     recovery_resume: BTreeMap<CanvasId, RecoveryResume>,
@@ -334,6 +440,9 @@ impl Coordinator {
         self.queue.sign_out()?;
         self.lease = None;
         self.replicas.clear();
+        self.checkpoint_transfers.clear();
+        self.verifying_checkpoints.clear();
+        self.ckpt_jobs_out.clear();
         self.selected = None;
         self.requests.clear();
         self.recovery_resume.clear();
@@ -362,7 +471,11 @@ impl Coordinator {
         self.outbound.push_back(Event::CachedCanvases { items: page.items });
         Ok(())
     }
+    #[cfg(test)]
     fn command(&mut self, sequence: u64, command: Command) -> Result<()> {
+        self.command_with_events(sequence, command, None)
+    }
+    fn command_with_events(&mut self, sequence: u64, command: Command, events: Option<&SyncSender<Stamped<Event>>>) -> Result<()> {
         match command {
             Command::Relocate { .. } => Err(other("Endpoint relocation requires the verified native coordinator")),
             Command::Access(access) => self.access(sequence, access),
@@ -398,7 +511,7 @@ impl Coordinator {
                         canvas,
                         owner: world.owner,
                         name: world.name.clone(),
-                        initial_name: world.replay_to(0).map_err(other)?.name,
+                        initial_name: world.initial_name().to_owned(),
                         revision: world.revision,
                         epoch,
                     };
@@ -421,6 +534,10 @@ impl Coordinator {
                 }
                 let operation = self.queue.enqueue(&lease, canvas, action)?;
                 self.outbound.push_back(Event::Saved { sequence, operation });
+                // Deliver durable local Event::Saved immediately before rebuilding optimistic display!
+                if let Some(events) = events {
+                    self.flush_outbound(events);
+                }
                 self.publish(canvas)
             }
             Command::SaveView { canvas, state } => {
@@ -476,14 +593,31 @@ impl Coordinator {
         }
         Ok(items)
     }
+    fn flush_outbound(&mut self, events: &SyncSender<Stamped<Event>>) -> bool {
+        while let Some(event) = self.outbound.pop_front() {
+            match events.try_send(Stamped { ticket: self.auth_ticket, value: event }) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(event)) => {
+                    self.outbound.push_front(event.value);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        true
+    }
     fn publish(&mut self, canvas: CanvasId) -> Result<()> {
         let lease = self.lease()?.clone();
         let Some(replica) = self.replicas.get(&canvas) else { return Ok(()) };
         let pending = self.canvas_pending(&lease, canvas)?.into_iter().map(|q| q.operation).collect::<Vec<_>>();
-        let canonical = Arc::new(replica.accepted().clone());
-        let (display, notice) = match replica.with_pending(lease.scope().profile, &pending) {
-            Ok(world) => (Arc::new(world), None),
-            Err(error) => (canonical.clone(), Some(format!("Saved offline edits need recovery before preview: {error}"))),
+        let canonical = replica.accepted_arc();
+        let (display, notice) = if pending.is_empty() {
+            (Arc::clone(&canonical), None)
+        } else {
+            match replica.with_pending(lease.scope().profile, &pending) {
+                Ok(world) => (Arc::new(world), None),
+                Err(error) => (canonical.clone(), Some(format!("Saved offline edits need recovery before preview: {error}"))),
+            }
         };
         let view = self.queue.load_view(&lease, canvas)?;
         // Replace stale presentation snapshots, but retain every durable save/error acknowledgment.
@@ -498,7 +632,7 @@ impl Coordinator {
             return Ok(());
         }
         self.queue.grant(&lease, canvas, replica.info().epoch, replica.accepted().next_sequence(lease.scope().device).map_err(other)?)?;
-        self.queue.save_snapshot(&lease, replica.accepted())?;
+        self.queue.append_accepted_events(&lease, replica.info(), &[], None)?;
         for queued in self.canvas_pending(&lease, canvas)? {
             if queued.operation.canvas == canvas
                 && let Some(accepted) = replica.accepted().receipt(queued.operation.id)
@@ -517,6 +651,76 @@ impl Coordinator {
         }
         self.publish(canvas)
     }
+    fn handle_reply_error(&mut self, lease: &crate::world_queue::Activation, action: &Action, sequence: u64, error: Error) -> Result<()> {
+        if matches!(action, Action::List { .. }) {
+            self.directory_scan = None;
+        }
+        if let Error::Rejected { code, .. } = &error {
+            let canvas = match action {
+                Action::Append { operation }
+                | Action::RemixGame { operation, .. }
+                | Action::RemixCanvas { operation, .. }
+                | Action::RemixStroke { operation } => Some(operation.canvas),
+                Action::Info { canvas } | Action::Events { canvas, .. } | Action::CheckpointMeta { canvas } | Action::CheckpointChunk { canvas, .. } => {
+                    Some(*canvas)
+                }
+                _ => None,
+            };
+            if let Some(canvas) = canvas {
+                let source_rejected =
+                    code == "unauthorized" && matches!(action, Action::RemixGame { .. } | Action::RemixCanvas { .. } | Action::RemixStroke { .. });
+                if code == "unauthorized" && !source_rejected {
+                    self.queue.revoke(lease, canvas)?;
+                    self.replicas.remove(&canvas);
+                    self.checkpoint_transfers.remove(&canvas);
+                    if self.selected == Some(canvas) {
+                        self.selected = None;
+                        self.invalidate_presence()?;
+                    }
+                    self.outbound.push_back(Event::Revoked { canvas });
+                } else if code == "conflict" && matches!(action, Action::CheckpointChunk { .. }) {
+                    // Server rotated the pinned checkpoint mid-transfer: discard stale stage and re-fetch meta (bounded).
+                    let _ = self.queue.clear_checkpoint_stage(lease, canvas);
+                    let retries = self.checkpoint_transfers.get(&canvas).map_or(0, |t| t.retries).saturating_add(1);
+                    if retries <= MAX_CHECKPOINT_RETRIES {
+                        if let Some(transfer) = self.checkpoint_transfers.get_mut(&canvas) {
+                            transfer.retries = retries;
+                        }
+                        self.requests.push_front((0, Action::CheckpointMeta { canvas }));
+                        return Ok(());
+                    }
+                    self.checkpoint_transfers.remove(&canvas);
+                    if let Some(replica) = self.replicas.get(&canvas) {
+                        self.requests.push_front((
+                            0,
+                            Action::Events { canvas, after: replica.accepted().revision, through: Some(replica.info().revision), limit: wire::MAX_PAGE },
+                        ));
+                        return Ok(());
+                    }
+                } else if (source_rejected || matches!(code.as_str(), "conflict" | "invalid"))
+                    && let Action::Append { operation }
+                    | Action::RemixGame { operation, .. }
+                    | Action::RemixCanvas { operation, .. }
+                    | Action::RemixStroke { operation } = action
+                    && let Some(queued) = self.canvas_pending(lease, canvas)?.into_iter().find(|q| q.operation.id == operation.id)
+                {
+                    self.queue.reject(&queued, RecoveryReason::Conflict)?;
+                    self.publish(canvas)?;
+                    // A remix requires both source and destination access.
+                    // Only an independent destination Info failure proves
+                    // destination membership was removed.
+                    self.requests.push_front((0, Action::Info { canvas }));
+                }
+            }
+        }
+        if let Action::CheckpointMeta { canvas } | Action::CheckpointChunk { canvas, .. } = action {
+            self.checkpoint_transfers.remove(canvas);
+        }
+        self.fail_resume_for_action(action, sequence, &error.to_string());
+        self.network_after = Instant::now() + Duration::from_secs(2);
+        Err(error)
+    }
+
     fn reply(&mut self, reply: Reply) -> Result<()> {
         self.inflight = false;
         if reply.generation != self.generation {
@@ -526,50 +730,7 @@ impl Coordinator {
         self.queue.ensure_current(&lease)?;
         let response = match reply.result {
             Ok(response) => response,
-            Err(error) => {
-                if matches!(reply.action, Action::List { .. }) {
-                    self.directory_scan = None;
-                }
-                if let Error::Rejected { code, .. } = &error {
-                    let canvas = match &reply.action {
-                        Action::Append { operation }
-                        | Action::RemixGame { operation, .. }
-                        | Action::RemixCanvas { operation, .. }
-                        | Action::RemixStroke { operation } => Some(operation.canvas),
-                        Action::Info { canvas } | Action::Events { canvas, .. } => Some(*canvas),
-                        _ => None,
-                    };
-                    if let Some(canvas) = canvas {
-                        let source_rejected = code == "unauthorized"
-                            && matches!(&reply.action, Action::RemixGame { .. } | Action::RemixCanvas { .. } | Action::RemixStroke { .. });
-                        if code == "unauthorized" && !source_rejected {
-                            self.queue.revoke(&lease, canvas)?;
-                            self.replicas.remove(&canvas);
-                            if self.selected == Some(canvas) {
-                                self.selected = None;
-                                self.invalidate_presence()?;
-                            }
-                            self.outbound.push_back(Event::Revoked { canvas });
-                        } else if (source_rejected || matches!(code.as_str(), "conflict" | "invalid"))
-                            && let Action::Append { operation }
-                            | Action::RemixGame { operation, .. }
-                            | Action::RemixCanvas { operation, .. }
-                            | Action::RemixStroke { operation } = &reply.action
-                            && let Some(queued) = self.canvas_pending(&lease, canvas)?.into_iter().find(|q| q.operation.id == operation.id)
-                        {
-                            self.queue.reject(&queued, RecoveryReason::Conflict)?;
-                            self.publish(canvas)?;
-                            // A remix requires both source and destination access.
-                            // Only an independent destination Info failure proves
-                            // destination membership was removed.
-                            self.requests.push_front((0, Action::Info { canvas }));
-                        }
-                    }
-                }
-                self.fail_resume_for_action(&reply.action, reply.sequence, &error.to_string());
-                self.network_after = Instant::now() + Duration::from_secs(2);
-                return Err(error);
-            }
+            Err(error) => return self.handle_reply_error(&lease, &reply.action, reply.sequence, error),
         };
         match (&reply.action, &response) {
             (Action::List { after, limit }, Response::Canvases { items, next }) => self.directory_page(reply.sequence, *after, *limit, items, *next)?,
@@ -610,17 +771,98 @@ impl Coordinator {
                 self.presence_verified(info.canvas);
                 let Some(replica) = self.replicas.get(&info.canvas) else { return Err(other("Canvas state unavailable")) };
                 if !replica.complete() {
-                    self.requests.push_front((
-                        0,
-                        Action::Events { canvas: info.canvas, after: replica.accepted().revision, through: Some(info.revision), limit: wire::MAX_PAGE },
-                    ));
+                    let gap = info.revision.saturating_sub(replica.accepted().revision);
+                    if self.verifying_checkpoints.contains_key(&info.canvas) {
+                        // Off-thread staged checkpoint verification in progress; avoid duplicate download.
+                    } else if gap >= CHECKPOINT_CATCHUP_GAP && !self.checkpoint_transfers.contains_key(&info.canvas) {
+                        self.requests.push_front((0, Action::CheckpointMeta { canvas: info.canvas }));
+                    } else {
+                        self.requests.push_front((
+                            0,
+                            Action::Events { canvas: info.canvas, after: replica.accepted().revision, through: Some(info.revision), limit: wire::MAX_PAGE },
+                        ));
+                    }
                 } else if !unchanged || self.recovery_resume.get(&info.canvas).is_some_and(|resume| resume.refreshed) {
                     self.ready(info.canvas)?;
                 }
             }
-            (Action::Events { canvas, .. }, Response::Events { through, next, .. }) => {
+            (Action::CheckpointMeta { canvas }, Response::CheckpointMeta { checkpoint }) => {
+                let Some(replica) = self.replicas.get_mut(canvas) else {
+                    return Err(other("Canvas changed before checkpoint metadata arrived"));
+                };
+                if let Some(ckpt) = checkpoint
+                    && ckpt.validate().is_ok()
+                    && ckpt.canvas == *canvas
+                    && ckpt.revision > replica.accepted().revision
+                    && ckpt.revision <= replica.info().revision
+                {
+                    let received = self.queue.begin_checkpoint_stage(&lease, ckpt)?;
+                    let retries = self.checkpoint_transfers.get(canvas).map_or(0, |t| t.retries);
+                    if received >= ckpt.compressed_bytes {
+                        let info = replica.info().clone();
+                        let compressed = self.queue.read_staged_checkpoint_bytes(&lease, &info, ckpt)?;
+                        self.checkpoint_transfers.remove(canvas);
+                        self.verifying_checkpoints.insert(*canvas, ckpt.clone());
+                        self.ckpt_jobs_out.push_back(CkptJob::VerifyStaged { generation: self.generation, meta: Box::new((info, ckpt.clone())), compressed });
+                    } else {
+                        self.checkpoint_transfers.insert(*canvas, CheckpointTransfer { ckpt: ckpt.clone(), retries });
+                        self.requests.push_front((
+                            0,
+                            Action::CheckpointChunk {
+                                canvas: *canvas,
+                                revision: ckpt.revision,
+                                compressed_sha256: ckpt.compressed_sha256,
+                                offset: received,
+                                len: wire::CHECKPOINT_CHUNK_BYTES,
+                            },
+                        ));
+                    }
+                } else {
+                    self.checkpoint_transfers.remove(canvas);
+                    self.requests.push_front((
+                        0,
+                        Action::Events { canvas: *canvas, after: replica.accepted().revision, through: Some(replica.info().revision), limit: wire::MAX_PAGE },
+                    ));
+                }
+            }
+            (Action::CheckpointChunk { canvas, .. }, Response::CheckpointChunk { revision, compressed_sha256, offset, bytes, total }) => {
+                let matches_pin = self
+                    .checkpoint_transfers
+                    .get(canvas)
+                    .is_some_and(|t| t.ckpt.revision == *revision && t.ckpt.compressed_sha256 == *compressed_sha256 && t.ckpt.compressed_bytes == *total);
+                if !matches_pin {
+                    return Err(other("Checkpoint chunk does not match active pinned transfer"));
+                }
+                let received = self.queue.stage_checkpoint_chunk(&lease, *canvas, *revision, *compressed_sha256, *offset, bytes, *total)?;
+                if received < *total {
+                    self.requests.push_front((
+                        0,
+                        Action::CheckpointChunk {
+                            canvas: *canvas,
+                            revision: *revision,
+                            compressed_sha256: *compressed_sha256,
+                            offset: received,
+                            len: wire::CHECKPOINT_CHUNK_BYTES,
+                        },
+                    ));
+                } else {
+                    let transfer = self.checkpoint_transfers.remove(canvas).ok_or_else(|| other("Checkpoint transfer missing"))?;
+                    let replica = self.replicas.get_mut(canvas).ok_or_else(|| other("Canvas changed before checkpoint completed"))?;
+                    let info = replica.info().clone();
+                    let compressed = self.queue.read_staged_checkpoint_bytes(&lease, &info, &transfer.ckpt)?;
+                    self.verifying_checkpoints.insert(*canvas, transfer.ckpt.clone());
+                    self.ckpt_jobs_out.push_back(CkptJob::VerifyStaged { generation: self.generation, meta: Box::new((info, transfer.ckpt)), compressed });
+                }
+            }
+            (Action::Events { canvas, .. }, Response::Events { events, through, next }) => {
                 let replica = self.replicas.get_mut(canvas).ok_or_else(|| other("Canvas changed before event page arrived"))?;
                 replica.apply_page(&response)?;
+                if let Some((ckpt_rev, chain_hash)) = self.queue.append_accepted_events(&lease, replica.info(), events, None)?
+                    && replica.accepted().revision == ckpt_rev
+                {
+                    let world = replica.accepted_arc();
+                    self.ckpt_jobs_out.push_back(CkptJob::CompressLocal { generation: self.generation, canvas: *canvas, world, chain_hash });
+                }
                 if let Some(after) = next {
                     self.requests.push_front((0, Action::Events { canvas: *canvas, after: *after, through: Some(*through), limit: wire::MAX_PAGE }));
                 } else {
@@ -635,9 +877,28 @@ impl Coordinator {
                     return Err(other("Service acknowledged different canvas content; local edit retained"));
                 }
                 self.presence_committed(operation, event.revision);
+                let matching_queued = self.canvas_pending(&lease, operation.canvas)?.into_iter().find(|q| q.operation.id == operation.id);
                 let replica = self.replicas.get_mut(&operation.canvas).ok_or_else(|| other("Canvas changed before upload finished"))?;
                 if replica.append_contiguous(event)? {
-                    self.ready(operation.canvas)?;
+                    let next_seq = replica.accepted().next_sequence(lease.scope().device).map_err(other)?;
+                    let info = replica.info().clone();
+                    let ckpt_trigger = self.queue.commit_contiguous_accepted(&lease, &info, event, matching_queued.as_ref(), next_seq)?;
+                    if let Some((ckpt_rev, chain_hash)) = ckpt_trigger
+                        && replica.accepted().revision == ckpt_rev
+                    {
+                        let world = replica.accepted_arc();
+                        self.ckpt_jobs_out.push_back(CkptJob::CompressLocal { generation: self.generation, canvas: operation.canvas, world, chain_hash });
+                    }
+                    if self.recovery_resume.get(&operation.canvas).is_some_and(|resume| resume.refreshed) {
+                        self.ready(operation.canvas)?;
+                    } else {
+                        self.publish(operation.canvas)?;
+                    }
+                } else if event.revision <= replica.accepted().base_revision()
+                    && let Some(queued) = matching_queued
+                {
+                    self.queue.acknowledge(&queued, event)?;
+                    self.publish(operation.canvas)?;
                 }
                 // Always catch up before another upload: a noncontiguous ACK is not a local-history commit.
                 self.requests.push_front((0, Action::Info { canvas: operation.canvas }));
@@ -645,6 +906,8 @@ impl Coordinator {
             (Action::Leave { canvas } | Action::Delete { canvas, .. }, Response::Done) => {
                 self.queue.revoke(&lease, *canvas)?;
                 self.replicas.remove(canvas);
+                self.checkpoint_transfers.remove(canvas);
+                self.verifying_checkpoints.remove(canvas);
                 if self.selected == Some(*canvas) {
                     self.selected = None;
                     self.invalidate_presence()?;
@@ -658,6 +921,8 @@ impl Coordinator {
                 reply.action,
                 Action::Info { .. }
                     | Action::Events { .. }
+                    | Action::CheckpointMeta { .. }
+                    | Action::CheckpointChunk { .. }
                     | Action::Append { .. }
                     | Action::RemixGame { .. }
                     | Action::RemixCanvas { .. }
@@ -670,7 +935,9 @@ impl Coordinator {
     }
     fn fail_resume_for_action(&mut self, action: &Action, sequence: u64, message: &str) {
         let canvas = match action {
-            Action::Info { canvas } | Action::Events { canvas, .. } => Some(*canvas),
+            Action::Info { canvas } | Action::Events { canvas, .. } | Action::CheckpointMeta { canvas } | Action::CheckpointChunk { canvas, .. } => {
+                Some(*canvas)
+            }
             _ => None,
         };
         if let Some(canvas) = canvas
@@ -681,6 +948,59 @@ impl Coordinator {
             self.outbound.push_back(Event::Error { sequence: resume.sequence, message: message.into() });
         }
     }
+    fn handle_checkpoint_result(&mut self, done: CkptResult) -> Result<()> {
+        match done {
+            CkptResult::LocalReady { generation, result } => {
+                if generation != self.generation {
+                    return Ok(());
+                }
+                let Ok(lease) = self.lease().cloned() else {
+                    return Ok(());
+                };
+                if let Ok(prepared) = result {
+                    let _ = self.queue.store_prepared_local_checkpoint(&lease, &prepared)?;
+                }
+                Ok(())
+            }
+            CkptResult::StagedVerified { generation, meta, compressed, result } => {
+                let (info, ckpt_ref) = *meta;
+                if generation != self.generation {
+                    return Ok(());
+                }
+                self.verifying_checkpoints.remove(&info.canvas);
+                let lease = self.lease()?.clone();
+                match result {
+                    Ok(boxed) => {
+                        let (ckpt, state) = *boxed;
+                        let Some(replica) = self.replicas.get_mut(&info.canvas) else {
+                            return Ok(());
+                        };
+                        self.queue.commit_verified_checkpoint(&lease, &info, &ckpt_ref, &compressed, &ckpt)?;
+                        replica.install_prevalidated_checkpoint(state)?;
+                        if !replica.complete() {
+                            self.requests.push_front((
+                                0,
+                                Action::Events {
+                                    canvas: info.canvas,
+                                    after: replica.accepted().revision,
+                                    through: Some(replica.info().revision),
+                                    limit: wire::MAX_PAGE,
+                                },
+                            ));
+                        } else {
+                            self.ready(info.canvas)?;
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = self.queue.clear_checkpoint_stage(&lease, info.canvas);
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
     fn schedule(&mut self, sender: &SyncSender<Job>) -> Result<()> {
         if !self.auth_fence.allowed(self.auth_ticket) {
             return Ok(());
@@ -735,6 +1055,9 @@ fn run(
     let presence_pool = presence::Pool::start(trusted_certificate.as_deref(), Arc::clone(&auth_fence))?;
     let (sender, network) = mpsc::sync_channel::<Job>(1);
     let (replies, receive) = mpsc::sync_channel(1);
+    let ckpt_queue = Arc::new((Mutex::new(ClientCkptQueueState::default()), Condvar::new()));
+    let (ckpt_done_tx, ckpt_done_rx) = mpsc::sync_channel::<CkptResult>(MAX_CLIENT_CKPT_BACKLOG);
+    let ckpt_thread = spawn_client_ckpt_worker(Arc::clone(&ckpt_queue), ckpt_done_tx).map_err(|e| Error::Storage(e.to_string()))?;
     let network_fence = Arc::clone(&auth_fence);
     let network_thread = std::thread::Builder::new()
         .name("komaphone-world-http".into())
@@ -756,6 +1079,9 @@ fn run(
         lease: None,
         generation: 0,
         replicas: BTreeMap::new(),
+        checkpoint_transfers: BTreeMap::new(),
+        verifying_checkpoints: BTreeMap::new(),
+        ckpt_jobs_out: VecDeque::new(),
         selected: None,
         requests: VecDeque::new(),
         recovery_resume: BTreeMap::new(),
@@ -780,8 +1106,13 @@ fn run(
             }
         }
         let immediate = priority.take();
+        let wait = if state.inflight || !state.requests.is_empty() || !state.verifying_checkpoints.is_empty() {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(10)
+        };
         if immediate.is_some() || state.outbound.len() < 32 {
-            match immediate.map(Ok).unwrap_or_else(|| commands.recv_timeout(Duration::from_millis(10))) {
+            match immediate.map(Ok).unwrap_or_else(|| commands.recv_timeout(wait)) {
                 Ok(envelope) => {
                     if !auth_fence.current(envelope.ticket) {
                         continue;
@@ -811,7 +1142,7 @@ fn run(
                         }
                         command => {
                             if auth_fence.allowed(envelope.ticket) {
-                                state.command(envelope.sequence, command)
+                                state.command_with_events(envelope.sequence, command, Some(events))
                             } else {
                                 Err(other("Canvas account is paused; reconnect before sharing"))
                             }
@@ -834,6 +1165,21 @@ fn run(
             } else if let Err(error) = state.reply(reply) {
                 state.outbound.push_back(Event::Error { sequence, message: error.to_string() });
             }
+        }
+        // Dispatch queued off-thread checkpoint compression / staged verification jobs without blocking.
+        if !state.ckpt_jobs_out.is_empty() {
+            let mut guard = ckpt_queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while let Some(job) = state.ckpt_jobs_out.pop_front() {
+                guard.push(job);
+            }
+            ckpt_queue.1.notify_one();
+        }
+        // Poll completed off-thread checkpoint jobs (at most 1 per loop turn so local edits stay immediate).
+        if let Ok(done) = ckpt_done_rx.try_recv()
+            && auth_fence.allowed(state.auth_ticket)
+            && let Err(error) = state.handle_checkpoint_result(done)
+        {
+            state.outbound.push_back(Event::Error { sequence: 0, message: error.to_string() });
         }
         for _ in 0..presence::SLOTS {
             if state.outbound.len() >= 32 {
@@ -858,20 +1204,20 @@ fn run(
             state.outbound.push_back(Event::Error { sequence: 0, message: error.to_string() });
             state.network_after = Instant::now() + Duration::from_secs(2);
         }
-        while let Some(event) = state.outbound.pop_front() {
-            match events.try_send(Stamped { ticket: state.auth_ticket, value: event }) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(event)) => {
-                    state.outbound.push_front(event.value);
-                    break;
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
-            }
+        if !state.flush_outbound(events) {
+            return Ok(());
         }
     }
     drop(sender);
     drop(receive);
+    drop(ckpt_done_rx);
+    {
+        let mut guard = ckpt_queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.closed = true;
+        ckpt_queue.1.notify_all();
+    }
     drop(presence_pool);
+    let _ = ckpt_thread.join();
     network_thread.join().map_err(|_| Error::Unavailable)?;
     Ok(())
 }

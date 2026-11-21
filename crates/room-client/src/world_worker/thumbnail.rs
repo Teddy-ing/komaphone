@@ -44,6 +44,55 @@ impl ThumbnailReader {
         }
         let mut replica = WorldReplica::open(expected.clone(), None)?;
         let mut bytes = 0usize;
+        if expected.revision >= super::CHECKPOINT_CATCHUP_GAP
+            && let Response::CheckpointMeta { checkpoint: Some(ckpt) } = self.call(Action::CheckpointMeta { canvas: expected.canvas }, current)?
+            && ckpt.validate().is_ok()
+            && ckpt.canvas == expected.canvas
+            && ckpt.revision <= expected.revision
+            && ckpt.compressed_bytes <= 32 * 1024 * 1024
+        {
+            let mut compressed = Vec::with_capacity(ckpt.compressed_bytes as usize);
+            while (compressed.len() as u64) < ckpt.compressed_bytes {
+                let offset = compressed.len() as u64;
+                let Response::CheckpointChunk { revision, compressed_sha256, offset: got_off, bytes: chunk, total } = self.call(
+                    Action::CheckpointChunk {
+                        canvas: expected.canvas,
+                        revision: ckpt.revision,
+                        compressed_sha256: ckpt.compressed_sha256,
+                        offset,
+                        len: wire::CHECKPOINT_CHUNK_BYTES,
+                    },
+                    current,
+                )?
+                else {
+                    return Err(other("Unexpected thumbnail checkpoint chunk response"));
+                };
+                if revision != ckpt.revision
+                    || compressed_sha256 != ckpt.compressed_sha256
+                    || got_off != offset
+                    || total != ckpt.compressed_bytes
+                    || chunk.is_empty()
+                    || (compressed.len() as u64).saturating_add(chunk.len() as u64) > ckpt.compressed_bytes
+                {
+                    return Err(other("Thumbnail checkpoint chunk mismatch"));
+                }
+                bytes = bytes.saturating_add(chunk.len());
+                if bytes > 32 * 1024 * 1024 {
+                    return Err(other("Thumbnail history exceeds its 32 MiB preview budget; open the canvas"));
+                }
+                compressed.extend_from_slice(&chunk);
+            }
+            let decoded = photocraft_scene::shared::WorldCheckpoint::decode_zlib_bounded(
+                &compressed,
+                ckpt.compressed_sha256.as_str(),
+                ckpt.uncompressed_bytes,
+                ckpt.state_hash.as_str(),
+                wire::MAX_CHECKPOINT_UNCOMPRESSED_BYTES,
+            )
+            .map_err(other)?;
+            let state = WorldState::from_checkpoint(decoded).map_err(other)?;
+            replica.install_checkpoint(state)?;
+        }
         while !replica.complete() {
             let response = self.call(
                 Action::Events { canvas: expected.canvas, after: replica.accepted().revision, through: Some(expected.revision), limit: wire::MAX_PAGE },

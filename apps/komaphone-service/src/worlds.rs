@@ -13,8 +13,15 @@ mod media;
 mod presence;
 pub(crate) use presence::Presence;
 mod restore;
+mod storage_v6;
+pub(crate) use storage_v6::{MAX_CHECKPOINT_BACKLOG, build_prepared_checkpoint_from_path, publish_prepared_checkpoint};
+pub use storage_v6::{PendingCheckpointJob, PreparedCheckpoint};
 mod stroke_copy;
 mod trash;
+
+pub(crate) fn scan_pending_checkpoints(db: &Connection) -> Result<Vec<PendingCheckpointJob>> {
+    storage_v6::scan_pending_checkpoints(db, MAX_CHECKPOINT_BACKLOG)
+}
 
 const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = wire::MAX_REQUEST_BYTES + 1024;
@@ -80,12 +87,16 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
             version = 5;
         }
         if version == 5 {
-            db.pragma_update(None, "user_version", 5)?;
+            storage_v6::migrate_v6(db, path)?;
+            version = 6;
+        }
+        if version == 6 {
+            db.pragma_update(None, "user_version", 6)?;
         }
         return Ok(());
     }
     let partial: u32 = db.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name IN ('worlds','world_members','world_invites','world_events','world_media_sources','world_blobs','world_trash','world_imports','world_import_assets','world_import_receipts','world_import_origins')",
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('worlds','world_members','world_invites','world_events','world_media_sources','world_blobs','world_trash','world_imports','world_import_assets','world_import_receipts','world_import_origins','world_meta','world_devices','world_strokes_idx','world_media_idx','world_tours_idx','world_checkpoints')",
         [],
         |r| r.get(0),
     )?;
@@ -93,7 +104,7 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
         return Err(Error::Schema);
     }
     let tx = db.unchecked_transaction()?;
-    tx.execute_batch("CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=5)); INSERT INTO world_schema VALUES(5);
+    tx.execute_batch("CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=6)); INSERT INTO world_schema VALUES(6);
         CREATE TABLE worlds(id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES identity_profiles(profile), name TEXT NOT NULL, initial_name TEXT NOT NULL, revision INTEGER NOT NULL, state BLOB NOT NULL, hash TEXT NOT NULL);
         CREATE TABLE world_members(canvas TEXT NOT NULL REFERENCES worlds(id), profile TEXT NOT NULL REFERENCES identity_profiles(profile), epoch INTEGER NOT NULL CHECK(epoch>0), active INTEGER NOT NULL CHECK(active IN (0,1)), PRIMARY KEY(canvas,profile));
         CREATE INDEX world_member_list ON world_members(profile,active,canvas);
@@ -102,7 +113,8 @@ pub(crate) fn initialize(db: &Connection, path: &std::path::Path) -> Result<()> 
     tx.execute_batch(media::TABLES)?;
     tx.execute_batch(trash::TABLES)?;
     tx.execute_batch(archive_import::TABLES)?;
-    tx.pragma_update(None, "user_version", 5)?;
+    tx.execute_batch(storage_v6::TABLES)?;
+    tx.pragma_update(None, "user_version", 6)?;
     tx.commit()?;
     Ok(())
 }
@@ -127,14 +139,14 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
     let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='world_schema')", [], |r| r.get(0))?;
     if !exists {
         let partial: u32 = db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name IN ('worlds','world_members','world_invites','world_events','world_media_sources','world_blobs','world_trash','world_imports','world_import_assets','world_import_receipts','world_import_origins')",
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('worlds','world_members','world_invites','world_events','world_media_sources','world_blobs','world_trash','world_imports','world_import_assets','world_import_receipts','world_import_origins','world_meta','world_devices','world_strokes_idx','world_media_idx','world_tours_idx','world_checkpoints')",
             [],
             |r| r.get(0),
         )?;
         return if partial == 0 { Ok(()) } else { Err(Error::Schema) };
     }
     let versions: Vec<u32> = db.prepare("SELECT version FROM world_schema LIMIT 2")?.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-    if versions != [1] && versions != [2] && versions != [3] && versions != [4] && versions != [5] {
+    if versions != [1] && versions != [2] && versions != [3] && versions != [4] && versions != [5] && versions != [6] {
         return Err(Error::Schema);
     }
     let media_tables: u32 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('world_media_sources','world_blobs')", [], |r| r.get(0))?;
@@ -145,7 +157,7 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         media::verify(db)?;
     }
     let trash_tables: u32 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name='world_trash'", [], |r| r.get(0))?;
-    let has_trash = versions == [3] || versions == [4] || versions == [5];
+    let has_trash = matches!(versions.as_slice(), [3] | [4] | [5] | [6]);
     if (has_trash && trash_tables != 1) || (!has_trash && trash_tables != 0) {
         return Err(Error::Schema);
     }
@@ -157,12 +169,21 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    let has_imports = versions == [4] || versions == [5];
+    let has_imports = matches!(versions.as_slice(), [4] | [5] | [6]);
     if (has_imports && import_tables != 4) || (!has_imports && import_tables != 0) {
         return Err(Error::Schema);
     }
     if has_imports {
         archive_import::verify(db)?;
+    }
+    let v6_tables: u32 = db.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('world_meta','world_devices','world_strokes_idx','world_media_idx','world_tours_idx','world_checkpoints')",
+        [],
+        |r| r.get(0),
+    )?;
+    let is_v6 = versions == [6];
+    if (is_v6 && v6_tables != 6) || (!is_v6 && v6_tables != 0) {
+        return Err(Error::Schema);
     }
     let invalid:u64=db.query_row("SELECT count(*) FROM world_members m LEFT JOIN worlds w ON w.id=m.canvas LEFT JOIN identity_profiles p ON p.profile=m.profile WHERE w.id IS NULL OR p.profile IS NULL OR typeof(m.epoch)!='integer' OR m.epoch<1 OR m.active NOT IN (0,1)",[],|r|read_u64(r,0))?;
     if invalid != 0 {
@@ -178,6 +199,9 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
     if invalid_events != 0 || invalid_invites != 0 || canvas_count > 16384 {
         return Err(Error::Storage);
     }
+    if is_v6 {
+        return storage_v6::verify_v6(db);
+    }
     let mut stmt = db.prepare("SELECT CAST(substr(CAST(id AS BLOB),1,33) AS TEXT),CAST(substr(CAST(owner AS BLOB),1,33) AS TEXT),CAST(substr(CAST(name AS BLOB),1,97) AS TEXT),revision,CAST(substr(CAST(initial_name AS BLOB),1,97) AS TEXT) FROM worlds ORDER BY id")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -189,7 +213,7 @@ pub(crate) fn verify(db: &Connection) -> Result<()> {
         photocraft_scene::validate_name(&initial_name).map_err(|_| Error::Storage)?;
         let id = CanvasId::new(&id).map_err(|_| Error::Storage)?;
         let owner = OwnerId::new(&owner).map_err(|_| Error::Storage)?;
-        let world = state(db, id)?;
+        let world = legacy_state(db, id)?;
         world.validate().map_err(|_| Error::Storage)?;
         if world.import_origin.as_ref().is_some_and(|origin| world.revision < origin.source_revision) {
             return Err(Error::Storage);
@@ -276,7 +300,7 @@ fn page(limit: u32) -> Result<u32> {
     }
     Ok(limit)
 }
-fn state(db: &Connection, canvas: CanvasId) -> Result<WorldState> {
+fn legacy_state(db: &Connection, canvas: CanvasId) -> Result<WorldState> {
     let (body, hash): (Vec<u8>, String) = db.query_row(
         "SELECT substr(CAST(state AS BLOB),1,?2),CAST(substr(CAST(hash AS BLOB),1,65) AS TEXT) FROM worlds WHERE id=?1",
         params![canvas.as_str(), (MAX_STATE_BYTES + 1) as i64],
@@ -290,11 +314,12 @@ fn state(db: &Connection, canvas: CanvasId) -> Result<WorldState> {
 
 /// Callers cap both BLOB and text projections in SQL before reading this row.
 fn read_event(row: &rusqlite::Row<'_>, canvas: CanvasId) -> Result<(AcceptedOp, usize)> {
-    let bytes: Vec<u8> = row.get(0)?;
+    let raw: Vec<u8> = row.get(0)?;
     let hash: String = row.get(1)?;
     let revision = read_u64(row, 2)?;
     let id: String = row.get(3)?;
-    if bytes.len() > MAX_EVENT_BYTES || digest(&bytes) != hash {
+    let bytes = storage_v6::decode_event_body(&raw)?;
+    if hash.len() != 64 || digest(&bytes) != hash {
         return Err(Error::Storage);
     }
     let event: AcceptedOp = serde_json::from_slice(&bytes)?;
@@ -345,12 +370,26 @@ impl Store {
         if serde_json::to_vec(&response)?.len() > wire::MAX_RESPONSE_BYTES {
             return Err(Domain::Limit("canvas response; use a smaller page").into());
         }
+        let queued_ckpt = if let Response::Accepted { event } = &response
+            && event.revision > 0
+            && event.revision.is_multiple_of(storage_v6::CHECKPOINT_STRIDE)
+        {
+            storage_v6::pending_job_at_head(&tx, event.op.canvas, event.revision)?
+        } else {
+            None
+        };
         tx.cache_flush()?;
         observe(SaveStage::BeforeCommit);
         tx.commit()?;
         observe(SaveStage::AfterCommit);
+        if let Some(job) = queued_ckpt {
+            self.queue_pending_checkpoint(job);
+        }
         match &request.action {
-            Action::Delete { canvas, .. } => self.world_presence.remove_canvas(*canvas),
+            Action::Delete { canvas, .. } => {
+                self.world_presence.remove_canvas(*canvas);
+                self.pending_checkpoints.remove(canvas);
+            }
             Action::Remove { canvas, member } => self.world_presence.remove_member(*canvas, *member),
             Action::Leave { canvas } => self.world_presence.remove_member(*canvas, profile),
             _ => {}
@@ -412,9 +451,7 @@ fn dispatch(db: &Transaction<'_>, profile: OwnerId, device: DeviceId, action: &A
                 return Err(Domain::Limit("canvas count").into());
             }
             let world = WorldState::new(*canvas, profile, name.clone()).map_err(scene_error)?;
-            let bytes = serde_json::to_vec(&world)?;
-            db.execute("INSERT INTO worlds VALUES(?1,?2,?3,?3,0,?4,?5)", params![canvas.as_str(), profile.as_str(), name, bytes, digest(&bytes)])?;
-            db.execute("INSERT INTO world_members VALUES(?1,?2,1,1)", params![canvas.as_str(), profile.as_str()])?;
+            storage_v6::insert_world(db, &world)?;
             Ok(Response::Canvas { info: summary(db, *canvas, profile)? })
         }
         Action::List { after, limit } => {
@@ -571,6 +608,10 @@ fn dispatch(db: &Transaction<'_>, profile: OwnerId, device: DeviceId, action: &A
             }
             Ok(Response::Events { events, through, next: (last < through).then_some(last) })
         }
+        Action::CheckpointMeta { canvas } => storage_v6::checkpoint_meta(db, profile, *canvas),
+        Action::CheckpointChunk { canvas, revision, compressed_sha256, offset, len } => {
+            storage_v6::checkpoint_chunk(db, profile, *canvas, *revision, *compressed_sha256, *offset, *len)
+        }
         Action::Presence { .. } | Action::Peers { .. } | Action::PresenceOpen { .. } | Action::PresenceUpdate { .. } | Action::PresenceRead { .. } => {
             Err(Error::Invalid("presence requires the live service channel"))
         }
@@ -609,37 +650,5 @@ fn prior_receipt(db: &Connection, operation: &WorldOp) -> Result<Option<Response
 }
 
 fn append_authorized(db: &Connection, operation: &WorldOp) -> Result<Response> {
-    let mut world = state(db, operation.canvas)?;
-    if world.imported_device(operation.device) {
-        return Err(Domain::Unauthorized.into());
-    }
-    if let Some(prior) = world.receipt(operation.id) {
-        if prior.op != *operation {
-            return Err(Domain::Conflict.into());
-        }
-        return Ok(Response::Accepted { event: Box::new(prior.clone()) });
-    }
-    let event = AcceptedOp { revision: world.revision.checked_add(1).ok_or(Domain::Limit("canvas revision"))?, op: operation.clone() };
-    world.apply(&event).map_err(|error| match error {
-        photocraft_scene::shared::Error::Permission => Domain::Unauthorized.into(),
-        photocraft_scene::shared::Error::Limit(_) => Domain::Limit("canvas operation/history capacity; retain local work").into(),
-        photocraft_scene::shared::Error::Sequence { .. } => Error::Invalid("missing writer operation; synchronize accepted sequence before retry"),
-        photocraft_scene::shared::Error::Revision { .. } => Error::Invalid("missing canvas revision; download the preceding event page"),
-        photocraft_scene::shared::Error::Conflict { .. } | photocraft_scene::shared::Error::DuplicateMismatch => Domain::Conflict.into(),
-        _ => Error::Invalid("canvas operation"),
-    })?;
-    let body = serde_json::to_vec(&world)?;
-    if body.len() > MAX_STATE_BYTES {
-        return Err(Domain::Limit("canvas state; retained work remains safe").into());
-    }
-    let bytes = serde_json::to_vec(&event)?;
-    db.execute(
-        "INSERT INTO world_events VALUES(?1,?2,?3,?4,?5)",
-        params![operation.canvas.as_str(), sql_int(event.revision)?, operation.id.as_str(), bytes, digest(&bytes)],
-    )?;
-    db.execute(
-        "UPDATE worlds SET name=?2,revision=?3,state=?4,hash=?5 WHERE id=?1",
-        params![operation.canvas.as_str(), world.name, sql_int(world.revision)?, body, digest(&body)],
-    )?;
-    Ok(Response::Accepted { event: Box::new(event) })
+    storage_v6::append_authorized_v6(db, operation)
 }

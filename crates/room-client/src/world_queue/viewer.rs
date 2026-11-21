@@ -41,7 +41,7 @@ impl WorldOutbox {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         active(&tx, lease)?;
         let revision: Option<u64> = tx
-            .query_row("SELECT revision FROM snapshots WHERE scope=?1 AND canvas=?2", params![lease.key, canvas.as_str()], |r| read_u64(r, 0))
+            .query_row("SELECT revision FROM canvas_heads WHERE scope=?1 AND canvas=?2", params![lease.key, canvas.as_str()], |r| read_u64(r, 0))
             .optional()
             .map_err(sql)?;
         viewer.validate(canvas, lease.scope.profile, revision.unwrap_or(0))?;
@@ -74,7 +74,7 @@ impl WorldOutbox {
         let viewer: ViewerState = serde_json::from_slice(&bytes).map_err(|_| invalid("Saved viewer state is invalid"))?;
         let revision: Option<u64> = self
             .db
-            .query_row("SELECT revision FROM snapshots WHERE scope=?1 AND canvas=?2", params![lease.key, canvas.as_str()], |r| read_u64(r, 0))
+            .query_row("SELECT revision FROM canvas_heads WHERE scope=?1 AND canvas=?2", params![lease.key, canvas.as_str()], |r| read_u64(r, 0))
             .optional()
             .map_err(sql)?;
         viewer.validate(canvas, lease.scope.profile, revision.unwrap_or(0))?;

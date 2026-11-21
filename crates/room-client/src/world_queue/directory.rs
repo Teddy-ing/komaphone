@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(queue.reconcile_directory(&lease, &baseline, &BTreeSet::new()).unwrap().len(), 2);
         assert!(queue.cached_summaries(&lease, None, 128).unwrap().items.is_empty());
         assert_eq!(queue.recovery(&lease, 10).unwrap().len(), 2);
-        let rows: u64 = queue.db.query_row("SELECT count(*) FROM snapshots", [], |row| read_u64(row, 0)).unwrap();
+        let rows: u64 = queue.db.query_row("SELECT count(*) FROM canvas_heads", [], |row| read_u64(row, 0)).unwrap();
         assert_eq!(rows, 2);
     }
 }

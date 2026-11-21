@@ -91,12 +91,24 @@ fn v4_service_db_migrates_to_v5_with_backup_and_rejects_v2_protocol() {
             100,
         )
         .unwrap();
+    let Response::Events { events: pre_events, .. } =
+        store.world_execute(&token(1), &Request { version: VERSION, action: Action::Events { canvas: c, after: 0, through: None, limit: 16 } }, 100).unwrap()
+    else {
+        panic!("expected events");
+    };
     drop(store);
 
-    // Simulate an existing production v4 database before upgrading.
+    // Simulate an existing production v4 database before upgrading (legacy worlds.state/hash, no v6 tables).
+    let mut legacy_world = WorldState::new(c, owner(1), "Pre-v5 canvas".into()).unwrap();
+    for ev in &pre_events {
+        legacy_world.apply(ev).unwrap();
+    }
+    let legacy_bytes = serde_json::to_vec(&legacy_world).unwrap();
+    let legacy_hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&legacy_bytes));
     let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE worlds SET state=?1,hash=?2 WHERE id=?3", rusqlite::params![&legacy_bytes, &legacy_hash, c.as_str()]).unwrap();
     db.execute_batch(
-        "DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=4)); INSERT INTO world_schema VALUES(4); PRAGMA user_version=4;",
+        "DROP TABLE world_checkpoints; DROP TABLE world_tours_idx; DROP TABLE world_media_idx; DROP TABLE world_strokes_idx; DROP TABLE world_devices; DROP TABLE world_meta; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=4)); INSERT INTO world_schema VALUES(4); PRAGMA user_version=4;",
     )
     .unwrap();
     drop(db);
@@ -113,10 +125,19 @@ fn v4_service_db_migrates_to_v5_with_backup_and_rejects_v2_protocol() {
     assert_eq!(old.query_row::<u32, _, _>("SELECT version FROM world_schema", [], |r| r.get(0)).unwrap(), 4);
     assert_eq!(old.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0)).unwrap(), 4);
     drop(old);
+    let backups_v6: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().contains("before-world-v6-"))
+        .collect();
+    assert_eq!(backups_v6.len(), 1);
 
-    // Old v2 protocol requests are explicitly rejected with DomainError::Version(2).
+    // Old v2 and v3 protocol requests are explicitly rejected with DomainError::Version.
     let old_err = store.world_execute(&token(1), &Request { version: 2, action: Action::Identity {} }, 200).unwrap_err();
     assert!(matches!(old_err, Error::Domain(DomainError::Version(2))));
+    let v3_err = store.world_execute(&token(1), &Request { version: 3, action: Action::Identity {} }, 200).unwrap_err();
+    assert!(matches!(v3_err, Error::Domain(DomainError::Version(3))));
 
     // Append a v2 brush stroke and verify schema promotion + presence preview round-trip.
     let brush = StrokeBrush {

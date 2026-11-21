@@ -22,6 +22,7 @@ chrono = { workspace = true, features = ["clock"] }
 getrandom = { workspace = true }
 clap = { workspace = true }
 sha2 = "0.10"
+flate2 = { workspace = true }
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "blob", "backup"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }

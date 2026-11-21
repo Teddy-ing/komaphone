@@ -10,6 +10,7 @@ use crate::{CanvasId, OwnerId, StrokeId};
 
 pub const MAX_CHUNK_BYTES: usize = 65_536;
 pub const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_ARCHIVE_V3_UNCOMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// Input bound, not membership capacity. 128 summary rows remain below 2 MiB.
 pub const MAX_IMPORTED_ACTORS: usize = 128;
@@ -80,8 +81,28 @@ impl ImportOrigin {
     }
 }
 
-/// Exact existing archive envelope. Encoded bounds are enforced before parsing;
-/// adapters must additionally verify each PNG's bytes/hash/dimensions.
+/// Compact schema-3 archive manifest: stores accepted events ONCE (zlib-rs compressed
+/// JSONL, no double stroke serialization) while keeping the single `world.json` envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveManifestV3 {
+    schema: u32,
+    world_schema: u32,
+    canvas: CanvasId,
+    owner: OwnerId,
+    initial_name: String,
+    limits: Limits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_origin: Option<Box<ImportOrigin>>,
+    revision: u64,
+    events_uncompressed_bytes: u64,
+    events_sha256: AssetHash,
+    events_zlib_b64: String,
+    assets: Vec<MediaFrame>,
+}
+
+/// Exact existing archive envelope (v1/v2) with transparent v3 compressed event-stream support.
+/// Encoded bounds are enforced before parsing; adapters verify each PNG's bytes/hash/dimensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveManifest {
@@ -90,13 +111,113 @@ pub struct ArchiveManifest {
     pub assets: Vec<MediaFrame>,
 }
 impl ArchiveManifest {
+    /// Encode as compact schema-3 `world.json` (single-copy zlib-rs compressed JSONL event log).
+    pub fn encode_v3(&self) -> Result<Vec<u8>> {
+        use base64::Engine;
+        use std::io::Write;
+        self.world.validate()?;
+        self.world.validate_complete_import()?;
+        if !self.world.has_full_history() {
+            return Err(Error::Invalid("archive export requires complete history"));
+        }
+        let mut jsonl = Vec::new();
+        let mut after = 0u64;
+        loop {
+            let page = self.world.events_after(after, super::MAX_EVENT_PAGE)?;
+            if page.is_empty() {
+                break;
+            }
+            for ev in page {
+                let line = serde_json::to_vec(ev).map_err(|_| Error::Invalid("archive event encoding"))?;
+                jsonl.extend_from_slice(&line);
+                jsonl.push(b'\n');
+                after = ev.revision;
+            }
+        }
+        let uncompressed = jsonl.len() as u64;
+        if uncompressed > MAX_ARCHIVE_V3_UNCOMPRESSED_BYTES {
+            return Err(Error::Limit("archive uncompressed events"));
+        }
+        let events_sha256 = AssetHash::new(&format!("{:x}", Sha256::digest(&jsonl)))?;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&jsonl).map_err(|_| Error::Invalid("archive compression"))?;
+        let compressed = enc.finish().map_err(|_| Error::Invalid("archive compression"))?;
+        let v3 = ArchiveManifestV3 {
+            schema: 3,
+            world_schema: self.world.schema,
+            canvas: self.world.canvas,
+            owner: self.world.owner,
+            initial_name: self.world.initial_name().to_owned(),
+            limits: self.world.limits(),
+            import_origin: self.world.import_origin.clone(),
+            revision: self.world.revision,
+            events_uncompressed_bytes: uncompressed,
+            events_sha256,
+            events_zlib_b64: base64::engine::general_purpose::STANDARD.encode(&compressed),
+            assets: self.assets.clone(),
+        };
+        let encoded = serde_json::to_vec(&v3).map_err(|_| Error::Invalid("archive v3 encoding"))?;
+        if encoded.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(Error::Limit("archive manifest bytes"));
+        }
+        Ok(encoded)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() as u64 > MAX_MANIFEST_BYTES {
             return Err(Error::Limit("archive manifest bytes"));
         }
+        #[derive(Deserialize)]
+        struct SchemaProbe {
+            schema: u32,
+        }
+        let probe: SchemaProbe = serde_json::from_slice(bytes).map_err(|_| Error::Invalid("archive manifest"))?;
+        if probe.schema == 3 {
+            return Self::decode_v3(bytes);
+        }
         let value: Self = serde_json::from_slice(bytes).map_err(|_| Error::Invalid("archive manifest"))?;
         value.validate()?;
         Ok(value)
+    }
+
+    fn decode_v3(bytes: &[u8]) -> Result<Self> {
+        use base64::Engine;
+        use std::io::Read;
+        let v3: ArchiveManifestV3 = serde_json::from_slice(bytes).map_err(|_| Error::Invalid("archive v3 manifest"))?;
+        if v3.schema != 3
+            || (v3.world_schema != super::SHARED_SCHEMA && v3.world_schema != super::SHARED_SCHEMA_BRUSH)
+            || v3.events_uncompressed_bytes > MAX_ARCHIVE_V3_UNCOMPRESSED_BYTES
+        {
+            return Err(Error::Schema);
+        }
+        let compressed = base64::engine::general_purpose::STANDARD.decode(v3.events_zlib_b64.as_bytes()).map_err(|_| Error::Invalid("archive v3 base64"))?;
+        if compressed.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(Error::Limit("archive v3 compressed bytes"));
+        }
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice()).take(MAX_ARCHIVE_V3_UNCOMPRESSED_BYTES + 1);
+        let mut jsonl = Vec::new();
+        decoder.read_to_end(&mut jsonl).map_err(|_| Error::Invalid("archive v3 decompression"))?;
+        if jsonl.len() as u64 > MAX_ARCHIVE_V3_UNCOMPRESSED_BYTES || jsonl.len() as u64 != v3.events_uncompressed_bytes {
+            return Err(Error::Limit("archive v3 uncompressed bytes"));
+        }
+        if format!("{:x}", Sha256::digest(&jsonl)) != v3.events_sha256.as_str() {
+            return Err(Error::Invalid("archive v3 event checksum mismatch"));
+        }
+        let mut world = WorldState::with_limits(v3.canvas, v3.owner, v3.initial_name, v3.limits)?;
+        world.import_origin = v3.import_origin;
+        for line in jsonl.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: super::AcceptedOp = serde_json::from_slice(line).map_err(|_| Error::Invalid("archive v3 event"))?;
+            world.apply(&event)?;
+        }
+        if world.revision != v3.revision || world.schema != v3.world_schema {
+            return Err(Error::Invalid("archive v3 revision or schema mismatch"));
+        }
+        let manifest = Self { schema: if world.schema >= super::SHARED_SCHEMA_BRUSH { 2 } else { 1 }, world, assets: v3.assets };
+        manifest.validate()?;
+        Ok(manifest)
     }
     pub fn validate(&self) -> Result<()> {
         let expected_world_schema = match self.schema {

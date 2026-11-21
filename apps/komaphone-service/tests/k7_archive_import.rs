@@ -297,7 +297,9 @@ fn actual_quota_failure_keeps_staged_content_and_commit_can_retry_with_headroom(
     let pages: i64 = db.pragma_query_value(None, "page_count", |r| r.get(0)).unwrap();
     let page_size: i64 = db.pragma_query_value(None, "page_size", |r| r.get(0)).unwrap();
     drop(db);
-    f.store = Store::open(&path, StoreOptions { quota_bytes: ((pages + 1) * page_size) as u64, ..Default::default() }, 100).unwrap();
+    // v6 uses 16 KiB pages + incremental world tables without a monolithic JSON snapshot,
+    // so zero extra pages beyond the vacuumed page count forces real SQLITE_FULL on commit.
+    f.store = Store::open(&path, StoreOptions { quota_bytes: (pages * page_size) as u64, ..Default::default() }, 100).unwrap();
     let failure = f.call(1, Action::ImportCommit { id: id(310) });
     assert!(matches!(failure, Err(photocraft_sync::Error::Full)), "{failure:?}");
     assert!(f.call(1, Action::Info { canvas: canvas(310) }).is_err());
@@ -337,7 +339,9 @@ fn schema_three_migration_retains_verified_backup_and_existing_world() {
     let path = f.root.path().join("service.sqlite3");
     drop(f.store);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=3)); INSERT INTO world_schema VALUES(3); PRAGMA user_version=3;").unwrap();
+    let legacy_body = serde_json::to_vec(&expected).unwrap();
+    db.execute("UPDATE worlds SET state=?1,hash=?2 WHERE id=?3", rusqlite::params![&legacy_body, hash(&legacy_body).as_str(), canvas(320).as_str()]).unwrap();
+    db.execute_batch("DROP TABLE world_checkpoints; DROP TABLE world_tours_idx; DROP TABLE world_media_idx; DROP TABLE world_strokes_idx; DROP TABLE world_devices; DROP TABLE world_meta; DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=3)); INSERT INTO world_schema VALUES(3); PRAGMA user_version=3;").unwrap();
     drop(db);
     f.store = Store::open(&path, StoreOptions::default(), 200).unwrap();
     assert_eq!(f.read(320), expected);
@@ -362,10 +366,11 @@ fn schema_three_migration_retains_verified_backup_and_existing_world() {
     assert_eq!(hash(&std::fs::read(&backup).unwrap()), before);
     let db = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = db.query_row("SELECT version FROM world_schema", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let user_version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert!(std::fs::read_dir(f.root.path()).unwrap().map(|e| e.unwrap().path()).any(|p| p.file_name().unwrap().to_string_lossy().contains("before-world-v5")));
+    assert!(std::fs::read_dir(f.root.path()).unwrap().map(|e| e.unwrap().path()).any(|p| p.file_name().unwrap().to_string_lossy().contains("before-world-v6")));
 }
 
 #[test]
@@ -391,8 +396,32 @@ fn real_restore_quarantines_incomplete_import_but_preserves_accepted_copy_and_re
     }
     assert_eq!(db.query_row("SELECT count(*) FROM world_import_receipts", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     assert_eq!(db.query_row("SELECT count(*) FROM hosted_profiles WHERE revoked=0", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    let bytes: Vec<u8> = db.query_row("SELECT state FROM worlds WHERE id=?1", [canvas(330).as_str()], |r| r.get(0)).unwrap();
-    assert_eq!(serde_json::from_slice::<WorldState>(&bytes).unwrap(), expected);
+    assert_eq!(db.query_row("SELECT revision FROM worlds WHERE id=?1", [canvas(330).as_str()], |r| r.get::<_, i64>(0)).unwrap() as u64, expected.revision);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM world_events WHERE canvas=?1", [canvas(330).as_str()], |r| r.get::<_, i64>(0)).unwrap() as u64,
+        expected.revision
+    );
+    drop(db);
+    let restored_store = Store::open(restored.join("service.sqlite3"), StoreOptions::default(), 400).unwrap();
+    // Re-verify restored world matches expected canonical state via verified reopen + event replay.
+    let db2 = rusqlite::Connection::open(restored.join("service.sqlite3")).unwrap();
+    let mut stmt = db2.prepare("SELECT body FROM world_events WHERE canvas=?1 ORDER BY revision").unwrap();
+    let mut rebuilt =
+        WorldState::with_import_origin(expected.canvas, expected.owner, expected.initial_name().to_owned(), expected.import_origin.clone()).unwrap();
+    for raw in stmt.query_map([canvas(330).as_str()], |r| r.get::<_, Vec<u8>>(0)).unwrap() {
+        let raw = raw.unwrap();
+        let json = if let Some(payload) = raw.strip_prefix(b"KZ1\0") {
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(payload), &mut out).unwrap();
+            out
+        } else {
+            raw
+        };
+        let ev: photocraft_scene::shared::AcceptedOp = serde_json::from_slice(&json).unwrap();
+        rebuilt.apply(&ev).unwrap();
+    }
+    assert_eq!(rebuilt, expected);
+    drop(restored_store);
 }
 
 #[test]

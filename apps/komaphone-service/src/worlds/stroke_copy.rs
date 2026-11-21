@@ -1,4 +1,4 @@
-use super::{append_authorized, denied, grant, scene_error, state, summary};
+use super::{append_authorized, denied, grant, scene_error, storage_v6, summary};
 use crate::{Error, Result};
 use photocraft_scene::OwnerId;
 use photocraft_scene::shared::media::Credit;
@@ -16,13 +16,13 @@ pub(super) fn copy(db: &Connection, profile: OwnerId, device: DeviceId, operatio
     };
     // Current permission and visibility are required even for duplicate receipts.
     let source_info = summary(db, provenance.canvas, profile)?;
-    let source_world = state(db, provenance.canvas)?;
+    let source_world = storage_v6::reconstruct_world(db, provenance.canvas, false)?;
     source_world.validate().map_err(|_| Error::Storage)?;
     if source_world.canvas != provenance.canvas
         || source_world.owner != source_info.owner
         || source_world.revision != source_info.revision
         || source_world.name != source_info.name
-        || source_world.replay_to(0).map_err(|_| Error::Storage)?.name != source_info.initial_name
+        || source_world.initial_name() != source_info.initial_name
     {
         return Err(Error::Storage);
     }

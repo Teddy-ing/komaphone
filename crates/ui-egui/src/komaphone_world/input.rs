@@ -237,8 +237,8 @@ pub(super) fn pointer(app: &mut PhotocraftApp, ui: &mut egui::Ui, rect: Rect, re
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
-    if camera != view.camera {
-        run(app, "komaphone.world.camera", json!({"camera":camera}));
+    if camera != view.camera && run(app, "komaphone.world.camera", json!({"camera":camera,"persist":false})) {
+        app.ui.world.view_save_due = Some(now + 0.30);
     }
     presence(app, ui, rect, &Viewport { camera, ..view.clone() });
 }

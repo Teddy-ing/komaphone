@@ -1,5 +1,7 @@
 # Komaphone project direction
 
+**Current workflow (owner update 2026-11-21):** Antigravity verifies each authorized item, records Complete (worker-verified), and continues to the next ready item without Codex review or handoff approval. This supersedes older review-stop wording below, including copied prompts and Awaiting review states. Preserve historical evidence; reconcile pending items against current source and finish missing checks before closing them. Codex review is optional on owner request. Testing, external acceptance and live-action authorization requirements remain. See orchestration-workflow.md (under docs/komaphone from the repository root).
+
 This repository is now Teddy-ing/komaphone, an independent private drawing game based on PhotoCraft. The product is a mouse-first Windows app: two/three-player Animation and Exquisite Corpse first, then multiple named persistent canvases with deep zoom and independently chosen member lists of variable size. A small private sync service is the chosen architecture. Preserve upstream copyright, license, and contributor attribution. Do not restore the removed ArtCraft brand marks or imply upstream endorsement.
 
 ## Komaphone instructions take precedence

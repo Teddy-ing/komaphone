@@ -1,6 +1,7 @@
 use super::*;
 use crate::world_queue::{Edit, WorldOp};
 use crate::world_worker::WorldAccess;
+use photocraft_scene::shared::WorldState;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -54,7 +55,7 @@ fn moves_exact_operations_sequences_snapshots_review_and_rejects_retired_source_
     queue.relocate_endpoint(&plan, &verified).unwrap();
     assert!(queue.ensure_current(&lease).is_err());
     assert!(queue.activate(lease.scope.clone()).is_err());
-    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
+    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 4);
     drop(queue);
     let mut queue = WorldOutbox::open(temp.path().join("world.db")).unwrap();
     queue.relocate_endpoint(&plan, &verified).unwrap();
@@ -122,19 +123,40 @@ fn old_schema_gets_readable_backup_before_version_two_retirement_rules() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("old.db");
     let queue = WorldOutbox::open(&path).unwrap();
-    queue.db.execute_batch("DROP TABLE scope_moves; PRAGMA user_version=1;").unwrap();
+    queue.db.execute_batch("DROP TABLE scope_moves; DROP TABLE canvas_heads; DROP TABLE accepted_events; DROP TABLE canvas_checkpoints; DROP TABLE checkpoint_staging; DROP TABLE checkpoint_staging_chunks; PRAGMA user_version=1;").unwrap();
     drop(queue);
     let queue = WorldOutbox::open(&path).unwrap();
-    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
+    assert_eq!(queue.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 4);
     let backup = Connection::open(path.with_file_name("old.db.pre-relocation-schema-v1.sqlite3")).unwrap();
     assert_eq!(backup.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 1);
     drop(queue);
     let path2 = temp.path().join("old2.db");
     let queue2 = WorldOutbox::open(&path2).unwrap();
-    queue2.db.execute_batch("PRAGMA user_version=2;").unwrap();
+    queue2.db.execute_batch("DROP TABLE canvas_heads; DROP TABLE accepted_events; DROP TABLE canvas_checkpoints; DROP TABLE checkpoint_staging; DROP TABLE checkpoint_staging_chunks; PRAGMA user_version=2;").unwrap();
     drop(queue2);
     let queue2 = WorldOutbox::open(&path2).unwrap();
-    assert_eq!(queue2.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
+    assert_eq!(queue2.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 4);
     let backup2 = Connection::open(path2.with_file_name("old2.db.pre-brush-schema-v2.sqlite3")).unwrap();
     assert_eq!(backup2.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 2);
+    drop(queue2);
+    // Schema v3 with legacy `snapshots` row migrates cleanly to v4 with backup and preserves artwork.
+    let path3 = temp.path().join("old3.db");
+    let mut queue3 = WorldOutbox::open(&path3).unwrap();
+    let profile = OwnerId::new(&"1".repeat(32)).unwrap();
+    let device = DeviceId::new(&"2".repeat(32)).unwrap();
+    let scope = WorldScope::new("https://original.example", profile, device).unwrap();
+    let lease = queue3.activate(scope.clone()).unwrap();
+    let canvas = CanvasId::new(&"7".repeat(32)).unwrap();
+    queue3.grant(&lease, canvas, 1, 1).unwrap();
+    let world = WorldState::new(canvas, profile, "Legacy v3".into()).unwrap();
+    let raw = serde_json::to_vec(&world).unwrap();
+    queue3.db.execute("INSERT INTO snapshots VALUES(?1,?2,0,?3,?4)", params![lease.key, canvas.as_str(), &raw, checksum(&lease.key, canvas, &raw)]).unwrap();
+    queue3.db.execute_batch("DROP TABLE canvas_heads; DROP TABLE accepted_events; DROP TABLE canvas_checkpoints; DROP TABLE checkpoint_staging; DROP TABLE checkpoint_staging_chunks; PRAGMA user_version=3;").unwrap();
+    drop(queue3);
+    let mut queue3 = WorldOutbox::open(&path3).unwrap();
+    assert_eq!(queue3.db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 4);
+    let backup3 = Connection::open(path3.with_file_name("old3.db.pre-world-v4.sqlite3")).unwrap();
+    assert_eq!(backup3.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)).unwrap(), 3);
+    let lease3 = queue3.activate(scope).unwrap();
+    assert_eq!(queue3.load_snapshot(&lease3, canvas).unwrap().unwrap().name, "Legacy v3");
 }

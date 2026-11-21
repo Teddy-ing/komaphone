@@ -9,7 +9,7 @@ use photocraft_scene::world_protocol::{ImportObject, Response};
 use photocraft_scene::{CanvasId, OwnerId};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{Limits, MAX_EVENT_BYTES, MAX_STATE_BYTES, media, require_owner, scene_error, summary};
+use super::{Limits, media, require_owner, scene_error, storage_v6, summary};
 use crate::store::{digest, read_u64, sql_int};
 use crate::{Error, Result};
 
@@ -312,35 +312,8 @@ pub(super) fn commit(db: &Transaction<'_>, profile: OwnerId, device: DeviceId, i
         return Err(Domain::Limit("canvas or retained import receipt capacity").into());
     }
     let copied = manifest.world.import_to(item.canvas, profile).map_err(scene_error)?;
-    let body = serde_json::to_vec(&copied)?;
-    if body.len() > MAX_STATE_BYTES {
-        return Err(Domain::Limit("imported canvas checkpoint").into());
-    }
-    let initial = copied.replay_to(0).map_err(scene_error)?.name;
-    db.execute(
-        "INSERT INTO worlds VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![item.canvas.as_str(), profile.as_str(), copied.name, initial, sql_int(copied.revision)?, body, digest(&body)],
-    )?;
-    db.execute("INSERT INTO world_members VALUES(?1,?2,1,1)", params![item.canvas.as_str(), profile.as_str()])?;
+    storage_v6::insert_world(db, &copied)?;
     store_origin(db, &copied)?;
-    let mut after = 0;
-    loop {
-        let events = copied.events_after(after, photocraft_scene::shared::MAX_EVENT_PAGE).map_err(scene_error)?;
-        if events.is_empty() {
-            break;
-        }
-        for event in events {
-            let body = serde_json::to_vec(&event)?;
-            if body.len() > MAX_EVENT_BYTES {
-                return Err(Domain::Limit("imported event bytes").into());
-            }
-            db.execute(
-                "INSERT INTO world_events VALUES(?1,?2,?3,?4,?5)",
-                params![item.canvas.as_str(), sql_int(event.revision)?, event.op.id.as_str(), body, digest(&body)],
-            )?;
-            after = event.revision;
-        }
-    }
     for frame in &manifest.assets {
         let (bytes, received): (Vec<u8>, u64) = db
             .query_row(

@@ -423,7 +423,70 @@ fn deep_zoom_catchup_tour_and_schema2_archive_agree_on_brush_strokes() {
     export_tour_gif(&frozen, &gif_path, true, &mut no_assets, |_, _| true).unwrap();
     assert!(std::fs::metadata(&gif_path).unwrap().len() > 100);
 
-    // WorldRenderer::visible_content includes both the depth-0 ancestor stroke and depth-6 detail stroke.
+    // Offscreen depth-0 stroke at (40, 60) is cleanly culled from `view_d6` near (0, 0);
+    // once a depth-0 ancestor actually intersects (0, 0), `visible_content(&view_d6)` includes both!
     let mut renderer = WorldRenderer::new(&world).unwrap();
-    assert_eq!(renderer.visible_content(&view_d6).unwrap().len(), 2);
+    assert_eq!(renderer.visible_content(&view_d6).unwrap().len(), 1);
+    append(&mut world, 1, make_stroke(3, 1, 0, &soft, &[(-10.0, 0.0, 0.0), (10.0, 0.0, 0.0)]));
+    let mut renderer2 = WorldRenderer::new(&world).unwrap();
+    assert_eq!(renderer2.visible_content(&view_d6).unwrap().len(), 2);
+}
+
+#[test]
+fn archive_v3_ten_thousand_five_hundred_revisions_roundtrip_and_size_bound() {
+    let mut world = WorldState::new(canvas(), owner(0), "Archive 10500".into()).unwrap();
+    for rev in 1..=10_500_u64 {
+        let author = (rev % 6) as u128;
+        let mut points = Vec::with_capacity(60);
+        let mut samples = Vec::with_capacity(60);
+        let bx = ((rev % 80) as f64 - 40.0) * 10.0;
+        let by = (((rev / 80) % 80) as f64 - 40.0) * 10.0;
+        for i in 0..60 {
+            let t = i as f64;
+            points.push([bx + t * 1.2, by + (t * 0.2).sin() * 4.0]);
+            samples.push(StrokeSample { time_ms: t * 8.0, ..Default::default() });
+        }
+        let stroke = Stroke {
+            id: StrokeId::new(&hex(500_000 + u128::from(rev))).unwrap(),
+            canvas: canvas(),
+            owner: owner(author),
+            revision: 0,
+            anchor: RegionKey {
+                depth: if rev % 10 == 0 {
+                    12
+                } else if rev % 5 == 0 {
+                    6
+                } else {
+                    0
+                },
+                ..Default::default()
+            },
+            points,
+            width: 12.0,
+            color: Srgba { rgba: [0.2, 0.4, 0.7, 0.8] },
+            erase: false,
+            brush: Some(Box::new(photocraft_scene::brush::StrokeBrush { authored_size: 12.0, hardness: 0.5, opacity: 0.8, seed: rev, ..Default::default() })),
+            samples: Some(samples),
+        };
+        append(&mut world, author, stroke);
+    }
+    assert_eq!(world.revision, 10_500);
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive_path = dir.path().join("scale-10500.komworld");
+    export_archive(&world, &archive_path, &mut no_assets, |_, _| true).unwrap();
+
+    let world_json_bytes = std::fs::metadata(archive_path.join("world.json")).unwrap().len();
+    eprintln!("[CP5 10,500-rev ARCHIVE v3] world.json={:.2} MiB ({} bytes)", world_json_bytes as f64 / (1024.0 * 1024.0), world_json_bytes);
+    assert!(world_json_bytes <= 12 * 1024 * 1024, "10,500-rev .komworld world.json exceeded 12 MiB target: {} bytes", world_json_bytes);
+
+    let (restored, assets) = read_archive(&archive_path).unwrap();
+    assert!(assets.is_empty());
+    assert_eq!(restored.revision, 10_500);
+    assert_eq!(restored.strokes.len(), 10_500);
+    assert_eq!(restored.canonical_hash().unwrap(), world.canonical_hash().unwrap());
+
+    let upload = photocraft_engine::world_media::inspect_archive_for_upload(&archive_path, &mut || true).unwrap();
+    assert_eq!(upload.world.revision, 10_500);
+    assert_eq!(upload.manifest_bytes, world_json_bytes);
 }

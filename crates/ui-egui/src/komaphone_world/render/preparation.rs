@@ -1,7 +1,11 @@
 //! One bounded native CPU worker per window. Replacing the latest request cannot
 //! spawn extra workers or publish a stale account/canvas/review projection.
+//!
+//! Uses incremental `WorldRenderer::apply_accepted` and `step_review_to` within
+//! the same scope so edits and catch-up playback update in O(1) and return exact
+//! `dirty_rects` (preserving unaffected tiles across the pyramid).
 use photocraft_engine::{
-    scene::{CanvasId, shared::WorldState},
+    scene::{CanvasId, shared::WorldState, spatial::WorldRect},
     world_media::WorldRenderer,
     worlds::Account,
 };
@@ -39,6 +43,7 @@ struct Request {
 pub(super) struct Completed {
     pub key: Key,
     pub result: Result<WorldRenderer, String>,
+    pub dirty_rects: Option<Vec<WorldRect>>,
 }
 #[derive(Default)]
 struct Mailbox {
@@ -77,8 +82,6 @@ impl Worker {
     }
     pub fn invalidate(&self) {
         let mut mailbox = lock(&self.shared);
-        // A different scope cannot reuse an exhausted serial. No new request
-        // can be issued after that practically unreachable limit.
         mailbox.serial = mailbox.serial.saturating_add(1);
         mailbox.request = None;
     }
@@ -95,6 +98,7 @@ impl Drop for Worker {
     }
 }
 fn run(shared: Arc<Shared>, mut before: impl FnMut(&Key)) {
+    let mut cached: Option<(Key, WorldRenderer)> = None;
     loop {
         let (serial, request) = {
             let mut mailbox = lock(&shared);
@@ -108,18 +112,89 @@ fn run(shared: Arc<Shared>, mut before: impl FnMut(&Key)) {
             (mailbox.serial, request)
         };
         before(&request.key);
-        let result = prepare(&request);
+        let (result, dirty_rects) = prepare_incremental(&request, &mut cached);
         let mut mailbox = lock(&shared);
         if mailbox.closed {
             return;
         }
         if mailbox.serial == serial || (result.is_ok() && mailbox.request.as_ref().is_some_and(|latest| request.key.may_show_before(&latest.key))) {
-            let previous = mailbox.result.replace(Completed { key: request.key, result });
+            let previous = mailbox.result.replace(Completed { key: request.key, result, dirty_rects });
             drop(mailbox);
             drop(previous);
         }
     }
 }
+
+fn prepare_incremental(request: &Request, cached: &mut Option<(Key, WorldRenderer)>) -> (Result<WorldRenderer, String>, Option<Vec<WorldRect>>) {
+    if request.source.canvas != request.key.scope.canvas {
+        *cached = None;
+        return (Err("Shared view source belongs to another canvas".into()), None);
+    }
+    // Check if we can incrementally advance/step an existing cached renderer in the exact same scope.
+    if let Some((prev_key, prev_renderer)) = cached.as_mut()
+        && prev_key.scope == request.key.scope
+    {
+        match (&prev_key.revision, &request.key.revision) {
+            (Revision::Live { display: old_disp, pending: old_pending, .. }, Revision::Live { display: new_disp, pending: new_pending, .. })
+                if request.source.revision == *new_disp
+                    && *new_disp > *old_disp
+                    && *new_disp - *old_disp <= 64
+                    && (*old_pending == 0 || *new_pending >= *old_pending)
+                    && same_history_tip(prev_renderer.world(), &request.source, *old_disp) =>
+            {
+                let delta = (*new_disp - *old_disp) as usize;
+                if let Ok(events) = request.source.events_after(*old_disp, delta) {
+                    let mut dirty = Vec::new();
+                    let mut ok = true;
+                    for ev in events {
+                        match prev_renderer.apply_accepted(ev) {
+                            Ok(Some(r)) => dirty.push(r),
+                            Ok(None) => {}
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && prev_renderer.world().revision == *new_disp {
+                        *prev_key = request.key.clone();
+                        return (Ok(prev_renderer.clone()), Some(dirty));
+                    }
+                }
+            }
+            (Revision::Review { end: old_end, .. }, Revision::Review { end: new_end, position: new_pos })
+                if old_end == new_end && *new_pos <= *new_end && *new_end <= request.source.revision =>
+            {
+                if let Ok(dirty) = prev_renderer.step_review_to(&request.source, *new_pos) {
+                    *prev_key = request.key.clone();
+                    return (Ok(prev_renderer.clone()), Some(dirty));
+                }
+            }
+            _ => {}
+        }
+    }
+    let result = prepare(request);
+    match result {
+        Ok(renderer) => {
+            *cached = Some((request.key.clone(), renderer.clone()));
+            (Ok(renderer), None)
+        }
+        Err(e) => {
+            *cached = None;
+            (Err(e), None)
+        }
+    }
+}
+
+fn same_history_tip(old: &WorldState, new: &WorldState, rev: u64) -> bool {
+    if rev == 0 {
+        return true;
+    }
+    let old_tip = old.events_after(rev - 1, 1).ok().and_then(|s| s.first()).map(|e| e.op.id);
+    let new_tip = new.events_after(rev - 1, 1).ok().and_then(|s| s.first()).map(|e| e.op.id);
+    old_tip.is_some() && old_tip == new_tip
+}
+
 fn prepare(request: &Request) -> Result<WorldRenderer, String> {
     if request.source.canvas != request.key.scope.canvas {
         return Err("Shared view source belongs to another canvas".into());

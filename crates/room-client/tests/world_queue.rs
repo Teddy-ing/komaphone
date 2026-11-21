@@ -557,7 +557,7 @@ fn cached_directory_reopens_scoped_and_paginated_without_revoked_grants() {
     assert!(queue.cached_summaries(&lease, None, 128).is_err());
     let lease = queue.activate(identity).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("UPDATE snapshots SET hash='corrupt' WHERE canvas=?1", [conflicted.as_str()]).unwrap();
+    db.execute("UPDATE canvas_heads SET hash='corrupt' WHERE canvas=?1", [conflicted.as_str()]).unwrap();
     assert!(queue.cached_summaries(&lease, None, 128).unwrap_err().to_string().contains("checksum"));
-    assert_eq!(db.query_row("SELECT count(*) FROM snapshots", [], |row| row.get::<_, u32>(0)).unwrap(), 130);
+    assert_eq!(db.query_row("SELECT count(*) FROM canvas_heads", [], |row| row.get::<_, u32>(0)).unwrap(), 130);
 }

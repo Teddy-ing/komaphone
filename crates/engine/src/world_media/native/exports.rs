@@ -214,8 +214,13 @@ pub fn export_archive(
         }
         crate::gallery_media::write_new_file(&staging.path().join(format!("{}.png", frame.hash.as_str())), &data)?;
     }
-    let schema = if world.schema >= photocraft_scene::shared::SHARED_SCHEMA_BRUSH { 2 } else { 1 };
-    let manifest = serde_json::to_vec(&ArchiveManifest { schema, world: world.clone(), assets: assets.into_values().collect() }).map_err(other)?;
+    let asset_list: Vec<MediaFrame> = assets.into_values().collect();
+    let manifest = if world.revision >= 256 {
+        photocraft_scene::shared::archive_import::ArchiveManifest { schema: 3, world: world.clone(), assets: asset_list }.encode_v3().map_err(other)?
+    } else {
+        let schema = if world.schema >= photocraft_scene::shared::SHARED_SCHEMA_BRUSH { 2 } else { 1 };
+        serde_json::to_vec(&ArchiveManifest { schema, world: world.clone(), assets: asset_list }).map_err(other)?
+    };
     if manifest.len() as u64 > MAX_ARCHIVE_MANIFEST || bytes.saturating_add(manifest.len() as u64) > MAX_EXPORT_BYTES {
         return Err(error("World archive manifest or total exceeds its output budget"));
     }
@@ -329,39 +334,10 @@ fn read_archive_impl(path: &Path, retain_assets: bool) -> Result<(WorldState, BT
     if bytes.len() as u64 > MAX_ARCHIVE_MANIFEST {
         return Err(error("World archive manifest exceeds 32 MiB"));
     }
-    let manifest: ArchiveManifest = serde_json::from_slice(&bytes).map_err(other)?;
-    let expected_world = match manifest.schema {
-        1 => photocraft_scene::shared::SHARED_SCHEMA,
-        2 => photocraft_scene::shared::SHARED_SCHEMA_BRUSH,
-        _ => return Err(error("Unsupported world archive schema")),
-    };
-    manifest.world.validate().map_err(other)?;
-    if manifest.world.schema != expected_world {
-        return Err(error("Unsupported world archive schema"));
-    }
-    if manifest.assets.len() > manifest.world.limits().max_media_frames {
-        return Err(error("Too many world archive assets"));
-    }
-    let mut expected = BTreeMap::new();
-    for media in manifest.world.media.values() {
-        for frame in &media.media.frames {
-            let descriptor = (frame.byte_len, frame.width, frame.height);
-            if expected.insert(frame.hash, descriptor).is_some_and(|prior| prior != descriptor) {
-                return Err(error("Retained content has conflicting immutable asset descriptors"));
-            }
-        }
-    }
-    if expected.len() != manifest.assets.len() {
-        return Err(error("World archive asset inventory differs from retained content"));
-    }
+    let manifest = photocraft_scene::shared::archive_import::ArchiveManifest::decode(&bytes).map_err(other)?;
     let mut assets = BTreeMap::new();
-    let mut seen = std::collections::BTreeSet::new();
     let mut total = bytes.len() as u64;
     for frame in manifest.assets {
-        if expected.get(&frame.hash) != Some(&(frame.byte_len, frame.width, frame.height)) || !seen.insert(frame.hash) {
-            return Err(error("World archive asset reference mismatch"));
-        }
-        frame.validate().map_err(other)?;
         let mut data = Vec::new();
         File::open(path.join(format!("{}.png", frame.hash.as_str()))).map_err(other)?.take(frame.byte_len + 1).read_to_end(&mut data).map_err(other)?;
         total = total.saturating_add(data.len() as u64);

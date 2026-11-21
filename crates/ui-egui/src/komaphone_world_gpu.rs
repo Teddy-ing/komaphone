@@ -1,35 +1,45 @@
-//! Native shared-canvas GPU compositor. Each device's drawing is rasterized into
-//! an isolated transparent scratch layer; erase never touches another device.
-//! The scratch allocation is reused after compositing, so texture memory does not
-//! multiply by the number of members. Scene projection remains indexed and bounded.
-use std::collections::{BTreeMap, BTreeSet};
+//! Single-pass `260×260×N` `Texture2DArray` shared-canvas GPU tile presenter.
+//!
+//! Replaces per-stroke GPU render passes and screen-space cache wipes with
+//! world-space LOD tiles (`256` interior + `2 px` directly rasterized apron),
+//! a reusable staging ring, reconciled desktop (`256`-layer, `66.02 MiB`) and
+//! Safe-GPU/WARP (`128`-layer, `33.01 MiB`) budgets, non-blocking progressive
+//! refinement with temporary coarse/fine fallback, and a pure-CPU fallback when
+//! `gpu_render_state` is unavailable.
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use eframe::{egui_wgpu::RenderState, wgpu};
+#[cfg(test)]
+use photocraft_engine::{
+    scene::shared::media::AssetHash,
+    world_brush::RasterizedBrushStroke,
+    world_media::WorldRenderer,
+    world_tiles::{TileComposeParams, compose_world_tile},
+};
 use photocraft_engine::{
     scene::{
-        StrokeId, Viewport, coordinates, render, round,
-        shared::{
-            DeviceId, SharedStroke,
-            media::{AssetHash, MediaFrame},
-        },
+        StrokeId, Viewport,
+        shared::{DeviceId, SharedStroke, media::MediaFrame},
+        spatial::{MAX_TILE_LOD, TILE_PHYSICAL, TileKey, WorldRect, fallback_quads, select_target_lod, stroke_world_rect, visible_tiles},
     },
-    world_brush::{MAX_BRUSH_WORK_SAMPLES, RasterizedBrushStroke, WORLD_BRUSH_TILE, blend_mode_to_paint, composite_brush_onto_layer, rasterize_world_stroke},
-    world_media::{VisibleObject, WorldRenderer},
+    world_brush::LiveTileBrush,
+    world_tiles::{RgbaFrame, SplitWarmJob, TileBudget, WorldTileManager},
 };
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cp6_bench;
 mod geometry;
 #[cfg(test)]
 pub(crate) mod tests;
-use geometry::{BrushOp, Geometry, Kind, TileCopy};
+
+pub use geometry::CpuTilePresenter;
+use geometry::{ALIGNED_ROW_BYTES, STAGING_TILE_BYTES, SlotKind, TileAtlas, TileQuadBatch, pad_tile_rows};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const MAX_PIXELS: u64 = 8_388_608;
-const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_BRUSH_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_STAGING_BYTES: usize = 128 * 1024 * 1024;
-const TILE_STRIDE_BYTES: u32 = WORLD_BRUSH_TILE * 4;
-const TILE_BYTES: usize = (WORLD_BRUSH_TILE * WORLD_BRUSH_TILE * 4) as usize;
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -40,98 +50,49 @@ pub struct Stats {
     pub texture_bytes: u64,
     pub uploaded_asset_bytes: u64,
     pub pending_assets: usize,
+    pub tile_array_bytes: u64,
+    pub visible_tiles: usize,
+    pub resident_tiles: usize,
+    pub fallback_tiles: usize,
+    pub pending_tiles: usize,
+    pub anim_pending_tiles: usize,
+    pub uploads_this_frame: usize,
+    pub target_lod: u8,
+    pub is_refining: bool,
 }
 
-struct Surface {
+struct OutputSurface {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
-    bind: wgpu::BindGroup,
-}
-
-struct Asset {
-    _surface: Surface,
-    descriptor: MediaFrame,
-    bytes: u64,
 }
 
 struct Targets {
     size: [u32; 2],
-    scratch: Surface,
-    output: Surface,
-    /// Lazily allocated only when brush strokes are present; preserves the legacy
-    /// `MAX_PIXELS * 8` memory budget for scenes with opaque round strokes only.
-    stroke: Option<Surface>,
+    output: OutputSurface,
     id: egui::TextureId,
 }
 
-struct CachedTile {
-    x0: u32,
-    y0: u32,
-    width: u32,
-    height: u32,
-    rgba8: Vec<u8>,
-}
-
-struct CachedBrush {
-    op: BrushOp,
-    tiles: Vec<CachedTile>,
-    bytes: usize,
-}
-
-#[derive(Default)]
-struct BrushCache {
-    view: Option<Viewport>,
-    density: u32,
-    entries: BTreeMap<(StrokeId, u64), Arc<CachedBrush>>,
-    bytes: usize,
-}
-
-impl BrushCache {
-    fn sync_view(&mut self, view: &Viewport, density: f32) {
-        let bits = density.to_bits();
-        if self.view.as_ref() != Some(view) || self.density != bits {
-            self.entries.clear();
-            self.bytes = 0;
-            self.view = Some(view.clone());
-            self.density = bits;
-        }
-    }
-
-    fn retain_ids(&mut self, keep: &BTreeSet<(StrokeId, u64)>) {
-        self.entries.retain(|k, _| keep.contains(k));
-        self.bytes = self.entries.values().map(|e| e.bytes).sum();
-    }
-
-    fn insert(&mut self, key: (StrokeId, u64), value: Arc<CachedBrush>) {
-        if value.bytes > MAX_BRUSH_CACHE_BYTES {
-            return;
-        }
-        while self.bytes.saturating_add(value.bytes) > MAX_BRUSH_CACHE_BYTES {
-            let Some(first_key) = self.entries.keys().next().copied() else { break };
-            if let Some(removed) = self.entries.remove(&first_key) {
-                self.bytes = self.bytes.saturating_sub(removed.bytes);
-            }
-        }
-        self.bytes = self.bytes.saturating_add(value.bytes);
-        self.entries.insert(key, value);
-    }
+struct PendingUpload {
+    layer: u32,
+    rgba8: Arc<Vec<u8>>,
 }
 
 pub struct WorldGpu {
     rs: RenderState,
     health: photocraft_gpu::DeviceHealth,
-    layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    normal: wgpu::RenderPipeline,
-    erase: wgpu::RenderPipeline,
-    image: wgpu::RenderPipeline,
-    brush_normal: wgpu::RenderPipeline,
-    brush_erase: wgpu::RenderPipeline,
-    brush_behind: wgpu::RenderPipeline,
-    composite: wgpu::RenderPipeline,
+    budget: TileBudget,
+    tile_array: wgpu::Texture,
+    tile_bind: wgpu::BindGroup,
+    tile_pipeline: wgpu::RenderPipeline,
+    staging_ring: wgpu::Buffer,
+    staging_slots: usize,
+    pad_scratch: Vec<u8>,
+    atlas: TileAtlas,
+    quads: TileQuadBatch,
     targets: Option<Targets>,
-    assets: BTreeMap<AssetHash, Asset>,
-    brush_cache: BrushCache,
+    last_scope_gen: u64,
+    last_lod: Option<u8>,
+    frame_counter: u64,
     pub stats: Stats,
 }
 
@@ -145,19 +106,50 @@ impl Drop for WorldGpu {
 
 impl WorldGpu {
     pub fn new(rs: &RenderState, health: photocraft_gpu::DeviceHealth) -> Result<Self> {
+        let info = rs.adapter.get_info();
+        let max_layers = rs.device.limits().max_texture_array_layers;
+        let budget = if info.device_type == wgpu::DeviceType::Cpu || max_layers < 256 { TileBudget::conservative() } else { TileBudget::desktop() };
+        Self::new_with_budget(rs, health, budget)
+    }
+
+    pub fn new_with_budget(rs: &RenderState, health: photocraft_gpu::DeviceHealth, mut budget: TileBudget) -> Result<Self> {
         if let Some(fault) = health.fault() {
             return Err(fault.to_string());
         }
+        let max_layers = rs.device.limits().max_texture_array_layers;
+        if budget.gpu_layers > max_layers {
+            budget = TileBudget::conservative();
+            budget.gpu_layers = budget.gpu_layers.min(max_layers).max(16);
+        }
         let device = &rs.device;
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("world texture"),
+        let tile_array = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("world tile array"),
+            size: wgpu::Extent3d { width: TILE_PHYSICAL, height: TILE_PHYSICAL, depth_or_array_layers: budget.gpu_layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let array_view = tile_array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("world tile linear"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("world tile array layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -170,51 +162,612 @@ impl WorldGpu {
                 },
             ],
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("world pixels"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
+        let tile_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world tile array bind"),
+            layout: &bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&array_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
         });
-        let shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("world author layers"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
-        let plain = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("world plain"), bind_group_layouts: &[], immediate_size: 0 });
-        let textured = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("world textured"),
-            bind_group_layouts: &[Some(&layout)],
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("world tile array shader"),
+            source: wgpu::ShaderSource::Wgsl(TILE_SHADER.into()),
+        });
+        let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("world tile array pipeline layout"),
+            bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
-        let normal = pipeline(device, &plain, &shader, "vs", "color", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, true);
-        let clear =
-            wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
-        let erase = pipeline(device, &plain, &shader, "vs", "color", wgpu::BlendState { color: clear, alpha: clear }, true);
-        let image = pipeline(device, &textured, &shader, "vs", "image", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, true);
-        let brush_normal = pipeline(device, &textured, &shader, "vs", "composite", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, true);
-        let brush_erase = pipeline(device, &textured, &shader, "vs", "composite", wgpu::BlendState { color: clear, alpha: clear }, true);
-        let dst_over =
-            wgpu::BlendComponent { src_factor: wgpu::BlendFactor::OneMinusDstAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let brush_behind = pipeline(device, &textured, &shader, "vs", "composite", wgpu::BlendState { color: dst_over, alpha: dst_over }, true);
-        let composite = pipeline(device, &textured, &shader, "quad", "composite", wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, false);
+        let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32];
+        let vbufs = [Some(wgpu::VertexBufferLayout { array_stride: 20, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs })];
+        let tile_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world tile array pipeline"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &vbufs, compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let staging_slots = (budget.staging_ring_bytes as usize / STAGING_TILE_BYTES).max(4);
+        let staging_bytes = (staging_slots * STAGING_TILE_BYTES) as u64;
+        let staging_ring = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world tile staging ring"),
+            size: staging_bytes,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         if let Some(fault) = health.fault() {
             return Err(fault.to_string());
         }
         Ok(Self {
             rs: rs.clone(),
             health,
-            layout,
-            sampler,
-            normal,
-            erase,
-            image,
-            brush_normal,
-            brush_erase,
-            brush_behind,
-            composite,
+            budget,
+            tile_array,
+            tile_bind,
+            tile_pipeline,
+            staging_ring,
+            staging_slots,
+            pad_scratch: vec![0u8; STAGING_TILE_BYTES],
+            atlas: TileAtlas::new(budget),
+            quads: TileQuadBatch::default(),
             targets: None,
-            assets: BTreeMap::new(),
-            brush_cache: BrushCache::default(),
+            last_scope_gen: 0,
+            last_lod: None,
+            frame_counter: 0,
             stats: Stats::default(),
         })
+    }
+
+    pub fn budget(&self) -> TileBudget {
+        self.budget
+    }
+
+    /// Resolve the active target LOD using the presenter's hysteresis state so
+    /// `LiveTileBrush` and `present_interactive` always target the exact same LOD.
+    pub fn target_lod(&self, view: &Viewport, density: f32) -> Result<u8> {
+        select_target_lod(view, density, self.budget.max_visible_tiles, self.last_lod).map_err(|e| e.to_string())
+    }
+
+    pub fn purge_slots(&mut self) {
+        self.atlas.clear();
+        self.last_lod = None;
+    }
+
+    /// Non-blocking interactive tile presentation: never rasterizes static committed
+    /// tiles, animated-media tiles, or peer-preview tiles on the UI thread; uploads
+    /// within per-frame caps, keeps the last valid presentation while async work
+    /// completes, and executes 1 single GPU quad pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_interactive(
+        &mut self,
+        mgr: &mut WorldTileManager,
+        view: &Viewport,
+        density: f32,
+        elapsed_ms: u64,
+        previews: &[SharedStroke],
+        mut live_tile_brush: Option<&mut LiveTileBrush>,
+        resolve_media: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Arc<RgbaFrame>>>,
+        retain_stale_for_review: bool,
+    ) -> Result<egui::TextureId> {
+        let size = self.validate_frame_inputs(view, density, previews)?;
+        let scope_gen = mgr.scope_gen();
+        if self.last_scope_gen != scope_gen {
+            self.atlas.clear();
+            self.last_scope_gen = scope_gen;
+            self.last_lod = None;
+        }
+        self.frame_counter = self.frame_counter.saturating_add(1);
+        let frame = self.frame_counter;
+
+        // Drain completed worker static AND async dynamic tiles into CPU caches.
+        let _completed = mgr.poll_completed();
+
+        let target_lod = select_target_lod(view, density, self.budget.max_visible_tiles, self.last_lod).map_err(|e| e.to_string())?;
+        self.last_lod = Some(target_lod);
+        let visible = visible_tiles(view, target_lod, self.budget.max_visible_tiles).map_err(|e| e.to_string())?;
+        if let Some(lb) = live_tile_brush.as_deref_mut() {
+            lb.ensure_lod(target_lod);
+        }
+        let live_stroke_id = live_tile_brush.as_deref().map(LiveTileBrush::stroke_id);
+
+        // Pre-register any already-available decoded frames for visible animated media BEFORE
+        // computing dynamic signatures so `has_media_frame` is stable from the first frame.
+        preregister_visible_anim_frames(mgr, view, elapsed_ms, resolve_media)?;
+
+        // Partition visible tiles into:
+        // 1. Local active-brush tiles (incremental LiveTileBrush path).
+        // 2. Async dynamic tiles (animated media and/or peer previews — NEVER recomposed on UI thread).
+        // 3. Static tiles (async static worker pool).
+        let dynamic_items = collect_dynamic_items(mgr, view, previews, elapsed_ms)?;
+        let mut local_brush_tiles: Vec<TileKey> = Vec::new();
+        let mut async_dynamic_tiles: Vec<TileKey> = Vec::new();
+        let mut static_visible: Vec<TileKey> = Vec::with_capacity(visible.len());
+        let mut active_async_set: BTreeSet<TileKey> = BTreeSet::new();
+        for &tile in &visible {
+            let phys = tile.physical_rect();
+            let has_local_brush = live_stroke_id.is_some_and(|lsid| dynamic_items.previews.iter().any(|(r, (sid, _))| *sid == lsid && r.intersects(&phys)));
+            if has_local_brush {
+                local_brush_tiles.push(tile);
+                continue;
+            }
+            let has_peer_or_anim =
+                dynamic_items.previews.iter().any(|(r, _)| r.intersects(&phys)) || dynamic_items.anim_media.iter().any(|(r, _)| r.intersects(&phys));
+            if has_peer_or_anim {
+                async_dynamic_tiles.push(tile);
+                active_async_set.insert(tile);
+            } else {
+                static_visible.push(tile);
+            }
+        }
+        if !local_brush_tiles.is_empty()
+            && let Some(lb) = live_tile_brush.as_deref_mut()
+        {
+            lb.prepare_tiles(&local_brush_tiles).map_err(|e| e.to_string())?;
+        }
+
+        self.quads.clear();
+        let mut uploads: Vec<PendingUpload> = Vec::new();
+        let mut static_uploads_used = 0usize;
+        let mut async_dyn_uploads_used = 0usize;
+        let mut fallback_tiles = 0usize;
+        let mut pending_tiles = 0usize;
+        let mut anim_pending_tiles = 0usize;
+        let mut pending_assets = 0usize;
+        let mut missing_no_fallback = Vec::new();
+        let mut async_jobs_to_schedule: Vec<(TileKey, u64, u64)> = Vec::new();
+        let edit_seq = mgr.edit_seq();
+
+        // 1. Local active-brush dynamic tiles (non-blocking: never rasterizes committed static bands
+        // on the UI thread; schedules off-thread `WarmSplitBands` + neighbor prefetch for cold W4 tiles).
+        let local_counts = self.present_local_brush_tiles(
+            mgr,
+            view,
+            scope_gen,
+            edit_seq,
+            frame,
+            elapsed_ms,
+            &visible,
+            &local_brush_tiles,
+            &dynamic_items,
+            live_stroke_id,
+            live_tile_brush.as_deref(),
+            previews,
+            resolve_media,
+            &mut uploads,
+            &mut active_async_set,
+            &mut async_jobs_to_schedule,
+        )?;
+        pending_assets = pending_assets.saturating_add(local_counts.pending_assets);
+        anim_pending_tiles = anim_pending_tiles.saturating_add(local_counts.anim_pending_tiles);
+
+        // 2. Async dynamic tiles (animated media & peer previews): NEVER block the UI thread!
+        // Present exact match if ready, otherwise keep the last valid presentation while
+        // bounded background workers prepare the next frame off-thread.
+        let dyn_counts = self.present_async_dynamic_tiles(
+            mgr,
+            view,
+            scope_gen,
+            edit_seq,
+            frame,
+            elapsed_ms,
+            &async_dynamic_tiles,
+            &dynamic_items,
+            retain_stale_for_review,
+            &mut uploads,
+            &mut static_uploads_used,
+            &mut async_dyn_uploads_used,
+            &mut missing_no_fallback,
+            &mut async_jobs_to_schedule,
+        )?;
+        pending_assets = pending_assets.saturating_add(dyn_counts.pending_assets);
+        anim_pending_tiles = anim_pending_tiles.saturating_add(dyn_counts.anim_pending_tiles);
+        pending_tiles = pending_tiles.saturating_add(dyn_counts.pending_tiles);
+        fallback_tiles = fallback_tiles.saturating_add(dyn_counts.fallback_tiles);
+
+        if !async_jobs_to_schedule.is_empty() || !active_async_set.is_empty() {
+            if let Some(lsid) = live_stroke_id {
+                let peer_only: Vec<SharedStroke> = previews.iter().filter(|p| p.stroke.id != lsid).cloned().collect();
+                mgr.schedule_dynamic_tiles(active_async_set, &async_jobs_to_schedule, &peer_only);
+            } else {
+                mgr.schedule_dynamic_tiles(active_async_set, &async_jobs_to_schedule, previews);
+            }
+        } else {
+            mgr.schedule_dynamic_tiles(active_async_set, &async_jobs_to_schedule, &[]);
+        }
+
+        // 3. Static tiles (non-dynamic visible tiles).
+        for &tile in &static_visible {
+            // 3a. Check resident GPU static slot.
+            if let Some((layer, meta)) = self.atlas.get_slot(tile, false, frame)
+                && meta.scope_gen == scope_gen
+                && mgr.is_tile_valid_at(tile, meta.validated_seq)
+            {
+                self.atlas.update_validated_seq(layer, mgr.edit_seq());
+                self.quads.push_tile(tile, layer, view)?;
+                continue;
+            }
+
+            // 3b. Check ready CPU cache (respecting per-frame upload cap).
+            if static_uploads_used < self.budget.max_uploads_per_frame
+                && let Some(cpu_tile) = mgr.get_valid_cpu_tile(tile)
+            {
+                pending_assets = pending_assets.saturating_add(cpu_tile.pending_assets);
+                if let Some(layer) = self.atlas.allocate(tile, false, SlotKind::Static, cpu_tile.validated_seq, scope_gen, frame) {
+                    uploads.push(PendingUpload { layer, rgba8: cpu_tile.rgba8 });
+                    static_uploads_used += 1;
+                    self.quads.push_tile(tile, layer, view)?;
+                    continue;
+                }
+            }
+
+            // 3c. Target tile is not yet uploaded: draw temporary fallback (never blank white if avoidable).
+            pending_tiles += 1;
+            let mut drew_fallback = false;
+            if retain_stale_for_review
+                && let Some((layer, meta)) = self.atlas.get_slot(tile, false, frame)
+                && meta.scope_gen == scope_gen
+            {
+                self.quads.push_tile(tile, layer, view)?;
+                drew_fallback = true;
+            }
+            if !drew_fallback
+                && let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
+                && meta.scope_gen == scope_gen
+            {
+                // Seamless 1-frame bridge after mouse-up while committed static tile finishes.
+                self.quads.push_tile(tile, layer, view)?;
+                drew_fallback = true;
+            }
+            if !drew_fallback {
+                drew_fallback = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, &mut uploads, &mut static_uploads_used)?;
+            }
+            if drew_fallback {
+                fallback_tiles += 1;
+            } else {
+                missing_no_fallback.push(tile);
+            }
+        }
+
+        // Schedule missing static visible tiles, cold `lod + 2` preview tiles, and 1-tile pan prefetch ring.
+        mgr.schedule_view(view, target_lod, &static_visible, &missing_no_fallback);
+
+        let uploads_count = uploads.len();
+        let id = self.submit_uploads_and_quads(size, &uploads)?;
+
+        let tile_array_bytes = u64::from(TILE_PHYSICAL) * u64::from(TILE_PHYSICAL) * 4 * u64::from(self.budget.gpu_layers);
+        self.stats = Stats {
+            vertices: self.quads.vertex_count(),
+            indices: self.quads.index_count() as usize,
+            layers: 0,
+            texture_bytes: u64::from(size[0]) * u64::from(size[1]) * 4,
+            uploaded_asset_bytes: 0,
+            pending_assets,
+            tile_array_bytes,
+            visible_tiles: visible.len(),
+            resident_tiles: self.atlas.resident_count(),
+            fallback_tiles,
+            pending_tiles,
+            anim_pending_tiles,
+            uploads_this_frame: uploads_count,
+            target_lod,
+            is_refining: pending_tiles > 0,
+        };
+        if let Some(fault) = self.health.fault() {
+            return Err(fault.to_string());
+        }
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_local_brush_tiles(
+        &mut self,
+        mgr: &mut WorldTileManager,
+        view: &Viewport,
+        scope_gen: u64,
+        edit_seq: u64,
+        frame: u64,
+        elapsed_ms: u64,
+        visible: &[TileKey],
+        local_brush_tiles: &[TileKey],
+        dynamic_items: &DynamicItems,
+        live_stroke_id: Option<StrokeId>,
+        live_tile_brush: Option<&LiveTileBrush>,
+        previews: &[SharedStroke],
+        resolve_media: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Arc<RgbaFrame>>>,
+        uploads: &mut Vec<PendingUpload>,
+        active_async_set: &mut BTreeSet<TileKey>,
+        async_jobs_to_schedule: &mut Vec<(TileKey, u64, u64)>,
+    ) -> Result<AsyncDynCounts> {
+        let mut counts = AsyncDynCounts::default();
+        if local_brush_tiles.is_empty() {
+            mgr.schedule_split_warm_tiles(BTreeSet::new(), &[], &[]);
+            return Ok(counts);
+        }
+        let Some(lsid) = live_stroke_id else {
+            mgr.schedule_split_warm_tiles(BTreeSet::new(), &[], &[]);
+            return Ok(counts);
+        };
+        let mut dirty_local: Vec<(TileKey, u64, u64, bool)> = Vec::new();
+        for &tile in local_brush_tiles {
+            let phys = tile.physical_rect();
+            let live_rev = live_tile_brush.and_then(|lb| lb.get_prepared_tile(tile)).map_or(0, |(rev, _)| rev);
+            let dyn_sig = compute_dynamic_tile_sig(scope_gen, edit_seq, Some(lsid), live_rev, phys, dynamic_items);
+            if dyn_sig != 0
+                && let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
+                && meta.scope_gen == scope_gen
+                && meta.dynamic_sig == dyn_sig
+                && mgr.is_tile_valid_at(tile, meta.validated_seq)
+            {
+                self.quads.push_tile(tile, layer, view)?;
+            } else {
+                let has_anim = dynamic_items.anim_media.iter().any(|(r, _)| r.intersects(&phys));
+                let bg_sig = if has_anim { compute_bg_anim_tile_sig(scope_gen, edit_seq, Some(lsid), phys, dynamic_items) } else { 0 };
+                dirty_local.push((tile, dyn_sig, bg_sig, has_anim));
+            }
+        }
+        let preview_rects = collect_preview_device_rects(mgr, previews)?;
+        let local_dev = previews.iter().find(|p| p.visible && p.stroke.id == lsid).map(|p| p.device);
+        let mut active_warm_set = BTreeSet::new();
+        let mut urgent_warm: Vec<SplitWarmJob> = Vec::new();
+        let mut prefetch_warm: Vec<SplitWarmJob> = Vec::new();
+        let mut any_needs_split = false;
+        if !dirty_local.is_empty() {
+            let batch_inputs: Vec<_> = dirty_local
+                .iter()
+                .map(|&(tile, _, bg_sig, has_anim)| {
+                    let arg = live_tile_brush.and_then(|lb| lb.get_prepared_tile(tile)).map(|(_, r)| (lsid, r));
+                    (tile, bg_sig, has_anim, arg)
+                })
+                .collect();
+            let composed_batch = mgr.render_live_tiles_nonblocking(&batch_inputs, lsid, elapsed_ms, previews, resolve_media).map_err(|e| e.to_string())?;
+            for ((tile, dyn_sig, bg_sig, _), (_, composed)) in dirty_local.into_iter().zip(composed_batch) {
+                counts.pending_assets = counts.pending_assets.saturating_add(composed.pending_assets.len());
+                let rgba8 = Arc::new(composed.rgba8);
+                let cached_sig =
+                    if composed.pending_assets.is_empty() && !composed.used_stale_anim_cache && !composed.used_cold_split_fallback { dyn_sig } else { 0 };
+                if composed.used_stale_anim_cache {
+                    active_async_set.insert(tile);
+                    async_jobs_to_schedule.push((tile, bg_sig, elapsed_ms));
+                    counts.anim_pending_tiles += 1;
+                }
+                if composed.used_cold_split_fallback {
+                    any_needs_split = true;
+                    let devs = tile_split_devices_for(tile.physical_rect(), &preview_rects, None);
+                    if !devs.is_empty() {
+                        active_warm_set.insert(tile);
+                        let wsig = compute_warm_sig(scope_gen, edit_seq, tile, bg_sig, &devs);
+                        urgent_warm.push((tile, wsig, elapsed_ms, devs));
+                        counts.anim_pending_tiles += 1;
+                    }
+                }
+                if let Some(layer) = self.atlas.allocate(tile, true, SlotKind::Dynamic, edit_seq, scope_gen, frame) {
+                    self.atlas.set_dynamic_sig(layer, cached_sig);
+                    uploads.push(PendingUpload { layer, rgba8 });
+                    self.quads.push_tile(tile, layer, view)?;
+                }
+            }
+        }
+        // Proactively warm up to 4 immediate cardinal neighbors ONLY when no urgent cold tiles are
+        // pending, so prefetch never evicts active live-brush tiles from `DynamicSplitCache`.
+        let local_needs_split_prefetch = any_needs_split
+            || previews.iter().any(|p| {
+                p.visible
+                    && (p.stroke.id != lsid
+                        || p.stroke.erase
+                        || p.stroke.brush.as_deref().is_some_and(|b| {
+                            b.behind
+                                || !matches!(
+                                    b.mode,
+                                    photocraft_engine::scene::brush::BrushBlendMode::Normal | photocraft_engine::scene::brush::BrushBlendMode::Dissolve
+                                )
+                        }))
+            });
+        if urgent_warm.is_empty() && local_needs_split_prefetch && local_dev.is_some() {
+            let visible_set: BTreeSet<TileKey> = visible.iter().copied().collect();
+            let active_local_set: BTreeSet<TileKey> = local_brush_tiles.iter().copied().collect();
+            for &tile in local_brush_tiles.iter().rev() {
+                if prefetch_warm.len() >= 4 {
+                    break;
+                }
+                for &(dx, dy) in &[(-1_i128, 0_i128), (1, 0), (0, -1), (0, 1)] {
+                    if prefetch_warm.len() >= 4 {
+                        break;
+                    }
+                    let nb = TileKey { lod: tile.lod, tx: tile.tx.saturating_add(dx), ty: tile.ty.saturating_add(dy) };
+                    if visible_set.contains(&nb) && !active_local_set.contains(&nb) && active_warm_set.insert(nb) {
+                        let nb_phys = nb.physical_rect();
+                        let devs = tile_split_devices_for(nb_phys, &preview_rects, local_dev);
+                        let nb_bg = if dynamic_items.anim_media.iter().any(|(r, _)| r.intersects(&nb_phys)) {
+                            compute_bg_anim_tile_sig(scope_gen, edit_seq, Some(lsid), nb_phys, dynamic_items)
+                        } else {
+                            0
+                        };
+                        let wsig = compute_warm_sig(scope_gen, edit_seq, nb, nb_bg, &devs);
+                        prefetch_warm.push((nb, wsig, elapsed_ms, devs));
+                    }
+                }
+            }
+        }
+        mgr.schedule_split_warm_tiles(active_warm_set, &urgent_warm, &prefetch_warm);
+        Ok(counts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_async_dynamic_tiles(
+        &mut self,
+        mgr: &mut WorldTileManager,
+        view: &Viewport,
+        scope_gen: u64,
+        edit_seq: u64,
+        frame: u64,
+        elapsed_ms: u64,
+        async_dynamic_tiles: &[TileKey],
+        dynamic_items: &DynamicItems,
+        retain_stale_for_review: bool,
+        uploads: &mut Vec<PendingUpload>,
+        static_uploads_used: &mut usize,
+        async_dyn_uploads_used: &mut usize,
+        missing_no_fallback: &mut Vec<TileKey>,
+        async_jobs_to_schedule: &mut Vec<(TileKey, u64, u64)>,
+    ) -> Result<AsyncDynCounts> {
+        let mut counts = AsyncDynCounts::default();
+        for &tile in async_dynamic_tiles {
+            let phys = tile.physical_rect();
+            let dyn_sig = compute_dynamic_tile_sig(scope_gen, edit_seq, None, 0, phys, dynamic_items);
+
+            // 2a. Resident GPU dynamic slot with exact up-to-date signature.
+            if dyn_sig != 0
+                && let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
+                && meta.scope_gen == scope_gen
+                && meta.dynamic_sig == dyn_sig
+                && mgr.is_tile_valid_at(tile, meta.validated_seq)
+            {
+                self.atlas.update_validated_seq(layer, edit_seq);
+                self.quads.push_tile(tile, layer, view)?;
+                continue;
+            }
+
+            // 2b. Completed async dynamic tile ready in CPU cache (within per-frame upload cap).
+            if *async_dyn_uploads_used < self.budget.max_uploads_per_frame
+                && let Some(dyn_cpu) = mgr.get_valid_dynamic_tile(tile, dyn_sig)
+            {
+                counts.pending_assets = counts.pending_assets.saturating_add(dyn_cpu.pending_assets);
+                if let Some(layer) = self.atlas.allocate(tile, true, SlotKind::Dynamic, dyn_cpu.validated_seq, scope_gen, frame) {
+                    let cached_sig = if dyn_cpu.pending_assets == 0 { dyn_sig } else { 0 };
+                    self.atlas.set_dynamic_sig(layer, cached_sig);
+                    uploads.push(PendingUpload { layer, rgba8: dyn_cpu.rgba8 });
+                    *async_dyn_uploads_used += 1;
+                    self.quads.push_tile(tile, layer, view)?;
+                    continue;
+                }
+            }
+
+            // 2c. Not ready yet: schedule async recomposition and keep the last valid presentation!
+            async_jobs_to_schedule.push((tile, dyn_sig, elapsed_ms));
+            counts.anim_pending_tiles += 1;
+
+            // Prefer the last valid GPU dynamic slot for this scope & edit_seq (seamless animation tick).
+            if let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
+                && meta.scope_gen == scope_gen
+                && mgr.is_tile_valid_at(tile, meta.validated_seq)
+            {
+                self.quads.push_tile(tile, layer, view)?;
+                continue;
+            }
+            // Next prefer any valid-edit_seq previous dynamic frame still in CPU cache.
+            if *async_dyn_uploads_used < self.budget.max_uploads_per_frame
+                && let Some(prev_dyn) = mgr.get_any_valid_dynamic_tile(tile)
+                && let Some(layer) = self.atlas.allocate(tile, true, SlotKind::Dynamic, prev_dyn.validated_seq, scope_gen, frame)
+            {
+                self.atlas.set_dynamic_sig(layer, prev_dyn.dynamic_sig);
+                uploads.push(PendingUpload { layer, rgba8: prev_dyn.rgba8 });
+                *async_dyn_uploads_used += 1;
+                self.quads.push_tile(tile, layer, view)?;
+                continue;
+            }
+            // Cold/post-edit tile with no valid dynamic presentation yet: hold previous GPU slot
+            // (during edit/review swap) or coarse/fine static fallback while first dynamic frame builds.
+            counts.pending_tiles += 1;
+            let mut drew_fallback = false;
+            if let Some((layer, meta)) = self.atlas.get_slot(tile, true, frame)
+                && meta.scope_gen == scope_gen
+            {
+                self.quads.push_tile(tile, layer, view)?;
+                drew_fallback = true;
+            }
+            if !drew_fallback
+                && let Some((layer, meta)) = self.atlas.get_slot(tile, false, frame)
+                && meta.scope_gen == scope_gen
+                && (retain_stale_for_review || mgr.is_tile_valid_at(tile, meta.validated_seq))
+            {
+                self.quads.push_tile(tile, layer, view)?;
+                drew_fallback = true;
+            }
+            if !drew_fallback {
+                drew_fallback = self.try_draw_fallback(mgr, tile, view, scope_gen, frame, uploads, static_uploads_used)?;
+            }
+            if drew_fallback {
+                counts.fallback_tiles += 1;
+            } else {
+                missing_no_fallback.push(tile);
+            }
+        }
+        Ok(counts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_draw_fallback(
+        &mut self,
+        mgr: &mut WorldTileManager,
+        target: TileKey,
+        view: &Viewport,
+        scope_gen: u64,
+        frame: u64,
+        uploads: &mut Vec<PendingUpload>,
+        static_uploads_used: &mut usize,
+    ) -> Result<bool> {
+        // Search coarser ancestors (`lod + 1 ..= lod + 6`) first.
+        let max_up = target.lod.saturating_add(6).min(MAX_TILE_LOD);
+        for f_lod in (target.lod + 1)..=max_up {
+            let quads = fallback_quads(target, f_lod, 4);
+            if quads.is_empty() {
+                continue;
+            }
+            let mut resolved = Vec::with_capacity(quads.len());
+            for (fkey, rect, uv) in quads {
+                if let Some((layer, meta)) = self.atlas.get_slot(fkey, false, frame)
+                    && meta.scope_gen == scope_gen
+                {
+                    resolved.push((rect, uv, layer));
+                } else if *static_uploads_used < self.budget.max_uploads_per_frame
+                    && let Some(cpu) = mgr.get_valid_cpu_tile(fkey)
+                    && let Some(layer) = self.atlas.allocate(fkey, false, SlotKind::CoarseFallback, cpu.validated_seq, scope_gen, frame)
+                {
+                    uploads.push(PendingUpload { layer, rgba8: cpu.rgba8 });
+                    *static_uploads_used += 1;
+                    resolved.push((rect, uv, layer));
+                }
+            }
+            if !resolved.is_empty() {
+                for (rect, uv, layer) in resolved {
+                    self.quads.push_rect(rect, uv, layer, view)?;
+                }
+                return Ok(true);
+            }
+        }
+        // Search resident finer children (`lod - 1`) when zooming out.
+        if target.lod > 0 {
+            let quads = fallback_quads(target, target.lod - 1, 4);
+            let mut drew_any = false;
+            for (fkey, rect, uv) in quads {
+                if let Some((layer, meta)) = self.atlas.get_slot(fkey, false, frame)
+                    && meta.scope_gen == scope_gen
+                {
+                    self.quads.push_rect(rect, uv, layer, view)?;
+                    drew_any = true;
+                }
+            }
+            if drew_any {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -255,100 +808,10 @@ impl WorldGpu {
         self.render_with_live(renderer, view, density, elapsed_ms, resolve, previews, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_brush_stroke(
-        &mut self,
-        shared: &SharedStroke,
-        view: &Viewport,
-        density: f32,
-        size: [u32; 2],
-        is_preview: bool,
-        live: Option<(StrokeId, &RasterizedBrushStroke)>,
-        used_cache_keys: &mut BTreeSet<(StrokeId, u64)>,
-        brush_work: &mut u64,
-        staging_bytes: &mut Vec<u8>,
-        geometry: &mut Geometry,
-    ) -> Result<()> {
-        if let Some((live_id, live_raster)) = live
-            && live_id == shared.stroke.id
-            && live_raster.phys_w == size[0]
-            && live_raster.phys_h == size[1]
-        {
-            let cached = pack_raster_direct(live_raster);
-            let copies = push_cached_tiles(&cached, staging_bytes)?;
-            return geometry.brush_tiles(shared.device, cached.op, copies, size);
-        }
-        if !is_preview {
-            let cache_key = (shared.stroke.id, shared.created_revision);
-            used_cache_keys.insert(cache_key);
-            let cached = if let Some(hit) = self.brush_cache.entries.get(&cache_key) {
-                Arc::clone(hit)
-            } else {
-                let raster = rasterize_world_stroke(&shared.stroke, view, density, brush_work, MAX_BRUSH_WORK_SAMPLES).map_err(|e| e.to_string())?;
-                let packed = Arc::new(match raster.as_ref() {
-                    Some(r) => pack_raster_direct(r),
-                    None => CachedBrush { op: BrushOp::Normal, tiles: Vec::new(), bytes: 0 },
-                });
-                self.brush_cache.insert(cache_key, Arc::clone(&packed));
-                packed
-            };
-            let copies = push_cached_tiles(&cached, staging_bytes)?;
-            return geometry.brush_tiles(shared.device, cached.op, copies, size);
-        }
-        if let Some(raster) = rasterize_world_stroke(&shared.stroke, view, density, brush_work, MAX_BRUSH_WORK_SAMPLES).map_err(|e| e.to_string())? {
-            let cached = pack_raster_direct(&raster);
-            let copies = push_cached_tiles(&cached, staging_bytes)?;
-            geometry.brush_tiles(shared.device, cached.op, copies, size)?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_media_object(
-        &mut self,
-        shared: &photocraft_engine::scene::shared::SharedMedia,
-        view: &Viewport,
-        elapsed_ms: u64,
-        resolve: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Vec<u8>>>,
-        needed: &mut BTreeSet<AssetHash>,
-        pending: &mut BTreeSet<AssetHash>,
-        geometry: &mut Geometry,
-    ) -> Result<()> {
-        let (_, frame) = shared.media.frame_at(elapsed_ms).map_err(|e| e.to_string())?;
-        needed.insert(frame.hash);
-        if self
-            .assets
-            .get(&frame.hash)
-            .is_none_or(|asset| asset.descriptor.byte_len != frame.byte_len || asset.descriptor.width != frame.width || asset.descriptor.height != frame.height)
-        {
-            self.assets.remove(&frame.hash);
-            let bytes = u64::from(frame.width) * u64::from(frame.height) * 4;
-            if self.assets.values().map(|asset| asset.bytes).sum::<u64>().saturating_add(bytes) > MAX_ASSET_BYTES {
-                self.assets.retain(|hash, _| needed.contains(hash));
-                if self.assets.values().map(|asset| asset.bytes).sum::<u64>().saturating_add(bytes) > MAX_ASSET_BYTES {
-                    return Err("Visible media exceeds the 128 MiB GPU asset cache".into());
-                }
-            }
-            let Some(encoded) = resolve(frame).map_err(|e| e.to_string())? else {
-                pending.insert(frame.hash);
-                return Ok(());
-            };
-            let decoded = photocraft_engine::world_media::decode_frame(frame, &encoded).map_err(|e| e.to_string())?;
-            if frame.width > self.rs.device.limits().max_texture_dimension_2d || frame.height > self.rs.device.limits().max_texture_dimension_2d {
-                return Err("Media exceeds this GPU's texture dimensions".into());
-            }
-            let surface = self.surface([frame.width, frame.height], false);
-            self.rs.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &surface._texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                decoded.as_raw(),
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.width * 4), rows_per_image: Some(frame.height) },
-                wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
-            );
-            self.assets.insert(frame.hash, Asset { _surface: surface, descriptor: frame.clone(), bytes });
-        }
-        geometry.media(shared, view, frame.hash)
-    }
-
+    /// Deterministic blocking render path (used by GPU readback tests, parity benchmarks,
+    /// and headless verification). Directly rasterizes all visible target-LOD tiles and
+    /// presents them in a single `Texture2DArray` quad pass.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_live(
         &mut self,
@@ -360,13 +823,104 @@ impl WorldGpu {
         previews: &[SharedStroke],
         live: Option<(StrokeId, &RasterizedBrushStroke)>,
     ) -> Result<egui::TextureId> {
+        let size = self.validate_frame_inputs(view, density, previews)?;
+        if view.camera.canvas != renderer.world().canvas {
+            return Err("Viewport belongs to another canvas".into());
+        }
+        let target_lod = select_target_lod(view, density, self.budget.max_visible_tiles, None).map_err(|e| e.to_string())?;
+        let visible = visible_tiles(view, target_lod, self.budget.max_visible_tiles).map_err(|e| e.to_string())?;
+
+        self.frame_counter = self.frame_counter.saturating_add(1);
+        let frame = self.frame_counter;
+        self.quads.clear();
+
+        let mut decoded_cache: BTreeMap<AssetHash, Arc<RgbaFrame>> = BTreeMap::new();
+        let mut pending_assets: BTreeSet<AssetHash> = BTreeSet::new();
+        let mut devices_seen: BTreeSet<DeviceId> = BTreeSet::new();
+        let mut uploads: Vec<PendingUpload> = Vec::new();
+        let index = renderer.index();
+        let live_tile_arg = live.filter(|(_, r)| r.phys_w == TILE_PHYSICAL && r.phys_h == TILE_PHYSICAL);
+
+        for &tile in &visible {
+            let query = index.query_tile(tile);
+            for &obj in &query.direct {
+                if let Some(e) = index.entry(obj) {
+                    devices_seen.insert(e.device);
+                }
+            }
+            for (_, dev, _) in &query.summaries {
+                devices_seen.insert(*dev);
+            }
+            for p in previews {
+                if p.visible && !index.world().strokes.contains_key(&p.stroke.id) {
+                    devices_seen.insert(p.device);
+                }
+            }
+            let params = TileComposeParams {
+                index,
+                tile,
+                scope_gen: frame,
+                validated_seq: frame,
+                elapsed_ms,
+                previews,
+                live_brush: live_tile_arg,
+                allow_parallel_brush: true,
+                cancel: None,
+            };
+            let composed = compose_world_tile(&params, None, &mut |mf| {
+                if let Some(hit) = decoded_cache.get(&mf.hash) {
+                    return Ok(Some(Arc::clone(hit)));
+                }
+                let Some(encoded) = resolve(mf)? else {
+                    return Ok(None);
+                };
+                let decoded = photocraft_engine::world_media::decode_frame(mf, &encoded)?;
+                let arc = Arc::new(RgbaFrame::from(decoded));
+                decoded_cache.insert(mf.hash, Arc::clone(&arc));
+                Ok(Some(arc))
+            })
+            .map_err(|e| e.to_string())?;
+            pending_assets.extend(composed.pending_assets);
+            let layer = self.atlas.allocate(tile, false, SlotKind::Static, frame, frame, frame).ok_or("GPU tile array exhausted for visible viewport")?;
+            uploads.push(PendingUpload { layer, rgba8: Arc::new(composed.rgba8) });
+            self.quads.push_tile(tile, layer, view)?;
+        }
+
+        let uploads_count = uploads.len();
+        let id = self.submit_uploads_and_quads(size, &uploads)?;
+        let tile_array_bytes = u64::from(TILE_PHYSICAL) * u64::from(TILE_PHYSICAL) * 4 * u64::from(self.budget.gpu_layers);
+        let uploaded_asset_bytes: u64 = decoded_cache.values().map(|f| f.rgba.len() as u64).sum();
+        self.stats = Stats {
+            vertices: self.quads.vertex_count(),
+            indices: self.quads.index_count() as usize,
+            layers: devices_seen.len(),
+            texture_bytes: u64::from(size[0]) * u64::from(size[1]) * 4,
+            uploaded_asset_bytes,
+            pending_assets: pending_assets.len(),
+            tile_array_bytes,
+            visible_tiles: visible.len(),
+            resident_tiles: self.atlas.resident_count(),
+            fallback_tiles: 0,
+            pending_tiles: 0,
+            anim_pending_tiles: 0,
+            uploads_this_frame: uploads_count,
+            target_lod,
+            is_refining: false,
+        };
+        if let Some(fault) = self.health.fault() {
+            return Err(fault.to_string());
+        }
+        Ok(id)
+    }
+
+    fn validate_frame_inputs(&self, view: &Viewport, density: f32, previews: &[SharedStroke]) -> Result<[u32; 2]> {
         if let Some(fault) = self.health.fault() {
             return Err(fault.to_string());
         }
         if !density.is_finite() || !(0.5..=4.0).contains(&density) {
             return Err("Invalid world display density".into());
         }
-        let size = [(view.width as f64 * f64::from(density)).ceil() as u32, (view.height as f64 * f64::from(density)).ceil() as u32];
+        let size = [(f64::from(view.width) * f64::from(density)).ceil() as u32, (f64::from(view.height) * f64::from(density)).ceil() as u32];
         let max_side = self.rs.device.limits().max_texture_dimension_2d.min(4096);
         if size.contains(&0) || size.iter().any(|n| *n > max_side) || u64::from(size[0]) * u64::from(size[1]) > MAX_PIXELS {
             return Err("Shared canvas GPU view exceeds its 4096-side / 8-megapixel surface budget".into());
@@ -376,570 +930,303 @@ impl WorldGpu {
         {
             return Err("Shared drawing previews exceed their bounded sample budget".into());
         }
-        let mut content = renderer.visible_content(view).map_err(|e| e.to_string())?;
-        let mut preview_ids = BTreeSet::new();
         let mut ids = BTreeSet::new();
         for shared in previews {
             shared.stroke.validate().map_err(|e| e.to_string())?;
             if shared.stroke.canvas != view.camera.canvas || !shared.visible || !ids.insert(shared.stroke.id) {
                 return Err("Invalid or duplicate shared drawing preview".into());
             }
-            if renderer.world().strokes.contains_key(&shared.stroke.id) {
-                continue;
-            }
-            preview_ids.insert(shared.stroke.id);
-            let mut transient = shared.clone();
-            transient.created_revision = renderer.world().revision.saturating_add(1);
-            transient.changed_revision = transient.created_revision;
-            content.push(VisibleObject::Stroke(Box::new(transient)));
         }
-        content.sort_by(|a, b| content_key(a).cmp(&content_key(b)));
-        self.brush_cache.sync_view(view, density);
+        Ok(size)
+    }
 
-        let mut geometry = Geometry::default();
-        let mut staging_bytes: Vec<u8> = Vec::new();
-        let mut needed = BTreeSet::new();
-        let mut pending = BTreeSet::new();
-        let mut used_cache_keys = BTreeSet::new();
-        let mut brush_work = 0u64;
-
-        // Group content by device so any device layer that uses non-Normal/non-Dissolve/non-Behind
-        // blend modes (e.g., Multiply, Screen, Overlay) can composite on CPU cleanly while every
-        // other device layer runs directly through hardware GPU pipelines.
-        let mut first_obj = 0usize;
-        while first_obj < content.len() {
-            let device = content.get(first_obj).map(content_device).ok_or("Missing content item")?;
-            let mut end_obj = first_obj + 1;
-            while content.get(end_obj).is_some_and(|item| content_device(item) == device) {
-                end_obj += 1;
-            }
-            let slice = content.get(first_obj..end_obj).ok_or("Invalid device object slice")?;
-            let needs_cpu_blend = slice.iter().any(|item| match item {
-                VisibleObject::Stroke(s) => s.stroke.brush.as_deref().is_some_and(|b| {
-                    !s.stroke.erase
-                        && !b.behind
-                        && !matches!(blend_mode_to_paint(b.mode), photocraft_color::BlendMode::Normal | photocraft_color::BlendMode::Dissolve)
-                }),
-                VisibleObject::Media(_) => false,
-            });
-
-            if needs_cpu_blend {
-                let copies =
-                    cpu_composite_device_layer(slice, view, density, size, elapsed_ms, resolve, live, &mut pending, &mut brush_work, &mut staging_bytes)?;
-                geometry.brush_tiles(device, BrushOp::Normal, copies, size)?;
-            } else {
-                for object in slice {
-                    match object {
-                        VisibleObject::Stroke(shared) => {
-                            if shared.stroke.brush.is_some() {
-                                let is_preview = preview_ids.contains(&shared.stroke.id);
-                                self.encode_brush_stroke(
-                                    shared,
-                                    view,
-                                    density,
-                                    size,
-                                    is_preview,
-                                    live,
-                                    &mut used_cache_keys,
-                                    &mut brush_work,
-                                    &mut staging_bytes,
-                                    &mut geometry,
-                                )?;
-                            } else {
-                                geometry.stroke(shared, view, density)?;
-                            }
-                        }
-                        VisibleObject::Media(shared) => {
-                            self.encode_media_object(shared, view, elapsed_ms, resolve, &mut needed, &mut pending, &mut geometry)?;
-                        }
-                    }
-                }
-            }
-            first_obj = end_obj;
-        }
-        self.assets.retain(|hash, _| needed.contains(hash));
-        self.brush_cache.retain_ids(&used_cache_keys);
-
-        let max_buf = self.rs.device.limits().max_buffer_size;
-        if geometry.vertices.len() as u64 > max_buf || geometry.indices.len() as u64 > max_buf || staging_bytes.len() as u64 > max_buf {
-            return Err("Visible shared-canvas geometry exceeds this GPU's buffer limit".into());
-        }
-        if self.targets.as_ref().is_none_or(|targets| targets.size != size) {
+    fn ensure_output(&mut self, size: [u32; 2]) -> Result<egui::TextureId> {
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
             if let Some(old) = self.targets.take() {
                 self.rs.renderer.write().free_texture(&old.id);
             }
-            let scratch = self.surface(size, true);
-            let output = self.surface(size, true);
-            let id = self.rs.renderer.write().register_native_texture(&self.rs.device, &output.view, wgpu::FilterMode::Nearest);
-            self.targets = Some(Targets { size, scratch, output, stroke: None, id });
+            let texture = self.rs.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("world tile output"),
+                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let id = self.rs.renderer.write().register_native_texture(&self.rs.device, &view, wgpu::FilterMode::Nearest);
+            self.targets = Some(Targets { size, output: OutputSurface { _texture: texture, view }, id });
         }
-        let has_brush_uploads = !staging_bytes.is_empty();
-        if has_brush_uploads && self.targets.as_ref().is_some_and(|targets| targets.stroke.is_none()) {
-            let stroke_surface = self.surface(size, false);
-            if let Some(targets) = self.targets.as_mut() {
-                targets.stroke = Some(stroke_surface);
-            }
-        }
-        let targets = self.targets.as_ref().ok_or("Missing GPU world surfaces")?;
-        let vertex = buffer(&self.rs.device, "world vertices", &geometry.vertices, wgpu::BufferUsages::VERTEX)?;
-        let indices = buffer(&self.rs.device, "world indices", &geometry.indices, wgpu::BufferUsages::INDEX)?;
-        let staging =
-            if has_brush_uploads { Some(buffer(&self.rs.device, "world brush staging", &staging_bytes, wgpu::BufferUsages::COPY_SRC)?) } else { None };
+        self.targets.as_ref().map(|t| t.id).ok_or_else(|| "Missing GPU world output surface".into())
+    }
 
-        let mut encoder = self.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world isolated author layers") });
-        clear_surface(&mut encoder, &targets.output.view, wgpu::Color::WHITE);
-        let mut layers = 0usize;
-        let mut first = 0usize;
-        while first < geometry.batches.len() {
-            let device = geometry.batches.get(first).ok_or("Missing GPU draw")?.device;
-            let mut end = first + 1;
-            while geometry.batches.get(end).is_some_and(|batch| batch.device == device) {
-                end += 1;
+    fn submit_uploads_and_quads(&mut self, size: [u32; 2], uploads: &[PendingUpload]) -> Result<egui::TextureId> {
+        let id = self.ensure_output(size)?;
+        // Upload in staging-ring chunks so even a blocking multi-tile upload never allocates unbounded staging memory.
+        for chunk in uploads.chunks(self.staging_slots.max(1)) {
+            let mut encoder = self.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world tile upload") });
+            for (slot_idx, item) in chunk.iter().enumerate() {
+                pad_tile_rows(&item.rgba8, &mut self.pad_scratch)?;
+                let offset = (slot_idx * STAGING_TILE_BYTES) as u64;
+                self.rs.queue.write_buffer(&self.staging_ring, offset, &self.pad_scratch);
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &self.staging_ring,
+                        layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(ALIGNED_ROW_BYTES), rows_per_image: Some(TILE_PHYSICAL) },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.tile_array,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: item.layer },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: TILE_PHYSICAL, height: TILE_PHYSICAL, depth_or_array_layers: 1 },
+                );
             }
-            let layer_batches = geometry.batches.get(first..end).ok_or("Invalid GPU layer range")?;
-            let layer_has_brushes = layer_batches.iter().any(|b| matches!(b.kind, Kind::Brush { .. }));
-            if !layer_has_brushes {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("world author layer"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &targets.scratch.view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_vertex_buffer(0, vertex.slice(..));
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                for batch in layer_batches {
-                    match &batch.kind {
-                        Kind::Color { erase } => pass.set_pipeline(if *erase { &self.erase } else { &self.normal }),
-                        Kind::Image(hash) => {
-                            pass.set_pipeline(&self.image);
-                            pass.set_bind_group(0, &self.assets.get(hash).ok_or("Missing media texture")?._surface.bind, &[]);
-                        }
-                        Kind::Brush { .. } => {}
-                    }
-                    pass.draw_indexed(batch.indices.clone(), 0, 0..1);
-                }
-            } else {
-                clear_surface(&mut encoder, &targets.scratch.view, wgpu::Color::TRANSPARENT);
-                let stroke_surface = targets.stroke.as_ref().ok_or("Missing GPU brush staging texture")?;
-                let staging_buf = staging.as_ref().ok_or("Missing GPU brush staging buffer")?;
-                let mut idx = 0usize;
-                while idx < layer_batches.len() {
-                    let Some(batch) = layer_batches.get(idx) else { break };
-                    match &batch.kind {
-                        Kind::Brush { op, copies } => {
-                            for copy in copies {
-                                encoder.copy_buffer_to_texture(
-                                    wgpu::TexelCopyBufferInfo {
-                                        buffer: staging_buf,
-                                        layout: wgpu::TexelCopyBufferLayout {
-                                            offset: copy.staging_offset,
-                                            bytes_per_row: Some(TILE_STRIDE_BYTES),
-                                            rows_per_image: Some(WORLD_BRUSH_TILE),
-                                        },
-                                    },
-                                    wgpu::TexelCopyTextureInfo {
-                                        texture: &stroke_surface._texture,
-                                        mip_level: 0,
-                                        origin: wgpu::Origin3d { x: copy.x0, y: copy.y0, z: 0 },
-                                        aspect: wgpu::TextureAspect::All,
-                                    },
-                                    wgpu::Extent3d { width: copy.width, height: copy.height, depth_or_array_layers: 1 },
-                                );
-                            }
-                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("world brush stroke"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &targets.scratch.view,
-                                    resolve_target: None,
-                                    depth_slice: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                            pass.set_vertex_buffer(0, vertex.slice(..));
-                            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.set_pipeline(match op {
-                                BrushOp::Normal => &self.brush_normal,
-                                BrushOp::Erase => &self.brush_erase,
-                                BrushOp::Behind => &self.brush_behind,
-                            });
-                            pass.set_bind_group(0, &stroke_surface.bind, &[]);
-                            pass.draw_indexed(batch.indices.clone(), 0, 0..1);
-                            idx += 1;
-                        }
-                        Kind::Color { .. } | Kind::Image(_) => {
-                            let start_plain = idx;
-                            while layer_batches.get(idx).is_some_and(|b| !matches!(b.kind, Kind::Brush { .. })) {
-                                idx += 1;
-                            }
-                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("world author layer segment"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &targets.scratch.view,
-                                    resolve_target: None,
-                                    depth_slice: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-                            pass.set_vertex_buffer(0, vertex.slice(..));
-                            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                            for plain in layer_batches.get(start_plain..idx).unwrap_or_default() {
-                                match &plain.kind {
-                                    Kind::Color { erase } => pass.set_pipeline(if *erase { &self.erase } else { &self.normal }),
-                                    Kind::Image(hash) => {
-                                        pass.set_pipeline(&self.image);
-                                        pass.set_bind_group(0, &self.assets.get(hash).ok_or("Missing media texture")?._surface.bind, &[]);
-                                    }
-                                    Kind::Brush { .. } => {}
-                                }
-                                pass.draw_indexed(plain.indices.clone(), 0, 0..1);
-                            }
-                        }
-                    }
-                }
-            }
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("world layer composite"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &targets.output.view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.composite);
-                pass.set_bind_group(0, &targets.scratch.bind, &[]);
-                pass.draw(0..3, 0..1);
-            }
-            layers += 1;
-            first = end;
+            self.rs.queue.submit([encoder.finish()]);
+        }
+
+        let targets = self.targets.as_ref().ok_or("Missing GPU output target")?;
+        let index_count = self.quads.index_count();
+        let mut encoder = self.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world tile quad pass") });
+        if index_count == 0 {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.output.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        } else {
+            let vbuf = upload_buffer(&self.rs.device, "world tile verts", &self.quads.vertices, wgpu::BufferUsages::VERTEX)?;
+            let ibuf = upload_buffer(&self.rs.device, "world tile indices", &self.quads.indices, wgpu::BufferUsages::INDEX)?;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world tile quad draw"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.output.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.tile_pipeline);
+            pass.set_bind_group(0, &self.tile_bind, &[]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..index_count, 0, 0..1);
         }
         self.rs.queue.submit([encoder.finish()]);
-        let target_multiplier = if targets.stroke.is_some() { 12 } else { 8 };
-        self.stats = Stats {
-            vertices: geometry.vertex_count(),
-            indices: geometry.indices.len() / 4,
-            layers,
-            texture_bytes: u64::from(size[0]) * u64::from(size[1]) * target_multiplier,
-            uploaded_asset_bytes: self.assets.values().map(|asset| asset.bytes).sum(),
-            pending_assets: pending.len(),
-        };
-        if let Some(fault) = self.health.fault() {
-            return Err(fault.to_string());
-        }
-        Ok(targets.id)
-    }
-
-    fn surface(&self, size: [u32; 2], target: bool) -> Surface {
-        let usages = wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC
-            | if target { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() };
-        let texture = self.rs.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("isolated world layer"),
-            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: usages,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&Default::default());
-        let bind = self.rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("world texture"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
-        Surface { _texture: texture, view, bind }
+        Ok(id)
     }
 }
 
-fn pack_raster_direct(raster: &RasterizedBrushStroke) -> CachedBrush {
-    let op = if raster.erase {
-        BrushOp::Erase
-    } else if raster.behind {
-        BrushOp::Behind
-    } else {
-        BrushOp::Normal
-    };
-    let mut tiles = Vec::with_capacity(raster.tiles.len());
-    let mut bytes = 0usize;
-    for tile in &raster.tiles {
-        let rgba8 = tile.to_premul_rgba8_padded(raster.aliased);
-        bytes = bytes.saturating_add(rgba8.len());
-        tiles.push(CachedTile { x0: tile.x0, y0: tile.y0, width: tile.width, height: tile.height, rgba8 });
-    }
-    CachedBrush { op, tiles, bytes }
+pub(crate) struct DynamicItems {
+    pub(crate) previews: Vec<(WorldRect, (StrokeId, u64))>,
+    pub(crate) anim_media: Vec<(WorldRect, u64)>,
 }
 
-fn push_cached_tiles(cached: &CachedBrush, staging: &mut Vec<u8>) -> Result<Vec<TileCopy>> {
-    let mut copies = Vec::with_capacity(cached.tiles.len());
-    for tile in &cached.tiles {
-        if staging.len().saturating_add(tile.rgba8.len()) > MAX_STAGING_BYTES {
-            return Err("Visible brush tiles exceed the GPU staging budget; zoom closer".into());
-        }
-        let offset = staging.len() as u64;
-        staging.extend_from_slice(&tile.rgba8);
-        copies.push(TileCopy { staging_offset: offset, x0: tile.x0, y0: tile.y0, width: tile.width, height: tile.height });
-    }
-    Ok(copies)
+#[inline]
+fn fnv_u64(mut h: u64, val: u64) -> u64 {
+    h ^= val;
+    h.wrapping_mul(0x0000_0100_0000_01B3)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cpu_composite_device_layer(
-    objects: &[VisibleObject],
-    view: &Viewport,
-    density: f32,
-    size: [u32; 2],
-    elapsed_ms: u64,
-    resolve: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Vec<u8>>>,
-    live: Option<(StrokeId, &RasterizedBrushStroke)>,
-    pending: &mut BTreeSet<AssetHash>,
-    work: &mut u64,
-    staging: &mut Vec<u8>,
-) -> Result<Vec<TileCopy>> {
-    let count = usize::try_from(u64::from(size[0]) * u64::from(size[1])).map_err(|_| "Layer pixel overflow".to_string())?;
-    let mut pixels = vec![[0.0f32; 4]; count];
-    let mut dirty_tiles = BTreeSet::<(u32, u32)>::new();
-    let w = size[0];
-    let h = size[1];
-    let sx_scale = f64::from(w) / f64::from(view.width);
-    let sy_scale = f64::from(h) / f64::from(view.height);
+#[inline]
+fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
 
-    for object in objects {
-        match object {
-            VisibleObject::Stroke(shared) => {
-                if shared.stroke.brush.is_some() {
-                    let owned;
-                    let raster = if let Some((live_id, live_r)) = live
-                        && live_id == shared.stroke.id
-                        && live_r.phys_w == w
-                        && live_r.phys_h == h
-                    {
-                        Some(live_r)
-                    } else {
-                        owned = rasterize_world_stroke(&shared.stroke, view, density, work, MAX_BRUSH_WORK_SAMPLES).map_err(|e| e.to_string())?;
-                        owned.as_ref()
-                    };
-                    if let Some(raster) = raster {
-                        for tile in &raster.tiles {
-                            dirty_tiles.insert((tile.x0 / WORLD_BRUSH_TILE, tile.y0 / WORLD_BRUSH_TILE));
-                        }
-                        composite_brush_onto_layer(raster, &mut pixels, w, |_| {});
-                    }
-                } else if let Some(projected) = render::project(&shared.stroke, view).map_err(|e| e.to_string())? {
-                    let mesh = round::mesh(&projected.paths, projected.width, [view.width, view.height], density, round::MAX_MESH_VERTICES)
-                        .map_err(|e| e.to_string())?;
-                    let mut cov = vec![0.0f32; count];
-                    let mut touched = Vec::new();
-                    let scale_pt = |p: [f32; 2]| [f64::from(p[0]) * sx_scale, f64::from(p[1]) * sy_scale];
-                    let mut raster_tri = |pts: [[f64; 2]; 3], alpha: [f32; 3]| -> Result<()> {
-                        let [a, b, c] = pts;
-                        let edge = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
-                        let area = edge(a, b, c);
-                        if !area.is_finite() || area.abs() < 1e-12 {
-                            return Ok(());
-                        }
-                        let min_x = a[0].min(b[0]).min(c[0]).floor().clamp(0.0, f64::from(w)) as u32;
-                        let max_x = a[0].max(b[0]).max(c[0]).ceil().clamp(0.0, f64::from(w)) as u32;
-                        let min_y = a[1].min(b[1]).min(c[1]).floor().clamp(0.0, f64::from(h)) as u32;
-                        let max_y = a[1].max(b[1]).max(c[1]).ceil().clamp(0.0, f64::from(h)) as u32;
-                        *work = work.saturating_add(u64::from(max_x - min_x) * u64::from(max_y - min_y));
-                        if *work > MAX_BRUSH_WORK_SAMPLES {
-                            return Err("World blend render budget reached; zoom closer".into());
-                        }
-                        for py in min_y..max_y {
-                            for px in min_x..max_x {
-                                let sample = [f64::from(px) + 0.5, f64::from(py) + 0.5];
-                                let u = edge(b, c, sample) / area;
-                                let v = edge(c, a, sample) / area;
-                                let ww = 1.0 - u - v;
-                                if u >= -1e-8 && v >= -1e-8 && ww >= -1e-8 {
-                                    let cval = (u * f64::from(alpha[0]) + v * f64::from(alpha[1]) + ww * f64::from(alpha[2])).clamp(0.0, 1.0) as f32;
-                                    let idx = py as usize * w as usize + px as usize;
-                                    if let Some(slot) = cov.get_mut(idx)
-                                        && cval > *slot
-                                    {
-                                        if *slot == 0.0 {
-                                            touched.push((px, py, idx));
-                                        }
-                                        *slot = cval;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    };
-                    for tri in mesh.indices.chunks_exact(3) {
-                        let a = mesh.vertices.get(tri[0] as usize).ok_or("Invalid triangle")?;
-                        let b = mesh.vertices.get(tri[1] as usize).ok_or("Invalid triangle")?;
-                        let c = mesh.vertices.get(tri[2] as usize).ok_or("Invalid triangle")?;
-                        raster_tri([scale_pt(a.position), scale_pt(b.position), scale_pt(c.position)], [a.coverage, b.coverage, c.coverage])?;
-                    }
-                    for poly in &projected.fills {
-                        if let Some(&first) = poly.first() {
-                            for edge in poly.get(1..).unwrap_or_default().windows(2) {
-                                raster_tri([scale_pt(first), scale_pt(edge[0]), scale_pt(edge[1])], [1.0; 3])?;
-                            }
-                        }
-                    }
-                    let color = projected.color.rgba;
-                    for (px, py, idx) in touched {
-                        let cval = cov.get(idx).copied().unwrap_or(0.0);
-                        dirty_tiles.insert((px / WORLD_BRUSH_TILE, py / WORLD_BRUSH_TILE));
-                        if let Some(dst) = pixels.get_mut(idx) {
-                            if projected.erase {
-                                for ch in dst.iter_mut() {
-                                    *ch *= 1.0 - cval;
-                                }
-                            } else {
-                                let a = cval * color[3];
-                                for ch in 0..3 {
-                                    dst[ch] = color[ch] * a + dst[ch] * (1.0 - a);
-                                }
-                                dst[3] = a + dst[3] * (1.0 - a);
-                            }
-                        }
-                    }
-                }
+pub(crate) fn collect_dynamic_items(mgr: &WorldTileManager, view: &Viewport, previews: &[SharedStroke], elapsed_ms: u64) -> Result<DynamicItems> {
+    let mut prev_list = Vec::new();
+    for p in previews {
+        if p.visible {
+            let rect = stroke_world_rect(&p.stroke).map_err(|e| e.to_string())?;
+            let mut sig = 0xCBF2_9CE4_8422_2325_u64;
+            sig = fnv_bytes(sig, p.stroke.id.as_str().as_bytes());
+            sig = fnv_u64(sig, p.changed_revision);
+            sig = fnv_u64(sig, p.stroke.points.len() as u64);
+            if let Some(last) = p.stroke.points.last() {
+                sig = fnv_u64(sig, last[0].to_bits());
+                sig = fnv_u64(sig, last[1].to_bits());
             }
-            VisibleObject::Media(shared) => {
-                let (_, frame) = shared.media.frame_at(elapsed_ms).map_err(|e| e.to_string())?;
-                let Some(encoded) = resolve(frame).map_err(|e| e.to_string())? else {
-                    pending.insert(frame.hash);
-                    continue;
-                };
-                let image = photocraft_engine::world_media::decode_frame(frame, &encoded).map_err(|e| e.to_string())?;
-                let media = &shared.media;
-                let start = coordinates::point_to_screen(view, coordinates::point(&media.anchor, media.offset).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-                let end = coordinates::point_to_screen(
-                    view,
-                    coordinates::point(&media.anchor, [media.offset[0] + media.width, media.offset[1] + media.height]).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-                let s0 = [start[0] * sx_scale, start[1] * sy_scale];
-                let s1 = [end[0] * sx_scale, end[1] * sy_scale];
-                let span = [s1[0] - s0[0], s1[1] - s0[1]];
-                if span[0] <= 0.0 || span[1] <= 0.0 || !span[0].is_finite() || !span[1].is_finite() {
-                    continue;
+            if let Some(last_s) = p.stroke.samples.as_ref().and_then(|s| s.last()) {
+                sig = fnv_u64(sig, last_s.time_ms.to_bits());
+            }
+            prev_list.push((rect, (p.stroke.id, sig)));
+        }
+    }
+    let mut anim_list = Vec::new();
+    if let Some(scene) = mgr.scene()
+        && let Ok(vrect) = photocraft_engine::scene::spatial::viewport_world_rect(view)
+    {
+        for id in scene.query_world_rect_media(vrect) {
+            if let Some(shared) = scene.world().media.get(&id)
+                && shared.media.frames.len() > 1
+                && let Some(entry) = scene.entry(photocraft_engine::world_tiles::SceneObject::Media(id))
+            {
+                let mut sig = 0xCBF2_9CE4_8422_2325_u64;
+                sig = fnv_bytes(sig, id.as_str().as_bytes());
+                if let Ok((f_idx, f_desc)) = shared.media.frame_at(elapsed_ms) {
+                    sig = fnv_u64(sig, f_idx as u64);
+                    sig = fnv_bytes(sig, f_desc.hash.as_str().as_bytes());
+                    // Include media-availability bit so newly downloaded frames immediately re-trigger recomposition.
+                    sig = fnv_u64(sig, u64::from(mgr.has_media_frame(&f_desc.hash)));
                 }
-                let x0 = s0[0].floor().clamp(0.0, f64::from(w)) as u32;
-                let x1 = s1[0].ceil().clamp(0.0, f64::from(w)) as u32;
-                let y0 = s0[1].floor().clamp(0.0, f64::from(h)) as u32;
-                let y1 = s1[1].ceil().clamp(0.0, f64::from(h)) as u32;
-                *work = work.saturating_add(u64::from(x1 - x0) * u64::from(y1 - y0));
-                if *work > MAX_BRUSH_WORK_SAMPLES {
-                    return Err("World blend media render budget reached; zoom closer".into());
-                }
-                for py in y0..y1 {
-                    for px in x0..x1 {
-                        let u = (f64::from(px) + 0.5 - s0[0]) / span[0];
-                        let v = (f64::from(py) + 0.5 - s0[1]) / span[1];
-                        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-                            continue;
-                        }
-                        let ix = ((u * f64::from(image.width())).floor() as u32).min(image.width().saturating_sub(1));
-                        let iy = ((v * f64::from(image.height())).floor() as u32).min(image.height().saturating_sub(1));
-                        let src = image.get_pixel_checked(ix, iy).ok_or("Invalid media pixel")?.0;
-                        let a = f32::from(src[3]) / 255.0;
-                        let idx = py as usize * w as usize + px as usize;
-                        dirty_tiles.insert((px / WORLD_BRUSH_TILE, py / WORLD_BRUSH_TILE));
-                        if let Some(dst) = pixels.get_mut(idx) {
-                            for ch in 0..3 {
-                                dst[ch] = f32::from(src[ch]) / 255.0 * a + dst[ch] * (1.0 - a);
-                            }
-                            dst[3] = a + dst[3] * (1.0 - a);
-                        }
-                    }
-                }
+                anim_list.push((entry.rect, sig));
             }
         }
     }
+    Ok(DynamicItems { previews: prev_list, anim_media: anim_list })
+}
 
-    let mut copies = Vec::with_capacity(dirty_tiles.len());
-    for (tx, ty) in dirty_tiles {
-        let x0 = tx * WORLD_BRUSH_TILE;
-        let y0 = ty * WORLD_BRUSH_TILE;
-        let tw = w.saturating_sub(x0).min(WORLD_BRUSH_TILE);
-        let th = h.saturating_sub(y0).min(WORLD_BRUSH_TILE);
-        if tw == 0 || th == 0 {
+pub(crate) fn compute_dynamic_tile_sig(
+    scope_gen: u64,
+    edit_seq: u64,
+    live_stroke_id: Option<StrokeId>,
+    live_rev: u64,
+    phys: WorldRect,
+    items: &DynamicItems,
+) -> u64 {
+    let mut h = 0xCBF2_9CE4_8422_2325_u64;
+    h = fnv_u64(h, scope_gen);
+    h = fnv_u64(h, edit_seq);
+    h = fnv_u64(h, live_rev);
+    for (r, (sid, psig)) in &items.previews {
+        if r.intersects(&phys) {
+            if live_stroke_id == Some(*sid) {
+                h = fnv_bytes(h, sid.as_str().as_bytes());
+                h = fnv_u64(h, live_rev ^ 0xA5A5_5A5A_F0F0_0F0F);
+            } else {
+                h = fnv_u64(h, *psig);
+            }
+        }
+    }
+    for (r, msig) in &items.anim_media {
+        if r.intersects(&phys) {
+            h = fnv_u64(h, *msig);
+        }
+    }
+    if h == 0 { 1 } else { h }
+}
+
+pub(crate) fn compute_bg_anim_tile_sig(scope_gen: u64, edit_seq: u64, exclude_stroke_id: Option<StrokeId>, phys: WorldRect, items: &DynamicItems) -> u64 {
+    let mut h = 0xCBF2_9CE4_8422_2325_u64;
+    h = fnv_u64(h, scope_gen);
+    h = fnv_u64(h, edit_seq);
+    h = fnv_u64(h, 0);
+    for (r, (sid, psig)) in &items.previews {
+        if exclude_stroke_id != Some(*sid) && r.intersects(&phys) {
+            h = fnv_u64(h, *psig);
+        }
+    }
+    for (r, msig) in &items.anim_media {
+        if r.intersects(&phys) {
+            h = fnv_u64(h, *msig);
+        }
+    }
+    if h == 0 { 1 } else { h }
+}
+
+pub(crate) fn collect_preview_device_rects(mgr: &WorldTileManager, previews: &[SharedStroke]) -> Result<Vec<(WorldRect, DeviceId)>> {
+    let scene = mgr.scene();
+    let mut out = Vec::with_capacity(previews.len());
+    for shared in previews {
+        if !shared.visible {
             continue;
         }
-        if staging.len().saturating_add(TILE_BYTES) > MAX_STAGING_BYTES {
-            return Err("Visible blend layer tiles exceed the GPU staging budget; zoom closer".into());
+        if scene.is_some_and(|s| s.world().strokes.contains_key(&shared.stroke.id)) {
+            continue;
         }
-        let offset = staging.len() as u64;
-        let mut buf = vec![0u8; TILE_BYTES];
-        let mut any = false;
-        for ly in 0..th {
-            let py = (y0 + ly) as usize;
-            for lx in 0..tw {
-                let px = (x0 + lx) as usize;
-                let Some(&v) = pixels.get(py * w as usize + px) else { continue };
-                if v[3] <= 0.0 {
-                    continue;
-                }
-                any = true;
-                let a = (v[3].clamp(0.0, 1.0) * 255.0).round() as u8;
-                let r = ((v[0].clamp(0.0, 1.0) * 255.0).round() as u8).min(a);
-                let g = ((v[1].clamp(0.0, 1.0) * 255.0).round() as u8).min(a);
-                let b = ((v[2].clamp(0.0, 1.0) * 255.0).round() as u8).min(a);
-                let o = (ly as usize * WORLD_BRUSH_TILE as usize + lx as usize) * 4;
-                if let Some(slot) = buf.get_mut(o..o + 4) {
-                    slot[0] = r;
-                    slot[1] = g;
-                    slot[2] = b;
-                    slot[3] = a;
-                }
+        let rect = stroke_world_rect(&shared.stroke).map_err(|e| e.to_string())?;
+        out.push((rect, shared.device));
+    }
+    Ok(out)
+}
+
+pub(crate) fn tile_split_devices_for(phys: WorldRect, preview_rects: &[(WorldRect, DeviceId)], force_dev: Option<DeviceId>) -> Arc<[DeviceId]> {
+    let mut devs = Vec::new();
+    if let Some(d) = force_dev {
+        devs.push(d);
+    }
+    for &(r, d) in preview_rects {
+        if r.intersects(&phys) && !devs.contains(&d) {
+            devs.push(d);
+        }
+    }
+    devs.sort_unstable();
+    Arc::from(devs)
+}
+
+pub(crate) fn compute_warm_sig(scope_gen: u64, edit_seq: u64, tile: TileKey, bg_sig: u64, split_devices: &[DeviceId]) -> u64 {
+    let mut h = 0xCBF2_9CE4_8422_2325_u64;
+    h = fnv_u64(h, scope_gen);
+    h = fnv_u64(h, edit_seq);
+    h = fnv_u64(h, u64::from(tile.lod));
+    h = fnv_u64(h, tile.tx as u64);
+    h = fnv_u64(h, (tile.tx >> 64) as u64);
+    h = fnv_u64(h, tile.ty as u64);
+    h = fnv_u64(h, (tile.ty >> 64) as u64);
+    h = fnv_u64(h, bg_sig);
+    for d in split_devices {
+        h = fnv_bytes(h, d.as_str().as_bytes());
+    }
+    if h == 0 { 1 } else { h }
+}
+
+#[derive(Default)]
+struct AsyncDynCounts {
+    pending_assets: usize,
+    anim_pending_tiles: usize,
+    pending_tiles: usize,
+    fallback_tiles: usize,
+}
+
+fn preregister_visible_anim_frames(
+    mgr: &mut WorldTileManager,
+    view: &Viewport,
+    elapsed_ms: u64,
+    resolve_media: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Arc<RgbaFrame>>>,
+) -> Result<()> {
+    if let Some(scene) = mgr.scene().cloned()
+        && let Ok(vrect) = photocraft_engine::scene::spatial::viewport_world_rect(view)
+    {
+        let mut frames_to_register: Vec<MediaFrame> = Vec::new();
+        for id in scene.query_world_rect_media(vrect) {
+            if let Some(shared) = scene.world().media.get(&id)
+                && shared.media.frames.len() > 1
+                && let Ok((_, mf)) = shared.media.frame_at(elapsed_ms)
+                && !mgr.has_media_frame(&mf.hash)
+                && !frames_to_register.iter().any(|f| f.hash == mf.hash)
+            {
+                frames_to_register.push(mf.clone());
             }
         }
-        if any {
-            staging.extend_from_slice(&buf);
-            copies.push(TileCopy { staging_offset: offset, x0, y0, width: tw, height: th });
+        for mf in frames_to_register {
+            if let Some(decoded) = resolve_media(&mf).map_err(|e| e.to_string())? {
+                mgr.register_media_frame(mf.hash, decoded);
+            }
         }
     }
-    Ok(copies)
+    Ok(())
 }
 
-fn content_device(item: &VisibleObject) -> DeviceId {
-    match item {
-        VisibleObject::Stroke(s) => s.device,
-        VisibleObject::Media(m) => m.device,
-    }
-}
-
-fn content_key(item: &VisibleObject) -> (DeviceId, u64, &str) {
-    match item {
-        VisibleObject::Stroke(s) => (s.device, s.created_revision, s.stroke.id.as_str()),
-        VisibleObject::Media(m) => (m.device, m.created_revision, m.media.id.as_str()),
-    }
-}
-
-fn buffer(device: &wgpu::Device, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
+fn upload_buffer(device: &wgpu::Device, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
     let size = (bytes.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(wgpu::COPY_BUFFER_ALIGNMENT);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
     let copied = match buffer.slice(..).get_mapped_range_mut() {
@@ -954,58 +1241,23 @@ fn buffer(device: &wgpu::Device, label: &str, bytes: &[u8], usage: wgpu::BufferU
     Ok(buffer)
 }
 
-fn pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    module: &wgpu::ShaderModule,
-    vs: &str,
-    fs: &str,
-    blend: wgpu::BlendState,
-    vertices: bool,
-) -> wgpu::RenderPipeline {
-    let attributes = wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Float32x4];
-    let buffers = [Some(wgpu::VertexBufferLayout { array_stride: 32, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes })];
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("world layer pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState { module, entry_point: Some(vs), buffers: if vertices { &buffers } else { &[] }, compilation_options: Default::default() },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module,
-            entry_point: Some(fs),
-            targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: Some(blend), write_mask: wgpu::ColorWrites::ALL })],
-            compilation_options: Default::default(),
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
+const TILE_SHADER: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) layer: u32,
+};
+
+@vertex
+fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) layer: u32) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), uv, layer);
 }
 
-fn clear_surface(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, color: wgpu::Color) {
-    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("world clear"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view,
-            resolve_target: None,
-            depth_slice: None,
-            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(color), store: wgpu::StoreOp::Store },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-}
+@group(0) @binding(0) var tiles: texture_2d_array<f32>;
+@group(0) @binding(1) var tile_sampler: sampler;
 
-const SHADER: &str = r#"
-struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @location(1) color:vec4<f32> };
-@vertex fn vs(@location(0) position:vec2<f32>,@location(1) uv:vec2<f32>,@location(2) color:vec4<f32>)->V {return V(vec4(position,0.0,1.0),uv,color);}
-@vertex fn quad(@builtin(vertex_index) id:u32)->V {let p=array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));let position=p[id];return V(vec4(position,0.0,1.0),vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5),vec4(1.0));}
-@group(0) @binding(0) var tex:texture_2d<f32>;
-@group(0) @binding(1) var tex_sampler:sampler;
-@fragment fn color(v:V)->@location(0) vec4<f32> {return v.color;}
-@fragment fn image(v:V)->@location(0) vec4<f32> {let c=textureSample(tex,tex_sampler,v.uv);return vec4(c.rgb*c.a,c.a)*v.color;}
-@fragment fn composite(v:V)->@location(0) vec4<f32> {return textureSample(tex,tex_sampler,v.uv);}
+@fragment
+fn fs(v: VOut) -> @location(0) vec4<f32> {
+    return textureSample(tiles, tile_sampler, v.uv, i32(v.layer));
+}
 "#;

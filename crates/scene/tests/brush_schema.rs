@@ -285,10 +285,12 @@ fn adversarial_brush_inputs_and_old_protocol_version_are_rejected() {
     bad_png.brush.as_mut().unwrap().tip = BrushTip::Sampled { width: 16, height: 16, png_b64: "AAAA".repeat(8) };
     assert!(bad_png.validate().is_err());
 
-    // Wire protocol version bumped from 2 -> 3.
-    assert_eq!(VERSION, 3);
-    let old_req = serde_json::to_vec(&Request { version: 2, action: Action::Identity {} }).unwrap();
-    assert!(Request::decode(&old_req).is_err());
+    // Wire protocol version bumped from 3 -> 4 (rejects both v2 and v3).
+    assert_eq!(VERSION, 4);
+    for old in [2u16, 3] {
+        let old_req = serde_json::to_vec(&Request { version: old, action: Action::Identity {} }).unwrap();
+        assert!(Request::decode(&old_req).is_err());
+    }
     let new_req = serde_json::to_vec(&Request { version: VERSION, action: Action::Identity {} }).unwrap();
     assert!(Request::decode(&new_req).is_ok());
 
@@ -304,4 +306,59 @@ fn adversarial_brush_inputs_and_old_protocol_version_are_rejected() {
     };
     let roundtrip: PreviewStyle = serde_json::from_slice(&serde_json::to_vec(&preview).unwrap()).unwrap();
     assert_eq!(roundtrip, preview);
+}
+
+#[test]
+fn checkpoint_bounded_zlib_zipbomb_hash_and_archive_v3_roundtrip() {
+    use photocraft_scene::shared::WorldCheckpoint;
+    use photocraft_scene::world_protocol::MAX_CHECKPOINT_UNCOMPRESSED_BYTES;
+    use std::io::Write;
+
+    let mut world = WorldState::new(canvas(90), owner(91), "Checkpoint v4".into()).unwrap();
+    for rev in 1..=25u64 {
+        let mut s = brush_stroke(rev as u128 + 100, canvas(90), owner(91), StrokeBrush::default(), None);
+        s.points = vec![[rev as f64, 0.0], [rev as f64 + 10.0, 5.0]];
+        world
+            .apply(&AcceptedOp {
+                revision: rev,
+                op: WorldOp {
+                    id: op_id(900 + rev as u128),
+                    canvas: canvas(90),
+                    author: owner(91),
+                    device: device(92),
+                    sequence: rev,
+                    authority_epoch: 1,
+                    action: Edit::AddStroke { stroke: s },
+                },
+            })
+            .unwrap();
+    }
+
+    let ckpt = world.to_checkpoint();
+    let (compressed, comp_sha, state_sha, uncomp_len) = ckpt.encode_zlib().unwrap();
+    let decoded = WorldCheckpoint::decode_zlib_bounded(&compressed, &comp_sha, uncomp_len, &state_sha, MAX_CHECKPOINT_UNCOMPRESSED_BYTES).unwrap();
+    assert_eq!(decoded, ckpt);
+    let from_ckpt = WorldState::from_checkpoint(decoded).unwrap();
+    assert_eq!(from_ckpt.revision, world.revision);
+    assert_eq!(from_ckpt.strokes, world.strokes);
+    assert_eq!(from_ckpt.base_revision(), world.revision);
+    assert!(from_ckpt.validate().is_ok());
+
+    // Hash mismatch rejected.
+    let mut tampered = compressed.clone();
+    tampered[0] ^= 0xFF;
+    assert!(WorldCheckpoint::decode_zlib_bounded(&tampered, &comp_sha, uncomp_len, &state_sha, MAX_CHECKPOINT_UNCOMPRESSED_BYTES).is_err());
+
+    // Streaming decompression cap rejects oversized / zip-bomb payloads cleanly before full allocation.
+    let mut bomb_enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    bomb_enc.write_all(&vec![b'A'; 128 * 1024]).unwrap();
+    let bomb = bomb_enc.finish().unwrap();
+    let bomb_sha = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bomb));
+    assert!(WorldCheckpoint::decode_zlib_bounded(&bomb, &bomb_sha, 64 * 1024, &state_sha, 64 * 1024).is_err());
+
+    // `.komworld` v3 archive encodes events ONCE (zlib-compressed) and decodes bit-identically.
+    let manifest = ArchiveManifest { schema: 2, world: world.clone(), assets: vec![] };
+    let v3_bytes = manifest.encode_v3().unwrap();
+    let decoded_manifest = ArchiveManifest::decode(&v3_bytes).unwrap();
+    assert_eq!(decoded_manifest.world, world);
 }

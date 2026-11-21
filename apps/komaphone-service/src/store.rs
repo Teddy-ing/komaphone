@@ -5,10 +5,14 @@ use photocraft_party::room::{Action, Room};
 use photocraft_party::{Error as DomainError, Participant, ParticipantId, RequestId, RoomId};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const APPLICATION_ID: u32 = 0x4b504852;
-const SCHEMA: u32 = 5;
+const SCHEMA: u32 = 6;
 const MAX_IDENTITIES: u64 = 256;
 const MAX_ROOMS: u64 = 128;
 const MAX_RECEIPTS: u64 = 65536;
@@ -34,9 +38,11 @@ pub enum SaveStage {
 
 pub struct Store {
     pub(crate) db: Connection,
+    pub(crate) db_path: PathBuf,
     pub(crate) options: StoreOptions,
     heartbeats: BTreeMap<(RoomId, ParticipantId), u64>,
     pub(crate) world_presence: crate::worlds::Presence,
+    pub(crate) pending_checkpoints: BTreeMap<photocraft_scene::CanvasId, crate::worlds::PendingCheckpointJob>,
 }
 
 impl Store {
@@ -71,6 +77,10 @@ impl Store {
         if journal != "delete" || sync != 3 || foreign != 1 {
             return Err(Error::Storage);
         }
+        if version == 0 {
+            db.pragma_update(None, "page_size", 16384)?;
+            db.pragma_update(None, "auto_vacuum", 1)?;
+        }
         let page_size: u64 = db.pragma_query_value(None, "page_size", |r| read_u64(r, 0))?;
         let pages = options.quota_bytes.checked_div(page_size).ok_or(Error::Invalid("page size"))?;
         db.pragma_update(None, "max_page_count", sql_int(pages)?)?;
@@ -101,7 +111,12 @@ impl Store {
         // Hosted tables precede world-v4 so the global version barrier and the
         // import tables can commit together, including upgrades from v1/v2.
         crate::worlds::initialize(&db, path)?;
-        Ok(Self { db, options, heartbeats: BTreeMap::new(), world_presence: Default::default() })
+        let startup_jobs = crate::worlds::scan_pending_checkpoints(&db)?;
+        let mut pending_checkpoints = BTreeMap::new();
+        for job in startup_jobs {
+            pending_checkpoints.insert(job.canvas, job);
+        }
+        Ok(Self { db, db_path: path.to_path_buf(), options, heartbeats: BTreeMap::new(), world_presence: Default::default(), pending_checkpoints })
     }
 
     pub fn execute(&mut self, credential: Option<&str>, request: &RpcRequest, now_ms: u64) -> Result<RpcResponse> {
@@ -194,7 +209,72 @@ impl Store {
             save_room(&tx, &room)?;
         }
         tx.commit()?;
+        let _ = self.incremental_vacuum(64);
         Ok(())
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn incremental_vacuum(&mut self, pages: u32) -> Result<()> {
+        let mode: i64 = self.db.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+        if mode == 2 {
+            let free: i64 = self.db.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+            if free > 0 {
+                self.db.execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue_pending_checkpoint(&mut self, job: crate::worlds::PendingCheckpointJob) {
+        if let Some(existing) = self.pending_checkpoints.get_mut(&job.canvas) {
+            if job.target_revision >= existing.target_revision {
+                *existing = job;
+            }
+            return;
+        }
+        if self.pending_checkpoints.len() >= crate::worlds::MAX_CHECKPOINT_BACKLOG
+            && let Some(oldest_canvas) = self.pending_checkpoints.iter().min_by_key(|(_, j)| j.target_revision).map(|(c, _)| *c)
+        {
+            self.pending_checkpoints.remove(&oldest_canvas);
+        }
+        self.pending_checkpoints.insert(job.canvas, job);
+    }
+
+    pub fn take_pending_checkpoints(&mut self) -> Vec<crate::worlds::PendingCheckpointJob> {
+        std::mem::take(&mut self.pending_checkpoints).into_values().collect()
+    }
+
+    pub fn prepare_checkpoint_from_path(db_path: &Path, job: &crate::worlds::PendingCheckpointJob) -> Result<Option<crate::worlds::PreparedCheckpoint>> {
+        crate::worlds::build_prepared_checkpoint_from_path(db_path, job)
+    }
+
+    pub fn publish_prepared_checkpoint(&mut self, prepared: &crate::worlds::PreparedCheckpoint) -> Result<bool> {
+        let tx = self.db.transaction()?;
+        let published = crate::worlds::publish_prepared_checkpoint(&tx, prepared)?;
+        tx.commit()?;
+        if published {
+            let _ = self.incremental_vacuum(64);
+        }
+        Ok(published)
+    }
+
+    /// Synchronous helper for in-process callers/tests that do not run the HTTP `server::serve`
+    /// background checkpoint worker. Reconstructs and publishes all queued checkpoints cleanly.
+    pub fn flush_pending_checkpoints(&mut self) -> Result<usize> {
+        let jobs = self.take_pending_checkpoints();
+        let mut count = 0usize;
+        for job in jobs {
+            if let Some(prepared) = Self::prepare_checkpoint_from_path(&self.db_path, &job)?
+                && self.publish_prepared_checkpoint(&prepared)?
+            {
+                count += 1;
+            }
+        }
+        let _ = self.incremental_vacuum(1024);
+        Ok(count)
     }
 
     /// Consistent SQLite backup, never a copy of an active database file.

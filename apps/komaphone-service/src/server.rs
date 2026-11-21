@@ -14,8 +14,8 @@ use std::{
     collections::BTreeMap,
     future::Future,
     net::SocketAddr,
-    path::Path,
-    sync::{Arc, Mutex, mpsc},
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -156,6 +156,62 @@ pub async fn spawn_tls(bind: SocketAddr, data_file: impl AsRef<Path>, options: S
     Ok(RunningService { address, stop: Some(stop), task })
 }
 
+#[derive(Default)]
+struct CheckpointQueueState {
+    pending: BTreeMap<photocraft_scene::CanvasId, crate::worlds::PendingCheckpointJob>,
+    closed: bool,
+}
+
+impl CheckpointQueueState {
+    fn push(&mut self, job: crate::worlds::PendingCheckpointJob) {
+        if let Some(existing) = self.pending.get_mut(&job.canvas) {
+            if job.target_revision >= existing.target_revision {
+                *existing = job;
+            }
+            return;
+        }
+        if self.pending.len() >= crate::worlds::MAX_CHECKPOINT_BACKLOG
+            && let Some(oldest) = self.pending.iter().min_by_key(|(_, j)| j.target_revision).map(|(c, _)| *c)
+        {
+            self.pending.remove(&oldest);
+        }
+        self.pending.insert(job.canvas, job);
+    }
+}
+
+fn spawn_checkpoint_worker(
+    db_path: PathBuf,
+    queue: Arc<(Mutex<CheckpointQueueState>, Condvar)>,
+    prepared_tx: mpsc::SyncSender<crate::worlds::PreparedCheckpoint>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new().name("komaphone-checkpoint".into()).spawn(move || {
+        loop {
+            let job = {
+                let mut guard = queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                while guard.pending.is_empty() && !guard.closed {
+                    guard = queue.1.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if guard.closed {
+                    return;
+                }
+                let next_canvas = guard.pending.iter().min_by_key(|(_, j)| j.target_revision).map(|(c, _)| *c);
+                let Some(canvas) = next_canvas else { continue };
+                guard.pending.remove(&canvas)
+            };
+            let Some(job) = job else { continue };
+            let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Store::prepare_checkpoint_from_path(&db_path, &job)))
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if let Some(prepared) = prepared
+                && prepared_tx.send(prepared).is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
 async fn serve<L: axum::serve::Listener<Addr = SocketAddr>>(
     listener: L,
     mut store: Store,
@@ -164,12 +220,27 @@ async fn serve<L: axum::serve::Listener<Addr = SocketAddr>>(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Job>(QUEUE);
+    let ckpt_queue = Arc::new((Mutex::new(CheckpointQueueState::default()), Condvar::new()));
+    let (prepared_tx, prepared_rx) = mpsc::sync_channel::<crate::worlds::PreparedCheckpoint>(crate::worlds::MAX_CHECKPOINT_BACKLOG);
+    let ckpt_worker = spawn_checkpoint_worker(store.db_path().to_path_buf(), Arc::clone(&ckpt_queue), prepared_tx)?;
+    // Dispatch any catch-up checkpoints detected on Store::open immediately.
+    {
+        let initial = store.take_pending_checkpoints();
+        if !initial.is_empty() {
+            let mut guard = ckpt_queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for job in initial {
+                guard.push(job);
+            }
+            ckpt_queue.1.notify_one();
+        }
+    }
+    let authority_ckpt_queue = Arc::clone(&ckpt_queue);
     let worker_clock = clock.clone();
     let client_id = google.as_ref().map(|g| g.client_id().to_owned());
     let worker = thread::Builder::new().name("komaphone-authority".into()).spawn(move || {
         let mut last_tick = Instant::now();
         loop {
-            match receiver.recv_timeout(Duration::from_millis(250)) {
+            match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(job) => {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job.request {
                         ServiceRequest::Room(request) => store.execute(job.credential.as_deref(), &request, worker_clock.now()).map(ServiceResponse::Room),
@@ -187,9 +258,21 @@ async fn serve<L: axum::serve::Listener<Addr = SocketAddr>>(
                     }))
                     .unwrap_or(Err(Error::Storage));
                     let _ = job.reply.send(result);
+                    let new_jobs = store.take_pending_checkpoints();
+                    if !new_jobs.is_empty() {
+                        let mut guard = authority_ckpt_queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for ckpt_job in new_jobs {
+                            guard.push(ckpt_job);
+                        }
+                        authority_ckpt_queue.1.notify_one();
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            // Publish at most one pre-compressed checkpoint per turn so incoming RPCs stay responsive.
+            if let Ok(prepared) = prepared_rx.try_recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.publish_prepared_checkpoint(&prepared)));
             }
             if last_tick.elapsed() >= Duration::from_millis(250) {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.tick(worker_clock.now()))).unwrap_or(Err(Error::Storage));
@@ -210,8 +293,15 @@ async fn serve<L: axum::serve::Listener<Addr = SocketAddr>>(
         .route("/health", get(move || async move { Json(serde_json::json!({"protocol_version":1,"service":"Komaphone","hosted":hosted})) }))
         .with_state(shared);
     let result = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
-    // Router has been dropped by serve; no senders remain and the isolated worker can terminate.
+    // Router has been dropped by serve; wake checkpoint worker, stop authority worker first
+    // (dropping prepared_rx so checkpoint worker cannot block on send), then join checkpoint worker.
+    {
+        let mut guard = ckpt_queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.closed = true;
+        ckpt_queue.1.notify_all();
+    }
     worker.join().map_err(|_| Error::Storage)?;
+    let _ = ckpt_worker.join();
     result.map_err(Error::Io)
 }
 

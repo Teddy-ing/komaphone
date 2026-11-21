@@ -84,7 +84,7 @@ pub struct Limits {
 }
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_operations: 65_536, max_strokes: 16_384, max_points: 262_144, max_tours: 128, max_media: 1024, max_media_frames: 4096 }
+        Self { max_operations: 262_144, max_strokes: 65_536, max_points: 2_097_152, max_tours: 128, max_media: 1024, max_media_frames: 4096 }
     }
 }
 impl Limits {
@@ -94,7 +94,7 @@ impl Limits {
             || self.max_strokes == 0
             || self.max_strokes > 262_144
             || self.max_points == 0
-            || self.max_points > 4_194_304
+            || self.max_points > 8_388_608
             || self.max_tours == 0
             || self.max_tours > 1024
             || self.max_media == 0
@@ -103,6 +103,204 @@ impl Limits {
             || self.max_media_frames > 65_536
         {
             return Err(Error::Invalid("reducer limits"));
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic rev-0 running chain hash seed for a shared canvas.
+pub fn chain_hash_init(canvas: CanvasId, owner: OwnerId, initial_name: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"komaphone-chain-v1:");
+    h.update(canvas.as_str().as_bytes());
+    h.update([0]);
+    h.update(owner.as_str().as_bytes());
+    h.update([0]);
+    h.update(initial_name.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Advance the running canonical event chain hash by one accepted revision.
+pub fn chain_hash_step(prev_chain: &str, revision: u64, event_hash: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"komaphone-chain-v1:");
+    h.update(prev_chain.as_bytes());
+    h.update(revision.to_be_bytes());
+    h.update(event_hash.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Derived-state snapshot at `revision` WITHOUT duplicating the accepted `events` log.
+/// Compressed with `zlib-rs` for immutable pinned checkpoint transfers and fast reopen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorldCheckpoint {
+    pub schema: u32,
+    pub canvas: CanvasId,
+    pub owner: OwnerId,
+    pub name: String,
+    pub initial_name: String,
+    pub revision: u64,
+    pub metadata_revision: u64,
+    pub strokes: BTreeMap<StrokeId, SharedStroke>,
+    pub tours: BTreeMap<TourId, Tour>,
+    pub media: BTreeMap<MediaId, SharedMedia>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_origin: Option<Box<ImportOrigin>>,
+    pub limits: Limits,
+    pub points: usize,
+    pub media_frames: usize,
+    pub sequences: BTreeMap<DeviceId, u64>,
+    pub device_authors: BTreeMap<DeviceId, OwnerId>,
+    pub tour_revisions: BTreeMap<TourId, u64>,
+}
+
+impl WorldCheckpoint {
+    pub fn state_hash(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(self).map_err(|_| Error::Invalid("checkpoint encoding"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Encode this checkpoint to canonical JSON + zlib-rs compressed bytes.
+    /// Returns `(compressed, compressed_sha256, state_hash, uncompressed_bytes)`.
+    pub fn encode_zlib(&self) -> Result<(Vec<u8>, String, String, u64)> {
+        use std::io::Write;
+        let json = serde_json::to_vec(self).map_err(|_| Error::Invalid("checkpoint encoding"))?;
+        let state_hash = format!("{:x}", Sha256::digest(&json));
+        let uncompressed = json.len() as u64;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(4));
+        enc.write_all(&json).map_err(|_| Error::Invalid("checkpoint compression"))?;
+        let compressed = enc.finish().map_err(|_| Error::Invalid("checkpoint compression"))?;
+        let compressed_sha256 = format!("{:x}", Sha256::digest(&compressed));
+        Ok((compressed, compressed_sha256, state_hash, uncompressed))
+    }
+
+    /// Verify compressed hash, stream-decompress under `max_uncompressed` (zip-bomb safe),
+    /// verify uncompressed length and `state_hash`, and run full structural/invariant validation.
+    pub fn decode_zlib_bounded(
+        compressed: &[u8],
+        expected_compressed_sha256: &str,
+        expected_uncompressed: u64,
+        expected_state_hash: &str,
+        max_uncompressed: u64,
+    ) -> Result<Self> {
+        use std::io::Read;
+        if expected_uncompressed == 0 || expected_uncompressed > max_uncompressed {
+            return Err(Error::Limit("checkpoint uncompressed size"));
+        }
+        if format!("{:x}", Sha256::digest(compressed)) != expected_compressed_sha256 {
+            return Err(Error::Invalid("checkpoint compressed checksum mismatch"));
+        }
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed).take(max_uncompressed.saturating_add(1));
+        let mut json = Vec::with_capacity(usize::try_from(expected_uncompressed.min(8 * 1024 * 1024)).unwrap_or(0));
+        decoder.read_to_end(&mut json).map_err(|_| Error::Invalid("checkpoint decompression failed"))?;
+        if json.len() as u64 > max_uncompressed || json.len() as u64 != expected_uncompressed {
+            return Err(Error::Limit("checkpoint uncompressed length mismatch"));
+        }
+        if format!("{:x}", Sha256::digest(&json)) != expected_state_hash {
+            return Err(Error::Invalid("checkpoint state hash mismatch"));
+        }
+        let ckpt: Self = serde_json::from_slice(&json).map_err(|_| Error::Invalid("checkpoint payload"))?;
+        ckpt.validate()?;
+        Ok(ckpt)
+    }
+
+    /// Full structural, limits, authorship, stroke, media, tour, and import-origin validation.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != SHARED_SCHEMA && self.schema != SHARED_SCHEMA_BRUSH {
+            return Err(Error::Schema);
+        }
+        crate::validate_name(&self.name)?;
+        crate::validate_name(&self.initial_name)?;
+        self.limits.validate()?;
+        valid_revision(self.revision)?;
+        valid_revision(self.metadata_revision)?;
+        if self.metadata_revision > self.revision
+            || self.revision > self.limits.max_operations as u64
+            || self.strokes.len() > self.limits.max_strokes
+            || self.points > self.limits.max_points
+            || self.tours.len() > self.limits.max_tours
+            || self.tour_revisions.len() > self.limits.max_tours
+            || self.media.len() > self.limits.max_media
+            || self.media_frames > self.limits.max_media_frames
+        {
+            return Err(Error::Limit("checkpoint invariants"));
+        }
+        if let Some(origin) = &self.import_origin {
+            origin.validate(self.canvas, self.owner)?;
+        }
+        if self.sequences.len() != self.device_authors.len() {
+            return Err(Error::Invalid("checkpoint device maps mismatch"));
+        }
+        for (dev, &seq) in &self.sequences {
+            if seq == 0 || seq > i64::MAX as u64 || !self.device_authors.contains_key(dev) {
+                return Err(Error::Invalid("checkpoint writer sequence"));
+            }
+        }
+        let mut total_points = 0usize;
+        let mut uses_brush = false;
+        for (&id, shared) in &self.strokes {
+            shared.stroke.validate()?;
+            crate::render::spatial_cells(&shared.stroke, crate::MAX_SPATIAL_CELLS)?;
+            if shared.stroke.id != id
+                || shared.stroke.canvas != self.canvas
+                || shared.stroke.revision != 0
+                || shared.created_revision == 0
+                || shared.created_revision > self.revision
+                || shared.changed_revision < shared.created_revision
+                || shared.changed_revision > self.revision
+                || self.device_authors.get(&shared.device) != Some(&shared.stroke.owner)
+            {
+                return Err(Error::Invalid("checkpoint stroke invariants"));
+            }
+            if let Some(prov) = &shared.provenance {
+                prov.validate()?;
+            }
+            if shared.stroke.uses_brush_v2() {
+                uses_brush = true;
+            }
+            total_points = total_points.checked_add(shared.stroke.points.len()).ok_or(Error::Limit("checkpoint points"))?;
+        }
+        if total_points != self.points || (uses_brush && self.schema < SHARED_SCHEMA_BRUSH) {
+            return Err(Error::Invalid("checkpoint stroke point count or schema"));
+        }
+        let mut total_frames = 0usize;
+        for (&id, shared) in &self.media {
+            shared.media.validate()?;
+            if shared.media.id != id
+                || shared.media.canvas != self.canvas
+                || shared.created_revision == 0
+                || shared.created_revision > self.revision
+                || shared.changed_revision < shared.created_revision
+                || shared.changed_revision > self.revision
+                || self.device_authors.get(&shared.device) != Some(&shared.media.owner)
+            {
+                return Err(Error::Invalid("checkpoint media invariants"));
+            }
+            total_frames = total_frames.checked_add(shared.media.frames.len()).ok_or(Error::Limit("checkpoint frames"))?;
+        }
+        if total_frames != self.media_frames {
+            return Err(Error::Invalid("checkpoint media frame count"));
+        }
+        for (&id, tour) in &self.tours {
+            tour.validate()?;
+            if tour.id != id
+                || tour.canvas != self.canvas
+                || tour.revision == 0
+                || tour.revision > self.revision
+                || self.tour_revisions.get(&id) != Some(&tour.revision)
+            {
+                return Err(Error::Invalid("checkpoint tour invariants"));
+            }
+        }
+        for &rev in self.tour_revisions.values() {
+            if rev == 0 || rev > self.revision {
+                return Err(Error::Invalid("checkpoint tour revision"));
+            }
         }
         Ok(())
     }
@@ -257,6 +455,8 @@ pub struct WorldState {
     receipts: BTreeMap<OpId, usize>,
     events: Vec<AcceptedOp>,
     tour_revisions: BTreeMap<TourId, u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    base_revision: u64,
 }
 impl WorldState {
     pub fn new(canvas: CanvasId, owner: OwnerId, name: String) -> Result<Self> {
@@ -285,7 +485,72 @@ impl WorldState {
             receipts: BTreeMap::new(),
             events: Vec::new(),
             tour_revisions: BTreeMap::new(),
+            base_revision: 0,
         })
+    }
+    pub fn from_checkpoint(ckpt: WorldCheckpoint) -> Result<Self> {
+        ckpt.validate()?;
+        Ok(Self {
+            schema: ckpt.schema,
+            canvas: ckpt.canvas,
+            owner: ckpt.owner,
+            name: ckpt.name,
+            initial_name: ckpt.initial_name,
+            revision: ckpt.revision,
+            metadata_revision: ckpt.metadata_revision,
+            strokes: ckpt.strokes,
+            tours: ckpt.tours,
+            media: ckpt.media,
+            import_origin: ckpt.import_origin,
+            limits: ckpt.limits,
+            points: ckpt.points,
+            media_frames: ckpt.media_frames,
+            sequences: ckpt.sequences,
+            device_authors: ckpt.device_authors,
+            receipts: BTreeMap::new(),
+            events: Vec::new(),
+            tour_revisions: ckpt.tour_revisions,
+            base_revision: ckpt.revision,
+        })
+    }
+    pub fn to_checkpoint(&self) -> WorldCheckpoint {
+        WorldCheckpoint {
+            schema: self.schema,
+            canvas: self.canvas,
+            owner: self.owner,
+            name: self.name.clone(),
+            initial_name: self.initial_name.clone(),
+            revision: self.revision,
+            metadata_revision: self.metadata_revision,
+            strokes: self.strokes.clone(),
+            tours: self.tours.clone(),
+            media: self.media.clone(),
+            import_origin: self.import_origin.clone(),
+            limits: self.limits,
+            points: self.points,
+            media_frames: self.media_frames,
+            sequences: self.sequences.clone(),
+            device_authors: self.device_authors.clone(),
+            tour_revisions: self.tour_revisions.clone(),
+        }
+    }
+    pub fn initial_name(&self) -> &str {
+        &self.initial_name
+    }
+    pub fn base_revision(&self) -> u64 {
+        self.base_revision
+    }
+    pub fn has_full_history(&self) -> bool {
+        self.base_revision == 0
+    }
+    pub fn device_author(&self, device: DeviceId) -> Option<OwnerId> {
+        self.device_authors.get(&device).copied()
+    }
+    pub fn media_frame_count(&self) -> usize {
+        self.media_frames
+    }
+    pub fn tour_count(&self) -> usize {
+        self.tour_revisions.len()
     }
     pub fn limits(&self) -> Limits {
         self.limits
@@ -294,7 +559,7 @@ impl WorldState {
         self.points
     }
     pub fn operation_count(&self) -> usize {
-        self.events.len()
+        (self.base_revision as usize).saturating_add(self.events.len())
     }
     pub fn next_sequence(&self, device: DeviceId) -> Result<u64> {
         self.sequences.get(&device).copied().unwrap_or(0).checked_add(1).filter(|n| *n <= i64::MAX as u64).ok_or(Error::Limit("writer sequence"))
@@ -306,10 +571,10 @@ impl WorldState {
         self.tour_revisions.get(&id).copied().unwrap_or(0)
     }
     pub fn events_after(&self, after: u64, limit: usize) -> Result<&[AcceptedOp]> {
-        if after > self.revision || limit == 0 || limit > MAX_EVENT_PAGE {
+        if after > self.revision || after < self.base_revision || limit == 0 || limit > MAX_EVENT_PAGE {
             return Err(Error::Invalid("event page"));
         }
-        let start = usize::try_from(after).map_err(|_| Error::Limit("event offset"))?;
+        let start = usize::try_from(after - self.base_revision).map_err(|_| Error::Limit("event offset"))?;
         let end = start.saturating_add(limit).min(self.events.len());
         self.events.get(start..end).ok_or(Error::Invalid("event range"))
     }
@@ -346,7 +611,7 @@ impl WorldState {
         if self.device_authors.get(&op.device).is_some_and(|author| *author != op.author) {
             return Err(Error::Permission);
         }
-        if self.events.len() >= self.limits.max_operations {
+        if self.operation_count() >= self.limits.max_operations {
             return Err(Error::Limit("retained operation history"));
         }
         // Validate the complete candidate before changing any field.
@@ -499,6 +764,22 @@ impl WorldState {
         if let Some(origin) = &self.import_origin {
             origin.validate(self.canvas, self.owner)?;
         }
+        if self.base_revision > 0 {
+            if self.base_revision.saturating_add(self.events.len() as u64) != self.revision {
+                return Err(Error::Invalid("checkpoint base revision mismatch"));
+            }
+            self.to_checkpoint().validate()?;
+            for (idx, event) in self.events.iter().enumerate() {
+                if event.revision != self.base_revision.saturating_add(idx as u64 + 1)
+                    || event.op.canvas != self.canvas
+                    || self.receipts.get(&event.op.id) != Some(&idx)
+                {
+                    return Err(Error::Invalid("checkpoint tail event mismatch"));
+                }
+                event.op.validate()?;
+            }
+            return Ok(());
+        }
         let mut rebuilt = Self::with_limits(self.canvas, self.owner, self.initial_name.clone(), self.limits)?;
         rebuilt.import_origin = self.import_origin.clone();
         for event in &self.events {
@@ -517,6 +798,12 @@ impl WorldState {
         }
         let mut result = Self::with_limits(self.canvas, self.owner, self.initial_name.clone(), self.limits)?;
         result.import_origin = self.import_origin.clone();
+        if revision == 0 {
+            return Ok(result);
+        }
+        if self.base_revision > 0 {
+            return Err(Error::Invalid("full history before checkpoint must be fetched before historical replay"));
+        }
         let count = usize::try_from(revision).map_err(|_| Error::Limit("replay revision"))?;
         for event in self.events.get(..count).ok_or(Error::Invalid("replay history gap"))? {
             result.apply(event)?;

@@ -1,10 +1,16 @@
 use super::{CommandSpec, Deserialize, Name, Result, Session, Value, active, empty, error, json, opened, parse, same, spec};
 use photocraft_scene::{Bookmark, Camera, coordinates};
 
+fn default_persist() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetCamera {
     camera: Camera,
+    #[serde(default = "default_persist")]
+    persist: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,20 +37,28 @@ pub(super) fn save(s: &mut Session, viewer: crate::worlds::Viewer) -> Result<Val
     Ok(json!({"pending":true,"saved":false}))
 }
 pub(super) fn camera(s: &mut Session, camera: Camera) -> Result<Value> {
+    camera_with_persist(s, camera, true)
+}
+fn camera_with_persist(s: &mut Session, camera: Camera, persist: bool) -> Result<Value> {
     same(s, camera.canvas)?;
     coordinates::validate_camera(&camera).map_err(error)?;
     let mut viewer = active(s)?.viewer.clone();
     viewer.camera = camera;
-    let result = save(s, viewer)?;
+    let result = if persist {
+        save(s, viewer)?
+    } else {
+        s.worlds.active.as_mut().ok_or_else(|| error("Open a shared canvas first"))?.viewer = viewer;
+        json!({"pending":false,"saved":false})
+    };
     s.worlds.tour_playback = None;
     s.worlds.flight = None;
     Ok(result)
 }
 pub(super) fn specs() -> Vec<CommandSpec> {
     vec![
-        spec("komaphone.world.camera", "Navigate shared canvas", r#"{"camera":exact_canvas_camera}"#, opened, |s, p| {
+        spec("komaphone.world.camera", "Navigate shared canvas", r#"{"camera":exact_canvas_camera,"persist":bool=true}"#, opened, |s, p| {
             let p: SetCamera = parse(p)?;
-            camera(s, p.camera)
+            camera_with_persist(s, p.camera, p.persist)
         }),
         spec("komaphone.world.home", "Shared canvas home", "{}", opened, |s, p| {
             empty(p)?;

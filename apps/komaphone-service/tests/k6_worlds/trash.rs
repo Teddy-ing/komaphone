@@ -137,7 +137,22 @@ fn trash_directory_pages_only_owned_canvases_and_v2_migration_retains_verified_b
     let before = events(&mut store, 1, 100);
     drop(store);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_trash; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=2)); INSERT INTO world_schema VALUES(2);").unwrap();
+    // Construct an authentic legacy v2 database (inline worlds.state/hash, no v3-v6 tables).
+    {
+        use sha2::{Digest, Sha256};
+        for (owner_id, cid) in [(1_u32, 100_u32), (1, 101), (1, 102), (2, 200)] {
+            let mut w = photocraft_scene::shared::WorldState::new(canvas(cid), owner(owner_id), format!("Canvas {cid}")).unwrap();
+            if cid == 100 {
+                for ev in &before {
+                    w.apply(ev).unwrap();
+                }
+            }
+            let bytes = serde_json::to_vec(&w).unwrap();
+            let h = format!("{:x}", Sha256::digest(&bytes));
+            db.execute("UPDATE worlds SET state=?1,hash=?2 WHERE id=?3", rusqlite::params![bytes, h, canvas(cid).as_str()]).unwrap();
+        }
+    }
+    db.execute_batch("DROP TABLE world_checkpoints; DROP TABLE world_tours_idx; DROP TABLE world_media_idx; DROP TABLE world_strokes_idx; DROP TABLE world_devices; DROP TABLE world_meta; DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_trash; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=2)); INSERT INTO world_schema VALUES(2); PRAGMA user_version=3;").unwrap();
     drop(db);
     let mut store = Store::open(&path, StoreOptions::default(), 100).unwrap();
     assert_eq!(events(&mut store, 1, 100), before);

@@ -180,7 +180,7 @@ pub(super) fn remix_canvas(
 ) -> Result<Response> {
     let media = placement(tx, profile, device, operation)?;
     super::grant(tx, source_canvas, profile)?;
-    let world = super::state(tx, source_canvas)?;
+    let world = super::storage_v6::reconstruct_world(tx, source_canvas, false)?;
     let source = world.media.get(&source_media).ok_or_else(invalid)?;
     // The immutable body remains a usable copy source after personal hide/undo. Hiding never deletes accepted art.
     let prepared = PreparedMedia {

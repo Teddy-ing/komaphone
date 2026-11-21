@@ -10,6 +10,7 @@ pub mod coordinates;
 pub mod render;
 pub mod round;
 pub mod shared;
+pub mod spatial;
 pub mod world_protocol;
 
 pub const MAX_DEPTH: u8 = 12;

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 
 const APPLICATION_ID: u32 = 0x4b575151;
-const SCHEMA: u32 = 3;
+const SCHEMA: u32 = 4;
 const MAX_PENDING: u64 = 8192;
 const MAX_QUEUE_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -22,6 +22,8 @@ const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_DIRECTORY: usize = 16_384;
 mod directory;
 mod relocation;
+mod storage_v4;
+pub use storage_v4::PreparedLocalCheckpoint;
 mod viewer;
 pub use viewer::ViewerState;
 
@@ -198,7 +200,7 @@ impl WorldOutbox {
         db.busy_timeout(Duration::from_secs(2)).map_err(sql)?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(sql)?;
         let app: u32 = db.pragma_query_value(None, "application_id", |r| r.get(0)).map_err(sql)?;
-        if (version != 0 && (!matches!(version, 1 | 2 | SCHEMA) || app != APPLICATION_ID)) || (version == 0 && app != 0) {
+        if (version != 0 && (!matches!(version, 1 | 2 | 3 | SCHEMA) || app != APPLICATION_ID)) || (version == 0 && app != 0) {
             return Err(invalid("Unsupported canvas queue database; preserve it and upgrade"));
         }
         if version == 0 {
@@ -215,6 +217,10 @@ impl WorldOutbox {
         if mode != "delete" || sync != 3 {
             return Err(invalid("Required canvas queue durability is unavailable"));
         }
+        if version == 0 {
+            db.pragma_update(None, "page_size", 16384).map_err(sql)?;
+            db.pragma_update(None, "auto_vacuum", 1).map_err(sql)?;
+        }
         let size: u64 = db.pragma_query_value(None, "page_size", |r| read_u64(r, 0)).map_err(sql)?;
         let pages = (512u64 * 1024 * 1024).checked_div(size).ok_or_else(|| invalid("Canvas queue page size"))?;
         db.pragma_update(None, "max_page_count", integer(pages)?).map_err(sql)?;
@@ -226,6 +232,8 @@ impl WorldOutbox {
             relocation::backup_schema_one(&db, path)?;
         } else if version == 2 {
             relocation::backup_schema_two(&db, path)?;
+        } else if version == 3 {
+            relocation::backup_schema_three(&db, path)?;
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         if version == 0 {
@@ -237,6 +245,7 @@ impl WorldOutbox {
               CREATE TABLE snapshots(scope TEXT NOT NULL,canvas TEXT NOT NULL,revision INTEGER NOT NULL,body BLOB NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(scope,canvas));").map_err(sql)?;
             tx.execute_batch("CREATE TABLE viewers(scope TEXT NOT NULL,canvas TEXT NOT NULL,body BLOB NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(scope,canvas));")
                 .map_err(sql)?;
+            tx.execute_batch(storage_v4::TABLES).map_err(sql)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID).map_err(sql)?;
             tx.pragma_update(None, "user_version", SCHEMA).map_err(sql)?;
         }
@@ -247,6 +256,20 @@ impl WorldOutbox {
                 tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scope_moves')", [], |row| row.get(0)).map_err(sql)?;
             if !retirement_table {
                 return Err(invalid("Canvas migration receipts are missing; preserve this database instead of reusing an old writer"));
+            }
+        }
+        if version > 0 && version < SCHEMA {
+            storage_v4::migrate_from_legacy_snapshots(&tx)?;
+        } else if version == SCHEMA {
+            let v4_tables: u32 = tx
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('canvas_heads','accepted_events','canvas_checkpoints','checkpoint_staging','checkpoint_staging_chunks')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if v4_tables != 5 {
+                return Err(invalid("Canvas incremental storage tables are missing; preserve recovery data"));
             }
         }
         tx.pragma_update(None, "user_version", SCHEMA).map_err(sql)?;
@@ -275,16 +298,12 @@ impl WorldOutbox {
         tx.commit().map_err(sql)
     }
 
-    /// Supply only an authenticated current grant and canonical next writer
-    /// sequence. New epochs preserve old operations as recovery variants.
-    pub fn grant(&mut self, lease: &Activation, canvas: CanvasId, epoch: u64, server_next_sequence: u64) -> Result<()> {
+    fn grant_in_tx(tx: &rusqlite::Transaction<'_>, lease: &Activation, canvas: CanvasId, epoch: u64, server_next_sequence: u64) -> Result<()> {
         if epoch == 0 || server_next_sequence == 0 {
             return Err(invalid("Canvas grant epoch/sequence must be positive"));
         }
         let epoch = integer(epoch)?;
         let server_next = integer(server_next_sequence)?;
-        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-        active(&tx, lease)?;
         let old: Option<(i64, i64, i64)> = tx
             .query_row("SELECT epoch,server_next,blocked FROM grants WHERE scope=?1 AND canvas=?2", params![lease.key, canvas.as_str()], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -315,7 +334,50 @@ impl WorldOutbox {
         // It may advance the canonical prefix, but must keep this writer paused.
         let blocked = if old.is_some_and(|(prior_epoch, _, blocked)| prior_epoch == epoch && blocked == 2) { 2 } else { 0 };
         tx.execute("INSERT INTO grants VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(scope,canvas) DO UPDATE SET epoch=excluded.epoch,next_sequence=excluded.next_sequence,server_next=excluded.server_next,blocked=excluded.blocked",params![lease.key,canvas.as_str(),epoch,next,server_next,blocked]).map_err(sql)?;
+        Ok(())
+    }
+
+    /// Supply only an authenticated current grant and canonical next writer
+    /// sequence. New epochs preserve old operations as recovery variants.
+    pub fn grant(&mut self, lease: &Activation, canvas: CanvasId, epoch: u64, server_next_sequence: u64) -> Result<()> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        Self::grant_in_tx(&tx, lease, canvas, epoch, server_next_sequence)?;
         tx.commit().map_err(sql)
+    }
+
+    /// Atomically persist one contiguous accepted event, advance the grant sequence,
+    /// and acknowledge the matching queued operation in ONE `Immediate` SQLite commit.
+    pub(crate) fn commit_contiguous_accepted(
+        &mut self,
+        lease: &Activation,
+        info: &wire::CanvasSummary,
+        event: &AcceptedOp,
+        queued: Option<&QueuedOperation>,
+        server_next_sequence: u64,
+    ) -> Result<Option<(u64, String)>> {
+        if let Some(q) = queued
+            && (event.revision == 0 || event.revision > i64::MAX as u64 || event.op != q.operation || q.activation != *lease)
+        {
+            return Err(invalid("Service acknowledged different canvas content; keep the queued original"));
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        Self::grant_in_tx(&tx, lease, info.canvas, info.epoch, server_next_sequence)?;
+        let ckpt_trigger = storage_v4::append_accepted_events_v4(&tx, lease, info, std::slice::from_ref(event))?;
+        if let Some(q) = queued {
+            check_queued(&tx, q)?;
+            storage_v4::verify_accepted_for_ack(&tx, &q.activation, event)?;
+            let next = integer(event.op.sequence.checked_add(1).ok_or_else(|| invalid("Canvas sequence limit"))?)?;
+            tx.execute(
+                "UPDATE grants SET server_next=max(server_next,?3),next_sequence=max(next_sequence,?3) WHERE scope=?1 AND canvas=?2",
+                params![q.activation.key, event.op.canvas.as_str(), next],
+            )
+            .map_err(sql)?;
+            tx.execute("DELETE FROM operations WHERE scope=?1 AND id=?2", params![q.activation.key, event.op.id.as_str()]).map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok(ckpt_trigger)
     }
 
     /// Explicitly resume new edits after preserving conflicting work in recovery.
@@ -442,11 +504,7 @@ impl WorldOutbox {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         active(&tx, &queued.activation)?;
         check_queued(&tx, queued)?;
-        let durable = read_snapshot(&tx, &queued.activation, accepted.op.canvas)?
-            .ok_or_else(|| invalid("Download and save the accepted canvas revision before clearing its local queue"))?;
-        if durable.receipt(accepted.op.id) != Some(accepted) {
-            return Err(invalid("Accepted operation is ahead of durable canvas history; retain it until catch-up is saved"));
-        }
+        storage_v4::verify_accepted_for_ack(&tx, &queued.activation, accepted)?;
         let next = integer(accepted.op.sequence.checked_add(1).ok_or_else(|| invalid("Canvas sequence limit"))?)?;
         tx.execute(
             "UPDATE grants SET server_next=max(server_next,?3),next_sequence=max(next_sequence,?3) WHERE scope=?1 AND canvas=?2",
@@ -534,11 +592,6 @@ impl WorldOutbox {
     }
 
     pub fn save_snapshot(&mut self, lease: &Activation, state: &WorldState) -> Result<()> {
-        state.validate().map_err(|e| invalid(&e.to_string()))?;
-        let bytes = serde_json::to_vec(state).map_err(|_| invalid("Canvas snapshot encoding"))?;
-        if bytes.len() > MAX_SNAPSHOT_BYTES {
-            return Err(invalid("Canvas snapshot exceeds local cache limit"));
-        }
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         active(&tx, lease)?;
         let allowed: bool = tx
@@ -551,18 +604,171 @@ impl WorldOutbox {
         if !allowed {
             return Err(invalid("Canvas has no current grant for this account"));
         }
-        if let Some(prior) = read_snapshot(&tx, lease, state.canvas)? {
-            if prior.revision > state.revision {
-                return Err(invalid("Stale canvas snapshot; retain newer local state"));
-            }
-            let prefix = state.replay_to(prior.revision).map_err(|e| invalid(&e.to_string()))?;
-            if prefix.canonical_hash().map_err(|e| invalid(&e.to_string()))? != prior.canonical_hash().map_err(|e| invalid(&e.to_string()))? {
-                return Err(invalid("Canvas snapshot conflicts with its saved immutable history; retain both recovery sources"));
-            }
-        }
-        tx.execute("INSERT INTO snapshots VALUES(?1,?2,?3,?4,?5) ON CONFLICT(scope,canvas) DO UPDATE SET revision=excluded.revision,body=excluded.body,hash=excluded.hash",params![lease.key,state.canvas.as_str(),integer(state.revision)?,bytes,checksum(&lease.key,state.canvas,&bytes)]).map_err(sql)?;
+        storage_v4::save_snapshot_v4(&tx, lease, state)?;
         tx.commit().map_err(sql)
     }
+
+    /// Incrementally append accepted events in O(events) without reserializing full state
+    /// or blocking on checkpoint compression. Returns `Some((rev, chain_hash))` when a
+    /// background local checkpoint should be generated off-thread.
+    pub fn append_accepted_events(
+        &mut self,
+        lease: &Activation,
+        info: &wire::CanvasSummary,
+        events: &[AcceptedOp],
+        _state_for_ckpt: Option<&WorldState>,
+    ) -> Result<Option<(u64, String)>> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let revoked: bool = tx
+            .query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE scope=?1 AND canvas=?2 AND blocked=1)", params![lease.key, info.canvas.as_str()], |r| r.get(0))
+            .map_err(sql)?;
+        if revoked {
+            return Err(invalid("Canvas access was revoked for this account"));
+        }
+        let need_ckpt = storage_v4::append_accepted_events_v4(&tx, lease, info, events)?;
+        tx.commit().map_err(sql)?;
+        Ok(need_ckpt)
+    }
+
+    /// Lock-free compression helper for background local checkpoint preparation.
+    pub fn prepare_local_checkpoint(
+        canvas: CanvasId,
+        ckpt: &photocraft_scene::shared::WorldCheckpoint,
+        chain_hash: String,
+    ) -> Result<storage_v4::PreparedLocalCheckpoint> {
+        storage_v4::prepare_local_checkpoint(canvas, ckpt, chain_hash)
+    }
+
+    /// Fast atomic write of a pre-compressed local checkpoint under the active `Activation` lease.
+    pub fn store_prepared_local_checkpoint(&mut self, lease: &Activation, prepared: &storage_v4::PreparedLocalCheckpoint) -> Result<bool> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let revoked: bool = tx
+            .query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE scope=?1 AND canvas=?2 AND blocked=1)", params![lease.key, prepared.canvas.as_str()], |r| {
+                r.get(0)
+            })
+            .map_err(sql)?;
+        if revoked {
+            return Ok(false);
+        }
+        let stored = storage_v4::store_prepared_local_checkpoint(&tx, lease, prepared)?;
+        tx.commit().map_err(sql)?;
+        if stored {
+            let _ = self.incremental_vacuum(64);
+        }
+        Ok(stored)
+    }
+
+    pub fn incremental_vacuum(&mut self, pages: u32) -> Result<()> {
+        let mode: i64 = self.db.pragma_query_value(None, "auto_vacuum", |r| r.get(0)).map_err(sql)?;
+        if mode == 2 {
+            let free: i64 = self.db.pragma_query_value(None, "freelist_count", |r| r.get(0)).map_err(sql)?;
+            if free > 0 {
+                self.db.execute_batch(&format!("PRAGMA incremental_vacuum({pages});")).map_err(sql)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 1: fast read-only assembly of completely staged checkpoint bytes for off-thread verification.
+    pub fn read_staged_checkpoint_bytes(&self, lease: &Activation, info: &wire::CanvasSummary, ckpt: &wire::CheckpointRef) -> Result<Vec<u8>> {
+        active(&self.db, lease)?;
+        let revoked: bool = self
+            .db
+            .query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE scope=?1 AND canvas=?2 AND blocked=1)", params![lease.key, info.canvas.as_str()], |r| r.get(0))
+            .map_err(sql)?;
+        if revoked {
+            return Err(invalid("Canvas access was revoked for this account"));
+        }
+        storage_v4::read_staged_checkpoint_bytes(&self.db, lease, info, ckpt)
+    }
+
+    /// Phase 2: pure lock-free bounded decompression & validation run off the `WorldWorker` thread.
+    pub fn verify_staged_checkpoint(
+        info: &wire::CanvasSummary,
+        ckpt: &wire::CheckpointRef,
+        compressed: &[u8],
+    ) -> Result<(photocraft_scene::shared::WorldCheckpoint, WorldState)> {
+        storage_v4::verify_and_decode_checkpoint(info, ckpt, compressed)
+    }
+
+    /// Phase 3: fast atomic publication of a pre-verified staged checkpoint under the active lease.
+    /// Never alters pending/recovery `operations` or personal `viewers`.
+    pub fn commit_verified_checkpoint(
+        &mut self,
+        lease: &Activation,
+        info: &wire::CanvasSummary,
+        ckpt_ref: &wire::CheckpointRef,
+        compressed: &[u8],
+        ckpt: &photocraft_scene::shared::WorldCheckpoint,
+    ) -> Result<()> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let revoked: bool = tx
+            .query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE scope=?1 AND canvas=?2 AND blocked=1)", params![lease.key, info.canvas.as_str()], |r| r.get(0))
+            .map_err(sql)?;
+        if revoked {
+            return Err(invalid("Canvas access was revoked for this account"));
+        }
+        storage_v4::commit_verified_checkpoint(&tx, lease, info, ckpt_ref, compressed, ckpt)?;
+        tx.commit().map_err(sql)?;
+        let _ = self.incremental_vacuum(64);
+        Ok(())
+    }
+
+    /// Begin or resume staging a pinned immutable checkpoint; returns bytes already staged.
+    pub fn begin_checkpoint_stage(&mut self, lease: &Activation, ckpt: &wire::CheckpointRef) -> Result<u64> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let received = storage_v4::begin_checkpoint_stage(&tx, lease, ckpt)?;
+        tx.commit().map_err(sql)?;
+        Ok(received)
+    }
+
+    /// Stage one verified pinned checkpoint chunk; returns new durable byte offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_checkpoint_chunk(
+        &mut self,
+        lease: &Activation,
+        canvas: CanvasId,
+        revision: u64,
+        compressed_sha256: photocraft_scene::shared::media::AssetHash,
+        offset: u64,
+        bytes: &[u8],
+        total: u64,
+    ) -> Result<u64> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let received = storage_v4::stage_checkpoint_chunk(&tx, lease, canvas, revision, compressed_sha256, offset, bytes, total)?;
+        tx.commit().map_err(sql)?;
+        Ok(received)
+    }
+
+    /// Discard any incomplete staged checkpoint for `canvas` (e.g. after server checkpoint rotation).
+    pub fn clear_checkpoint_stage(&mut self, lease: &Activation, canvas: CanvasId) -> Result<()> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        storage_v4::clear_checkpoint_stage(&tx, &lease.key, canvas)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// Atomically verify and publish a completely staged pinned checkpoint under the current activation lease.
+    /// Never alters pending/recovery `operations` or personal `viewers`.
+    pub fn publish_checkpoint(&mut self, lease: &Activation, info: &wire::CanvasSummary, ckpt: &wire::CheckpointRef) -> Result<WorldState> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        active(&tx, lease)?;
+        let revoked: bool = tx
+            .query_row("SELECT EXISTS(SELECT 1 FROM grants WHERE scope=?1 AND canvas=?2 AND blocked=1)", params![lease.key, info.canvas.as_str()], |r| r.get(0))
+            .map_err(sql)?;
+        if revoked {
+            return Err(invalid("Canvas access was revoked for this account"));
+        }
+        let state = storage_v4::publish_checkpoint(&tx, lease, info, ckpt)?;
+        tx.commit().map_err(sql)?;
+        Ok(state)
+    }
+
     pub fn load_snapshot(&self, lease: &Activation, canvas: CanvasId) -> Result<Option<WorldState>> {
         active(&self.db, lease)?;
         read_snapshot(&self.db, lease, canvas)
@@ -572,91 +778,12 @@ impl WorldOutbox {
     /// account/writer. This directory is never a new service membership grant.
     pub fn cached_summaries(&self, lease: &Activation, after: Option<CanvasId>, limit: usize) -> Result<CachedCanvasPage> {
         active(&self.db, lease)?;
-        if limit == 0 || limit > 128 {
-            return Err(invalid("Cached canvas page must contain 1 to 128 rows"));
-        }
-        let mut query = self.db.prepare("SELECT s.canvas,s.revision,g.epoch,length(s.body),substr(s.body,1,?3),s.hash FROM snapshots s JOIN grants g ON g.scope=s.scope AND g.canvas=s.canvas WHERE s.scope=?1 AND g.blocked IN(0,2) AND (?2 IS NULL OR s.canvas>?2) ORDER BY s.canvas LIMIT ?4").map_err(sql)?;
-        let mut rows =
-            query.query(params![lease.key, after.map(|id| id.as_str().to_owned()), (MAX_SNAPSHOT_BYTES + 1) as i64, (limit + 1) as i64]).map_err(sql)?;
-        let mut items = Vec::new();
-        let mut scanned = 0usize;
-        let mut more = false;
-        while let Some(row) = rows.next().map_err(sql)? {
-            let length = usize::try_from(read_u64(row, 3).map_err(sql)?).map_err(|_| invalid("Cached canvas size"))?;
-            if items.len() >= limit || (!items.is_empty() && scanned.saturating_add(length) > MAX_PAGE_BYTES) {
-                more = true;
-                break;
-            }
-            if length > MAX_SNAPSHOT_BYTES {
-                return Err(invalid("Cached canvas exceeds the snapshot limit; preserve recovery data"));
-            }
-            let canvas = CanvasId::new(&row.get::<_, String>(0).map_err(sql)?).map_err(|_| invalid("Cached canvas identity"))?;
-            let revision = read_u64(row, 1).map_err(sql)?;
-            let epoch = read_u64(row, 2).map_err(sql)?;
-            let bytes: Vec<u8> = row.get(4).map_err(sql)?;
-            let hash: String = row.get(5).map_err(sql)?;
-            if bytes.len() != length || checksum(&lease.key, canvas, &bytes) != hash {
-                return Err(invalid("Cached canvas checksum failed; preserve recovery data"));
-            }
-            // Ignoring the retained drawing arrays avoids allocating a whole
-            // scene just to show names in the offline gallery.
-            #[derive(Deserialize)]
-            struct Summary {
-                canvas: CanvasId,
-                owner: OwnerId,
-                name: String,
-                initial_name: String,
-                #[serde(default)]
-                import_origin: Option<Box<photocraft_scene::shared::ImportOrigin>>,
-                revision: u64,
-            }
-            let saved: Summary = serde_json::from_slice(&bytes).map_err(|_| invalid("Cached canvas metadata is invalid"))?;
-            if saved.canvas != canvas || saved.revision != revision || epoch == 0 {
-                return Err(invalid("Cached canvas metadata does not match its authorized row"));
-            }
-            photocraft_scene::validate_name(&saved.name).map_err(|_| invalid("Cached canvas name"))?;
-            photocraft_scene::validate_name(&saved.initial_name).map_err(|_| invalid("Cached canvas initial name"))?;
-            scanned = scanned.saturating_add(length);
-            if let Some(origin) = &saved.import_origin {
-                origin.validate(canvas, saved.owner).map_err(|_| invalid("Cached archive origin"))?;
-                if revision < origin.source_revision {
-                    return Err(invalid("Cached archive download is incomplete; reconnect to finish it. Saved artwork is preserved"));
-                }
-            }
-            items.push(wire::CanvasSummary {
-                canvas,
-                owner: saved.owner,
-                name: saved.name,
-                initial_name: saved.initial_name,
-                import_origin: saved.import_origin,
-                revision,
-                epoch,
-            });
-        }
-        let next = if more { items.last().map(|item| item.canvas) } else { None };
-        Ok(CachedCanvasPage { items, next })
+        storage_v4::cached_summaries_v4(&self.db, lease, after, limit)
     }
 }
 
 fn read_snapshot(db: &Connection, lease: &Activation, canvas: CanvasId) -> Result<Option<WorldState>> {
-    let row: Option<(Vec<u8>, String)> = db
-        .query_row(
-            "SELECT substr(body,1,?3),hash FROM snapshots WHERE scope=?1 AND canvas=?2",
-            params![lease.key, canvas.as_str(), (MAX_SNAPSHOT_BYTES + 1) as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(sql)?;
-    let Some((bytes, hash)) = row else { return Ok(None) };
-    if bytes.len() > MAX_SNAPSHOT_BYTES || checksum(&lease.key, canvas, &bytes) != hash {
-        return Err(invalid("Canvas snapshot checksum failed; preserve recovery data"));
-    }
-    let state: WorldState = serde_json::from_slice(&bytes).map_err(|_| invalid("Saved canvas snapshot is invalid"))?;
-    state.validate().map_err(|e| invalid(&e.to_string()))?;
-    if state.canvas != canvas {
-        return Err(invalid("Saved snapshot belongs to another canvas"));
-    }
-    Ok(Some(state))
+    storage_v4::read_world(db, &lease.key, canvas)
 }
 
 fn check_queued(db: &Connection, queued: &QueuedOperation) -> Result<()> {

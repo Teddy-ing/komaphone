@@ -1,9 +1,13 @@
 //! One exact completed GPU output. Polls and cursor labels do not regenerate
 //! unchanged retained geometry; camera movement and transient drawing still do.
+#[cfg(test)]
 use super::{Key, Viewport};
+#[cfg(test)]
 use crate::komaphone_world_gpu::Stats;
+#[cfg(test)]
 use photocraft_engine::scene::shared::media::MediaFrame;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OutputKey {
     ready: Key,
@@ -11,11 +15,13 @@ pub(super) struct OutputKey {
     density: u32,
     frames: Vec<MediaFrame>,
 }
+#[cfg(test)]
 impl OutputKey {
     pub fn new(ready: Key, view: Viewport, density: f32, frames: Vec<MediaFrame>) -> Self {
         Self { ready, view, density: density.to_bits(), frames }
     }
 }
+#[cfg(test)]
 struct Completed {
     key: OutputKey,
     texture: egui::TextureId,
@@ -25,12 +31,17 @@ struct Completed {
 pub(super) struct OutputCache {
     // Keep the camera/account key off the app's stack. Only one texture is held
     // by WorldGpu; this cache owns neither another image nor any source samples.
+    #[cfg(test)]
     completed: Option<Box<Completed>>,
 }
 impl OutputCache {
     pub fn clear(&mut self) {
-        self.completed = None;
+        #[cfg(test)]
+        {
+            self.completed = None;
+        }
     }
+    #[cfg(test)]
     pub fn render(
         &mut self,
         key: OutputKey,

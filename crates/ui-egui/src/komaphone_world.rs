@@ -92,6 +92,8 @@ pub struct WorldUi {
     #[serde(skip)]
     next_view_checkpoint: f64,
     #[serde(skip)]
+    view_save_due: Option<f64>,
+    #[serde(skip)]
     last_time: Option<f64>,
     #[serde(skip)]
     account: Option<photocraft_engine::worlds::Account>,
@@ -124,6 +126,7 @@ impl Default for WorldUi {
             draft: None,
             pan: None,
             next_view_checkpoint: 0.0,
+            view_save_due: None,
             last_time: None,
             account: None,
         }
@@ -333,6 +336,7 @@ fn sync(app: &mut PhotocraftApp, ui: &egui::Ui) {
         app.ui.world.selected = selected;
         app.ui.world.rename = app.session.worlds.active.as_ref().map_or_else(String::new, |a| a.info.name.clone());
         app.ui.world.pan = None;
+        app.ui.world.view_save_due = None;
         if let Some(draft) = app.ui.world.draft.as_mut() {
             draft.drawing = false;
         }
@@ -414,6 +418,19 @@ fn sync(app: &mut PhotocraftApp, ui: &egui::Ui) {
         app.ui.world.next_view_checkpoint = now + 0.5;
         if let Err(error) = app.session.world_save_view() {
             app.ui.world.message = Some(error.to_string());
+        }
+    }
+    if let Some(due) = app.ui.world.view_save_due {
+        if app.ui.world.pan.is_none() && now >= due {
+            app.ui.world.view_save_due = None;
+            if app.session.worlds.view_needs_save()
+                && let Err(error) = app.session.world_save_view()
+            {
+                app.ui.world.message = Some(error.to_string());
+            }
+        } else {
+            let wait = (due - now).clamp(0.016, 0.30);
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
     }
 }

@@ -475,10 +475,18 @@ fn world_v1_migration_keeps_a_verified_backup_and_all_existing_grants_events() {
     };
     world(&mut f.store, 1, Action::Append { operation: op });
     let before = events(&mut f.store, 2, 100);
+    let Response::Canvas { info: pre_info } = world(&mut f.store, 1, Action::Info { canvas: canvas(100) }) else { panic!("info") };
+    let mut legacy_world = photocraft_scene::shared::WorldState::new(canvas(100), owner(1), pre_info.initial_name).unwrap();
+    for ev in &before {
+        legacy_world.apply(ev).unwrap();
+    }
+    let legacy_bytes = serde_json::to_vec(&legacy_world).unwrap();
+    let legacy_hash = format!("{:x}", Sha256::digest(&legacy_bytes));
     let path = f.directory.path().join("service.sqlite3");
     drop(f.store);
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_trash; DROP TABLE world_blobs; DROP TABLE world_media_sources; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=1)); INSERT INTO world_schema VALUES(1);").unwrap();
+    db.execute("UPDATE worlds SET state=?1,hash=?2 WHERE id=?3", rusqlite::params![&legacy_bytes, &legacy_hash, canvas(100).as_str()]).unwrap();
+    db.execute_batch("DROP TABLE world_checkpoints; DROP TABLE world_tours_idx; DROP TABLE world_media_idx; DROP TABLE world_strokes_idx; DROP TABLE world_devices; DROP TABLE world_meta; DROP TABLE world_import_assets; DROP TABLE world_imports; DROP TABLE world_import_receipts; DROP TABLE world_import_origins; DROP TABLE world_trash; DROP TABLE world_blobs; DROP TABLE world_media_sources; DROP TABLE world_schema; CREATE TABLE world_schema(version INTEGER NOT NULL CHECK(version=1)); INSERT INTO world_schema VALUES(1); PRAGMA user_version=3;").unwrap();
     drop(db);
     let mut migrated = Store::open(&path, StoreOptions::default(), 100).unwrap();
     assert_eq!(events(&mut migrated, 2, 100), before);

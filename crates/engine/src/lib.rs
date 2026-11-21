@@ -28,6 +28,7 @@ pub mod world_brush;
 pub mod world_cmds;
 mod world_recovery;
 pub mod world_thumbnails;
+pub mod world_tiles;
 pub mod worlds;
 pub use photocraft_scene as scene;
 pub mod gallery_media;

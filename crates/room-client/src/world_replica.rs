@@ -1,5 +1,7 @@
 //! Verified canonical canvas replay and separate optimistic local edits.
 //! No network acknowledgment is inferred from a matching image or local save.
+use std::sync::Arc;
+
 use photocraft_scene::{
     CanvasId, OwnerId,
     shared::{AcceptedOp, WorldOp, WorldState},
@@ -11,7 +13,7 @@ use crate::{Error, Result};
 #[derive(Clone, Debug)]
 pub struct WorldReplica {
     info: CanvasSummary,
-    accepted: WorldState,
+    accepted: Arc<WorldState>,
 }
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.into())
@@ -42,7 +44,7 @@ impl WorldReplica {
                 cached.validate().map_err(scene)?;
                 if cached.canvas != info.canvas
                     || cached.owner != info.owner
-                    || cached.replay_to(0).map_err(scene)?.name != info.initial_name
+                    || cached.initial_name() != info.initial_name
                     || cached.import_origin != info.import_origin
                 {
                     return Err(invalid("Cached canvas identity does not match its authorized service grant"));
@@ -54,7 +56,7 @@ impl WorldReplica {
             }
             None => WorldState::with_import_origin(info.canvas, info.owner, info.initial_name.clone(), info.import_origin.clone()).map_err(scene)?,
         };
-        let replica = Self { info, accepted };
+        let replica = Self { info, accepted: Arc::new(accepted) };
         if replica.accepted.import_origin.as_ref().is_some_and(|origin| origin.source_revision == 0) {
             replica.accepted.validate().map_err(scene)?;
         }
@@ -66,6 +68,9 @@ impl WorldReplica {
     }
     pub fn accepted(&self) -> &WorldState {
         &self.accepted
+    }
+    pub(crate) fn accepted_arc(&self) -> Arc<WorldState> {
+        Arc::clone(&self.accepted)
     }
     pub fn complete(&self) -> bool {
         self.accepted.revision == self.info.revision
@@ -95,6 +100,31 @@ impl WorldReplica {
         }
         Ok(())
     }
+    /// Atomically install a verified pinned checkpoint state whose revision lies within
+    /// `[self.accepted.revision, self.info.revision]`.
+    pub fn install_checkpoint(&mut self, state: WorldState) -> Result<()> {
+        state.validate().map_err(scene)?;
+        self.install_prevalidated_checkpoint(state)
+    }
+
+    /// Install a `WorldState` already validated off-thread by `verify_and_decode_checkpoint`.
+    pub(crate) fn install_prevalidated_checkpoint(&mut self, state: WorldState) -> Result<()> {
+        if state.canvas != self.info.canvas
+            || state.owner != self.info.owner
+            || state.initial_name() != self.info.initial_name
+            || state.import_origin != self.info.import_origin
+        {
+            return Err(invalid("Checkpoint identity disagrees with authorized canvas summary"));
+        }
+        if state.revision < self.accepted.revision || state.revision > self.info.revision {
+            return Err(invalid("Checkpoint revision is out of bounds for this replica"));
+        }
+        if state.revision == self.info.revision && state.name != self.info.name {
+            return Err(invalid("Checkpoint canvas title disagrees with authorized summary"));
+        }
+        self.accepted = Arc::new(state);
+        Ok(())
+    }
     /// Accept a contiguous bounded page atomically. Reordered/malformed payloads
     /// cannot replace a newer local scene with an old whole-world upload.
     pub fn apply_page(&mut self, response: &Response) -> Result<()> {
@@ -108,7 +138,7 @@ impl WorldReplica {
         if last > *through || *next != (last < *through).then_some(last) || (events.is_empty() && last < *through) {
             return Err(invalid("Canvas event page is incomplete or cannot make progress"));
         }
-        let mut candidate = self.accepted.clone();
+        let mut candidate = (*self.accepted).clone();
         for event in events {
             if event.revision != candidate.revision.saturating_add(1) {
                 return Err(invalid("Missing or reordered canvas events; request the last acknowledged revision"));
@@ -125,7 +155,7 @@ impl WorldReplica {
         {
             candidate.validate().map_err(scene)?;
         }
-        self.accepted = candidate;
+        self.accepted = Arc::new(candidate);
         Ok(())
     }
     /// A returned upload receipt is validated against the exact queued operation
@@ -146,12 +176,12 @@ impl WorldReplica {
             .as_ref()
             .is_some_and(|origin| self.accepted.revision < origin.source_revision && event.revision >= origin.source_revision)
         {
-            let mut candidate = self.accepted.clone();
+            let mut candidate = (*self.accepted).clone();
             candidate.apply(event).map_err(scene)?;
             candidate.validate().map_err(scene)?;
-            self.accepted = candidate;
+            self.accepted = Arc::new(candidate);
         } else {
-            self.accepted.apply(event).map_err(scene)?;
+            Arc::make_mut(&mut self.accepted).apply(event).map_err(scene)?;
         }
         if event.revision >= self.info.revision {
             self.info.revision = event.revision;
@@ -165,7 +195,7 @@ impl WorldReplica {
         if pending.len() > 8192 {
             return Err(invalid("Canvas local preview operation limit"));
         }
-        let mut view = self.accepted.clone();
+        let mut view = (*self.accepted).clone();
         for op in pending {
             if op.canvas != self.info.canvas || op.author != profile || op.authority_epoch != self.info.epoch {
                 return Err(invalid("Pending artwork belongs to another canvas, account or revoked grant"));
@@ -174,6 +204,9 @@ impl WorldReplica {
                 if existing.op != *op {
                     return Err(invalid("Pending artwork conflicts with an immutable receipt"));
                 }
+                continue;
+            }
+            if view.base_revision() > 0 && view.device_author(op.device) == Some(op.author) && op.sequence < view.next_sequence(op.device).map_err(scene)? {
                 continue;
             }
             view.apply(&AcceptedOp { revision: view.revision.checked_add(1).ok_or_else(|| invalid("Canvas revision exhausted"))?, op: op.clone() })

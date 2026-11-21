@@ -1,5 +1,7 @@
 # Owner adjustments — 2026-11-18
 
+**Current workflow (owner update 2026-11-21):** Antigravity verifies each authorized item, records Complete (worker-verified), and continues to the next ready item without Codex review or handoff approval. This supersedes older review-stop wording below, including copied prompts and Awaiting review states. Preserve historical evidence; reconcile pending items against current source and finish missing checks before closing them. Codex review is optional on owner request. Testing, external acceptance and live-action authorization requirements remain. See orchestration-workflow.md (under docs/komaphone from the repository root).
+
 Approved requested behavior, queued for implementation under the [backlog](adjustments-backlog.md) and [orchestration workflow](orchestration-workflow.md). No implementation or runtime verification is claimed. The owner supplied two screenshots: the compact checkbox/button layer list, and the PhotoCraft bottom-left zoom/dimensions status display. Their requirements are transcribed below so implementation does not depend on temporary attachment paths. Names transcribed as Camophone/Comophone refer to Komaphone; the editor reference is PhotoCraft.
 
 ## Sequence and review boundaries

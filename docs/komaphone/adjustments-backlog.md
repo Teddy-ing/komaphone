@@ -1,5 +1,7 @@
 # Komaphone adjustments backlog
 
+**Current workflow (owner update 2026-11-21):** Antigravity verifies each authorized item, records Complete (worker-verified), and continues to the next ready item without Codex review or handoff approval. This supersedes older review-stop wording below, including copied prompts and Awaiting review states. Preserve historical evidence; reconcile pending items against current source and finish missing checks before closing them. Codex review is optional on owner request. Testing, external acceptance and live-action authorization requirements remain. See orchestration-workflow.md (under docs/komaphone from the repository root).
+
 Created 2026-11-17 at the owner's request. A living queue for owner-requested quality-of-life changes, fine-tuning and later additions. Active queue items are recorded below; examples used to explain this workflow are not requests. Follow the [orchestration workflow](orchestration-workflow.md): Antigravity implements and gathers evidence; Codex reviews the packet; the owner relays messages.
 
 ## Scheduling and scope
@@ -139,14 +141,13 @@ checks the change invalidates and refresh the relevant candidate evidence.
 Do not waive unavailable laptop/friend tests or claim K7 complete. Do not deploy
 live changes or incur expenses beyond applicable authorization.
 
-Update the item to Awaiting review, tracked status and local devlog. Return the
+After required checks pass, mark Complete (worker-verified) and update status/devlog. Retain the
 orchestration workflow's compact evidence packet: task-relative diff, exact
 commands/results, failures/skips, screenshot paths where relevant, source and
-artifact identities, remaining limits and affected K7 gates. Stop for Codex
-review; do not begin the next item or label your own work Accepted.
+artifact identities, remaining limits and affected K7 gates. Continue to the next ready authorized item without waiting for Codex review.
 ```
 
-## Codex review prompt
+## Optional Codex review prompt (owner request only)
 
 ```text
 Review [QOL-ID] and the attached Antigravity evidence packet under

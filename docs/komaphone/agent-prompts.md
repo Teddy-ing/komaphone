@@ -1,5 +1,7 @@
 # Komaphone agent implementation prompts
 
+**Current workflow (owner update 2026-11-21):** Antigravity verifies each authorized item, records Complete (worker-verified), and continues to the next ready item without Codex review or handoff approval. This supersedes older review-stop wording below, including copied prompts and Awaiting review states. Preserve historical evidence; reconcile pending items against current source and finish missing checks before closing them. Codex review is optional on owner request. Testing, external acceptance and live-action authorization requirements remain. See orchestration-workflow.md (under docs/komaphone from the repository root).
+
 Use these in the Komaphone repository with the intended model, GPT-6 Astra, and goal mode/subagents where available. These are ordinary task instructions, not an API integration or a claim that a model setting guarantees completion. The product baseline and executable checks decide success.
 
 ## Current owner workflow
