@@ -360,3 +360,117 @@ fn private_or_closed_gallery_releases_preview_and_thumbnail_texture_handles() {
     prune_textures(&app, &ctx);
     assert_cached(false);
 }
+
+fn corpse_game_manifest(entry_num: u64, players: u8) -> GalleryManifest {
+    let game = GameId::new(&format!("{entry_num:032x}")).unwrap();
+    let mut reveal = Vec::new();
+    for chain in 0..players {
+        for round in 0..3u8 {
+            let project = id(entry_num * 100 + u64::from(chain) * 3 + u64::from(round) + 1);
+            let assignment = Assignment { id: AssignmentId { game, chain, round }, player: author(u64::from((chain + round) % players) + 1).id, project };
+            let checkpoint = CheckpointRef { id: CheckpointId::new(project.as_str()).unwrap(), asset: asset(2) };
+            reveal.push(RevealedEntry::Artwork {
+                assignment,
+                revision: 1,
+                image: asset(1),
+                checkpoint,
+                replay: Box::new(ReplayRef {
+                    id: ReplayId::new(project.as_str()).unwrap(),
+                    manifest: None,
+                    baseline: checkpoint,
+                    end_event: None,
+                    event_count: 0,
+                    duration_ms: 0,
+                }),
+                assets: vec![asset(1), asset(2)],
+            });
+        }
+    }
+    let room = RoomView {
+        id: RoomId::new(id(entry_num + 50).as_str()).unwrap(),
+        revision: 12,
+        epoch: 3,
+        phase: Phase::Reveal,
+        round: 2,
+        mode: Mode::ExquisiteCorpse,
+        timer_ms: None,
+        moderator: author(1).id,
+        members: (0..players).map(|i| MemberView { participant: author(u64::from(i) + 1), connected: true, ready: true }).collect(),
+        waiting: Vec::new(),
+        paused: None,
+        deadline_ms: None,
+        assignment: None,
+        reveal,
+    };
+    GalleryManifest::from_reveal(id(entry_num), &room, author(1).id, "2026-11-21T01:00:00Z".into()).unwrap()
+}
+
+#[test]
+fn switching_gallery_creature_or_game_during_playback_resets_part_step_and_timer() {
+    let mut app = app(true);
+    let game_a = Arc::new(corpse_game_manifest(200, 3));
+    let game_b = Arc::new(corpse_game_manifest(201, 2));
+    app.session.gallery.active = Some(game_a);
+    app.session.gallery.items = vec![
+        GalleryItem { kind: "creature".into(), ..item(200, "Corpse game A", "Artist 1", false, false) },
+        GalleryItem { kind: "creature".into(), ..item(201, "Corpse game B", "Artist 1", false, false) },
+    ];
+    let ctx = egui::Context::default();
+    PhotocraftApp::setup_context(&ctx, app.ui.theme);
+    paint(&mut app, &ctx, 1.0, Vec::new());
+    paint(&mut app, &ctx, 1.1, Vec::new());
+
+    // Enter Drawing replay on Creature 1, Part 2 (legs), mid-playback with leftover fractional accumulator.
+    click(&mut app, &ctx, "gallery.replayMode", 1.2);
+    app.ui.gallery.frame = 2;
+    app.ui.gallery.replay_step = 3;
+    app.ui.gallery.playing_replay = true;
+    app.ui.gallery.accumulator = 75.0;
+    app.ui.gallery.last_time = 1.2;
+
+    // Switching to Creature 2 stops replay and restarts at Part 0 (Head), step 0, accumulator 0.
+    click(&mut app, &ctx, "gallery.chain.1", 1.3);
+    assert_eq!(app.ui.gallery.chain, 1);
+    assert_eq!(app.ui.gallery.frame, 0);
+    assert_eq!(app.ui.gallery.replay_step, 0);
+    assert!(!app.ui.gallery.playing_replay);
+    assert_eq!(app.ui.gallery.accumulator, 0.0);
+
+    // Subsequent clock ticks must not advance from stale playback state.
+    paint(&mut app, &ctx, 2.5, Vec::new());
+    assert_eq!((app.ui.gallery.chain, app.ui.gallery.frame, app.ui.gallery.replay_step), (1, 0, 0));
+    assert!(!app.ui.gallery.playing_replay);
+
+    // Switching backward to Creature 1 during playback also resets part, step and timer.
+    app.ui.gallery.frame = 1;
+    app.ui.gallery.replay_step = 2;
+    app.ui.gallery.playing_replay = true;
+    app.ui.gallery.accumulator = 60.0;
+    click(&mut app, &ctx, "gallery.chain.0", 2.6);
+    assert_eq!((app.ui.gallery.chain, app.ui.gallery.frame, app.ui.gallery.replay_step), (0, 0, 0));
+    assert!(!app.ui.gallery.playing_replay);
+    assert_eq!(app.ui.gallery.accumulator, 0.0);
+
+    // Clicking another gallery game in the list stops active playback immediately before async open finishes.
+    app.ui.gallery.playing_replay = true;
+    app.ui.gallery.accumulator = 45.0;
+    click(&mut app, &ctx, &format!("gallery.item.{}.original", id(201).as_str()), 2.8);
+    assert!(!app.ui.gallery.playing_replay);
+    assert_eq!(app.ui.gallery.accumulator, 0.0);
+
+    // Switching to another gallery game mid-playback resets chain, part, replay mode, playback and timer.
+    app.ui.gallery.chain = 2;
+    app.ui.gallery.frame = 2;
+    app.ui.gallery.replay_step = 4;
+    app.ui.gallery.playing_replay = true;
+    app.ui.gallery.accumulator = 90.0;
+    app.session.gallery.active = Some(game_b);
+    paint(&mut app, &ctx, 3.0, Vec::new());
+    assert_eq!((app.ui.gallery.chain, app.ui.gallery.frame, app.ui.gallery.replay_step), (0, 0, 0));
+    assert!(!app.ui.gallery.replay_mode);
+    assert!(!app.ui.gallery.playing_replay);
+    assert!(!app.ui.gallery.playing_animation);
+    assert_eq!(app.ui.gallery.accumulator, 0.0);
+    tick_at(&mut app, &ctx, 5.0);
+    assert_eq!((app.ui.gallery.chain, app.ui.gallery.frame, app.ui.gallery.replay_step), (0, 0, 0));
+}

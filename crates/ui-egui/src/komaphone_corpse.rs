@@ -20,6 +20,15 @@ impl Default for CorpseUi {
         Self { game: None, chain: 0, visible_parts: 1 }
     }
 }
+impl CorpseUi {
+    /// Switch to another creature chain, restarting sequential reveal at the head.
+    pub fn select_chain(&mut self, chain: u8) {
+        if self.chain != chain {
+            self.chain = chain;
+            self.visible_parts = 1;
+        }
+    }
+}
 
 pub fn seam_caption(ui: &mut egui::Ui, round: u8, missing: bool) {
     ui.strong(format!("Draw the {}", corpse::part_name(round).to_lowercase()));
@@ -77,14 +86,16 @@ pub fn reveal(ui: &mut egui::Ui, room: &RoomView, state: &mut CorpseUi, texture:
         *state = CorpseUi { game: Some(first.game), ..Default::default() };
     }
     if usize::from(state.chain) >= room.members.len() {
-        state.chain = 0;
+        state.select_chain(0);
     }
     state.visible_parts = state.visible_parts.clamp(1, 3);
+    let mut selected_chain = state.chain;
     ui.horizontal_wrapped(|ui| {
         for index in 0..room.members.len().min(3) {
-            tracked_choice(ui, &mut state.chain, index as u8, &format!("Creature {}", index + 1), &format!("corpse.chain.{index}"));
+            tracked_choice(ui, &mut selected_chain, index as u8, &format!("Creature {}", index + 1), &format!("corpse.chain.{index}"));
         }
     });
+    state.select_chain(selected_chain);
     ui.horizontal_wrapped(|ui| {
         tracked_choice(ui, &mut state.visible_parts, 1, "Head", "corpse.reveal.head");
         tracked_choice(ui, &mut state.visible_parts, 2, "Add torso", "corpse.reveal.torso");
@@ -177,5 +188,23 @@ mod tests {
         assert_eq!(state, decoded);
         assert!(!encoded.contains("rgba"));
         assert!(!encoded.contains("texture"));
+    }
+
+    #[test]
+    fn selecting_another_creature_restarts_sequential_reveal_at_head() {
+        let mut state = CorpseUi { game: Some(GameId::new(&format!("{:032x}", 9)).unwrap()), chain: 0, visible_parts: 3 };
+        // Re-selecting the current creature keeps its reveal progress.
+        state.select_chain(0);
+        assert_eq!((state.chain, state.visible_parts), (0, 3));
+        // Advancing to the next creature restarts at Head.
+        state.select_chain(1);
+        assert_eq!((state.chain, state.visible_parts), (1, 1));
+        // Switching mid-reveal (torso visible) to creature 3 or backward to creature 1 restarts at Head.
+        state.visible_parts = 2;
+        state.select_chain(2);
+        assert_eq!((state.chain, state.visible_parts), (2, 1));
+        state.visible_parts = 3;
+        state.select_chain(0);
+        assert_eq!((state.chain, state.visible_parts), (0, 1));
     }
 }

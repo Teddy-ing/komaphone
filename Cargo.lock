@@ -5787,6 +5787,7 @@ name = "photocraft-ui-egui"
 version = "0.20.1"
 dependencies = [
  "base64 0.23.1",
+ "chrono",
  "craft-print",
  "craft-ui",
  "craft-update",
@@ -5796,6 +5797,7 @@ dependencies = [
  "egui_kittest",
  "epaint_default_fonts",
  "flate2",
+ "iana-time-zone",
  "log",
  "photocraft-algo",
  "photocraft-cms",

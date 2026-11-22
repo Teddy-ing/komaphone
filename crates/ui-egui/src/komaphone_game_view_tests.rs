@@ -403,3 +403,393 @@ fn capture_submission_error_ui_fixtures() {
     h.run_steps(5);
     h.render().unwrap().save(out_dir.join("03-workspace-after-dismiss.png")).unwrap();
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn synthetic_corpse_band(chain: u8, round: u8) -> RoomImage {
+    use photocraft_engine::rooms::corpse::{BAND_HEIGHT, WIDTH};
+    let bg = match (chain, round) {
+        (0, 0) => [235, 110, 95, 255],
+        (0, 1) => [242, 185, 78, 255],
+        (0, 2) => [175, 102, 72, 255],
+        (1, 0) => [92, 175, 240, 255],
+        (1, 1) => [68, 192, 176, 255],
+        (1, 2) => [66, 98, 178, 255],
+        (_, 0) => [112, 206, 124, 255],
+        (_, 1) => [168, 202, 82, 255],
+        (_, _) => [156, 108, 204, 255],
+    };
+    let accent = [28, 32, 42, 255];
+    let light = [248, 248, 244, 255];
+    let w = WIDTH as usize;
+    let h = BAND_HEIGHT as usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let mut color = bg;
+            let border = x < 18 || x >= w - 18 || y < 14 || y >= h - 14;
+            if border {
+                color = accent;
+            } else {
+                match round {
+                    // Head: circle + two eyes + smile bar
+                    0 => {
+                        let dx = x as i32 - 512;
+                        let dy = y as i32 - 260;
+                        let r2 = dx * dx + dy * dy;
+                        if r2 < 170 * 170 {
+                            color = light;
+                        }
+                        let eye_l = (x as i32 - 445).pow(2) + (y as i32 - 220).pow(2) < 24 * 24;
+                        let eye_r = (x as i32 - 579).pow(2) + (y as i32 - 220).pow(2) < 24 * 24;
+                        let mouth = (430..=594).contains(&x) && (310..=338).contains(&y);
+                        if eye_l || eye_r || mouth {
+                            color = accent;
+                        }
+                    }
+                    // Torso: central vest + arms
+                    1 => {
+                        let vest = (330..=694).contains(&x) && (40..=472).contains(&y);
+                        let arms = (130..=894).contains(&x) && (120..=220).contains(&y);
+                        if vest || arms {
+                            color = light;
+                        }
+                        if (480..=544).contains(&x) && (120..=420).contains(&y) {
+                            color = accent;
+                        }
+                    }
+                    // Legs: two vertical legs + boots
+                    _ => {
+                        let leg_l = (330..=465).contains(&x) && (20..=450).contains(&y);
+                        let leg_r = (559..=694).contains(&x) && (20..=450).contains(&y);
+                        if leg_l || leg_r {
+                            color = light;
+                        }
+                        let boot_l = (290..=465).contains(&x) && (385..=465).contains(&y);
+                        let boot_r = (559..=734).contains(&x) && (385..=465).contains(&y);
+                        if boot_l || boot_r {
+                            color = accent;
+                        }
+                    }
+                }
+            }
+            let idx = (y * w + x) * 4;
+            rgba[idx..idx + 4].copy_from_slice(&color);
+        }
+    }
+    RoomImage { width: WIDTH, height: BAND_HEIGHT, rgba }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn corpse_room_with_artwork(game_byte: u8, players: u8) -> (RoomView, Vec<(AssetHash, Arc<RoomImage>)>) {
+    let game_id = GameId::new(&format!("{game_byte:032x}")).unwrap();
+    let names = ["Alice", "Bob", "Cara"];
+    let members: Vec<MemberView> = (0..players)
+        .map(|index| MemberView {
+            participant: Participant {
+                id: ParticipantId::new(&format!("{:032x}", index + 1)).unwrap(),
+                device: DeviceId::new(&format!("{:032x}", index + 11)).unwrap(),
+                display_name: names[usize::from(index)].into(),
+            },
+            connected: true,
+            ready: true,
+        })
+        .collect();
+    let mut reveal = Vec::new();
+    let mut images = Vec::new();
+    for chain in 0..players {
+        for round in 0..3u8 {
+            let asset_num = game_byte.wrapping_mul(16).wrapping_add(chain * 3 + round + 1);
+            let image_ref = asset(asset_num);
+            let ckpt_ref = asset(asset_num.wrapping_add(64));
+            let project_id = ProjectId::new(&format!("{:032x}", u16::from(game_byte) * 100 + u16::from(chain) * 12 + u16::from(round) + 1)).unwrap();
+            let assignment = Assignment {
+                id: AssignmentId { game: game_id, chain, round },
+                player: members[usize::from((chain + round) % players)].participant.id,
+                project: project_id,
+            };
+            let ckpt =
+                photocraft_engine::party::CheckpointRef { id: photocraft_engine::party::CheckpointId::new(project_id.as_str()).unwrap(), asset: ckpt_ref };
+            reveal.push(RevealedEntry::Artwork {
+                assignment,
+                revision: 1,
+                image: image_ref,
+                checkpoint: ckpt,
+                replay: Box::new(photocraft_engine::party::ReplayRef {
+                    id: photocraft_engine::party::ReplayId::new(project_id.as_str()).unwrap(),
+                    manifest: None,
+                    baseline: ckpt,
+                    end_event: None,
+                    event_count: 0,
+                    duration_ms: 0,
+                }),
+                assets: vec![image_ref, ckpt_ref],
+            });
+            images.push((image_ref.hash, Arc::new(synthetic_corpse_band(chain, round))));
+        }
+    }
+    let room = RoomView {
+        id: RoomId::new(&"b".repeat(32)).unwrap(),
+        revision: 20,
+        epoch: 3,
+        phase: Phase::Reveal,
+        round: 2,
+        mode: Mode::ExquisiteCorpse,
+        timer_ms: None,
+        moderator: members[0].participant.id,
+        members,
+        waiting: vec![],
+        paused: None,
+        deadline_ms: None,
+        assignment: None,
+        reveal,
+    };
+    (room, images)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn assemble_corpse_rgba(room: &RoomView, chain_idx: u8, imgs: &std::collections::BTreeMap<AssetHash, Arc<RoomImage>>) -> Vec<u8> {
+    let chain = photocraft_engine::rooms::corpse::reveal_chain(room, chain_idx).unwrap();
+    let parts = chain.parts.each_ref().map(|part| part.image.and_then(|img| imgs.get(&img.hash).map(|arc| arc.as_ref())));
+    photocraft_engine::rooms::corpse::assemble(parts).unwrap().rgba
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_corpse_sequential_switch(h: &mut egui_kittest::Harness<'_, PhotocraftApp>, players: u8) {
+    use egui_kittest::kittest::Queryable;
+
+    let c1_legs = if players == 2 { "Legs and feet · Alice" } else { "Legs and feet · Cara" };
+    let c2_torso = if players == 2 { "Torso and arms · Alice" } else { "Torso and arms · Cara" };
+    let c2_legs = if players == 2 { "Legs and feet · Bob" } else { "Legs and feet · Alice" };
+
+    // Creature 1 starts at Head only with notes absent.
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 1));
+    assert!(h.query_by_label("Head · Alice").is_some());
+    assert!(h.query_by_label("Torso and arms · Bob").is_none());
+    assert!(h.query_by_label("Open handoff notes").is_none());
+    assert!(h.state().ui.rooms.requested_notes.is_none());
+
+    // Progress Creature 1 sequentially: Head -> Add torso -> Full creature.
+    h.get_by_label("Add torso").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 2));
+    assert!(h.query_by_label("Torso and arms · Bob").is_some());
+    assert!(h.query_by_label(c1_legs).is_none());
+
+    h.get_by_label("Full creature").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 3));
+    assert!(h.query_by_label(c1_legs).is_some());
+
+    // Clicking the already-selected creature preserves its progress.
+    h.get_by_label("Creature 1").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 3));
+
+    // Selecting Creature 2 immediately restarts at Head (visible_parts == 1).
+    h.get_by_label("Creature 2").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (1, 1));
+    assert!(h.query_by_label("Head · Bob").is_some());
+    assert!(h.query_by_label(c2_torso).is_none());
+    assert!(h.query_by_label(c2_legs).is_none());
+
+    // Creature 2 progresses Head -> Add torso cleanly.
+    h.get_by_label("Add torso").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (1, 2));
+    assert!(h.query_by_label(c2_torso).is_some());
+    assert!(h.query_by_label(c2_legs).is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_corpse_rapid_and_game_switch(h: &mut egui_kittest::Harness<'_, PhotocraftApp>, players: u8) {
+    use egui_kittest::kittest::Queryable;
+
+    // Switching mid-reveal (from torso = 2) resets the destination creature to Head, and explicit Full creature works directly.
+    let (next_label, next_chain, next_head, next_torso, next_legs) = if players == 3 {
+        ("Creature 3", 2u8, "Head · Cara", "Torso and arms · Alice", "Legs and feet · Bob")
+    } else {
+        ("Creature 1", 0u8, "Head · Alice", "Torso and arms · Bob", "Legs and feet · Alice")
+    };
+    h.get_by_label(next_label).click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (next_chain, 1));
+    assert!(h.query_by_label(next_head).is_some());
+    assert!(h.query_by_label(next_torso).is_none());
+    h.get_by_label("Full creature").click();
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (next_chain, 3));
+    assert!(h.query_by_label(next_legs).is_some());
+
+    // Rapid next/previous and backward switches always land at Head (visible_parts == 1).
+    let sequence: &[(&str, u8)] = if players == 3 {
+        &[("Creature 2", 1), ("Creature 1", 0), ("Creature 3", 2), ("Creature 2", 1), ("Creature 1", 0)]
+    } else {
+        &[("Creature 2", 1), ("Creature 1", 0), ("Creature 2", 1), ("Creature 1", 0)]
+    };
+    for &(label, expected_chain) in sequence {
+        h.get_by_label("Add torso").click();
+        h.run_steps(1);
+        assert_eq!(h.state().ui.rooms.corpse_view.visible_parts, 2);
+        h.get_by_label(label).click();
+        h.run_steps(1);
+        assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (expected_chain, 1));
+    }
+
+    // Out-of-range stale chain index resets both chain and visible_parts to Head.
+    h.state_mut().ui.rooms.corpse_view.chain = players + 4;
+    h.state_mut().ui.rooms.corpse_view.visible_parts = 3;
+    h.run_steps(1);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 1));
+
+    // Switching to a different revealed game resets chain=0 and visible_parts=1.
+    h.get_by_label("Creature 2").click();
+    h.run_steps(1);
+    h.get_by_label("Full creature").click();
+    h.run_steps(1);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (1, 3));
+    let (other_room, other_images) = corpse_room_with_artwork(players + 10, players);
+    {
+        let rooms = &mut h.state_mut().session.rooms;
+        rooms.status.room = Some(other_room);
+        rooms.media.reconcile(&rooms.status);
+        for (hash, img) in &other_images {
+            rooms.media.images.insert(*hash, img.clone());
+        }
+    }
+    h.run_steps(2);
+    assert_eq!((h.state().ui.rooms.corpse_view.chain, h.state().ui.rooms.corpse_view.visible_parts), (0, 1));
+    assert!(h.state().ui.rooms.requested_notes.is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn corpse_reveal_restarts_at_head_when_switching_creatures_in_two_and_three_player_games() {
+    for players in [2u8, 3u8] {
+        let (room, images) = corpse_room_with_artwork(players, players);
+        let original_by_hash: std::collections::BTreeMap<AssetHash, Vec<u8>> = images.iter().map(|(h, img)| (*h, img.rgba.clone())).collect();
+        let mut app = app(room.clone());
+        app.session.rooms.media.reconcile(&app.session.rooms.status);
+        for (hash, img) in &images {
+            app.session.rooms.media.images.insert(*hash, img.clone());
+        }
+        let baseline_assembled: Vec<Vec<u8>> = (0..players).map(|c| assemble_corpse_rgba(&room, c, &app.session.rooms.media.images)).collect();
+        app.ui.rooms.view_reveal = true;
+        app.ui.rooms.open = false;
+
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).build_ui_state(
+            |ui, app: &mut PhotocraftApp| {
+                sync(app, ui.ctx());
+                crate::komaphone_workspace::chrome(app, ui);
+                egui::CentralPanel::default().show(ui, |ui| reveal(app, ui));
+            },
+            app,
+        );
+        h.run_steps(3);
+
+        verify_corpse_sequential_switch(&mut h, players);
+        verify_corpse_rapid_and_game_switch(&mut h, players);
+
+        // Original artwork bytes and assembled full composition are completely unchanged.
+        for (hash, img) in &images {
+            assert_eq!(img.rgba.as_slice(), original_by_hash[hash].as_slice());
+        }
+        let reloaded_map: std::collections::BTreeMap<_, _> = images.into_iter().collect();
+        for c in 0..players {
+            assert_eq!(assemble_corpse_rgba(&room, c, &reloaded_map), baseline_assembled[usize::from(c)]);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn capture_qol002_corpse_reveal_ui_fixtures() {
+    use egui_kittest::kittest::Queryable;
+
+    let Some(out_dir) = std::env::var_os("KOMAPHONE_QOL002_AFTER_SCREENSHOTS").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let _gpu = photocraft_testkit::gpu_lock();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // 1. Two-player game: Creature 1 full -> Creature 2 resets to Head -> Add torso -> Full creature.
+    let (room_2p, images_2p) = corpse_room_with_artwork(1, 2);
+    let mut app_2p = app(room_2p);
+    app_2p.session.rooms.media.reconcile(&app_2p.session.rooms.status);
+    for (hash, img) in images_2p {
+        app_2p.session.rooms.media.images.insert(hash, img);
+    }
+    app_2p.ui.rooms.view_reveal = true;
+    app_2p.ui.rooms.open = false;
+
+    let mut h2 = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).with_pixels_per_point(1.0).wgpu().build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            sync(app, ui.ctx());
+            crate::komaphone_workspace::chrome(app, ui);
+            egui::CentralPanel::default().show(ui, |ui| reveal(app, ui));
+        },
+        app_2p,
+    );
+    PhotocraftApp::setup_context(&h2.ctx, crate::theme::ThemeKind::Studio);
+    h2.run_steps(4);
+    h2.get_by_label("Add torso").click();
+    h2.run_steps(3);
+    h2.get_by_label("Full creature").click();
+    h2.run_steps(4);
+    assert_eq!((h2.state().ui.rooms.corpse_view.chain, h2.state().ui.rooms.corpse_view.visible_parts), (0, 3));
+    h2.render().unwrap().save(out_dir.join("after-01-2p-creature1-full.png")).unwrap();
+
+    h2.get_by_label("Creature 2").click();
+    h2.run_steps(4);
+    assert_eq!((h2.state().ui.rooms.corpse_view.chain, h2.state().ui.rooms.corpse_view.visible_parts), (1, 1));
+    h2.render().unwrap().save(out_dir.join("after-02-2p-creature2-reset-head.png")).unwrap();
+
+    h2.get_by_label("Add torso").click();
+    h2.run_steps(4);
+    assert_eq!((h2.state().ui.rooms.corpse_view.chain, h2.state().ui.rooms.corpse_view.visible_parts), (1, 2));
+    h2.render().unwrap().save(out_dir.join("after-03-2p-creature2-torso.png")).unwrap();
+
+    h2.get_by_label("Full creature").click();
+    h2.run_steps(4);
+    assert_eq!((h2.state().ui.rooms.corpse_view.chain, h2.state().ui.rooms.corpse_view.visible_parts), (1, 3));
+    h2.render().unwrap().save(out_dir.join("after-04-2p-creature2-full.png")).unwrap();
+
+    // 2. Three-player game: Creature 1 full -> Creature 2 mid-reveal (torso) -> Creature 3 resets to Head -> switch back to Creature 1 resets to Head.
+    let (room_3p, images_3p) = corpse_room_with_artwork(3, 3);
+    let mut app_3p = app(room_3p);
+    app_3p.session.rooms.media.reconcile(&app_3p.session.rooms.status);
+    for (hash, img) in images_3p {
+        app_3p.session.rooms.media.images.insert(hash, img);
+    }
+    app_3p.ui.rooms.view_reveal = true;
+    app_3p.ui.rooms.open = false;
+
+    let mut h3 = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 860.0)).with_pixels_per_point(1.0).wgpu().build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            sync(app, ui.ctx());
+            crate::komaphone_workspace::chrome(app, ui);
+            egui::CentralPanel::default().show(ui, |ui| reveal(app, ui));
+        },
+        app_3p,
+    );
+    PhotocraftApp::setup_context(&h3.ctx, crate::theme::ThemeKind::Studio);
+    h3.run_steps(4);
+    h3.get_by_label("Full creature").click();
+    h3.run_steps(3);
+    h3.get_by_label("Creature 2").click();
+    h3.run_steps(3);
+    h3.get_by_label("Add torso").click();
+    h3.run_steps(3);
+    assert_eq!((h3.state().ui.rooms.corpse_view.chain, h3.state().ui.rooms.corpse_view.visible_parts), (1, 2));
+    h3.get_by_label("Creature 3").click();
+    h3.run_steps(4);
+    assert_eq!((h3.state().ui.rooms.corpse_view.chain, h3.state().ui.rooms.corpse_view.visible_parts), (2, 1));
+    h3.render().unwrap().save(out_dir.join("after-05-3p-creature3-reset-head.png")).unwrap();
+
+    h3.get_by_label("Full creature").click();
+    h3.run_steps(3);
+    h3.get_by_label("Creature 1").click();
+    h3.run_steps(4);
+    assert_eq!((h3.state().ui.rooms.corpse_view.chain, h3.state().ui.rooms.corpse_view.visible_parts), (0, 1));
+    h3.render().unwrap().save(out_dir.join("after-06-3p-switch-back-creature1-head.png")).unwrap();
+}

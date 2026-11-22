@@ -88,9 +88,9 @@ pub(crate) use layer_drag::{dropped_on, layer_drag_edge_scroll};
 pub(crate) use layer_row::thumb_load_badge;
 #[cfg(test)]
 use layer_row::{layer_thumb_fit, paint_clipping_indicator};
-pub(crate) use layers::{blend_options, fx_button};
+pub(crate) use layers::{blend_options, fx_button, layers};
 #[cfg(test)]
-use layers::{layers, opacity_row_layout, simple_lock_toggle};
+use layers::{opacity_row_layout, simple_lock_toggle};
 #[cfg(test)]
 use navigator::{NAV_ROW_H, navigator, navigator_zoom_drag_id, navigator_zoom_to};
 #[cfg(test)]
@@ -102,9 +102,10 @@ pub use options_bar::options_bar;
 use options_bar::options_bar_height;
 pub(crate) use options_bar::{FIXED_SIZE_MAX_PX, opt_label};
 pub use panel_state::{migrate_panel_state, panel_state_id, remember_panel_state};
-pub use properties::properties_window;
 #[cfg(test)]
-use properties::{adjustments_grid, properties_body};
+use properties::adjustments_grid;
+pub(crate) use properties::properties_body;
+pub use properties::properties_window;
 pub use status_bar::{status_bar, status_bar_heights};
 #[cfg(test)]
 use title_bar::title_x;

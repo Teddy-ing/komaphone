@@ -40,6 +40,7 @@ unicode-bidi = "0.3"
 base64 = "0.23"
 # Inflating the translation catalogs, stored deflated (build.rs); already linked through photocraft-io.
 flate2 = { workspace = true }
+chrono = { workspace = true }
 web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -47,6 +48,9 @@ web-time = { workspace = true }
 craft-ui = { workspace = true, features = ["native-windows"] }
 craft-update = { workspace = true }
 rayon = { workspace = true }
+# Local viewer timezone formatting (`komaphone_time`, QOL-015); already in Cargo.lock.
+chrono = { workspace = true, features = ["clock"] }
+iana-time-zone = "=0.1.65"
 # Safe native UI-language APIs (Windows/macOS); no subprocess or web dependency.
 sys-locale = "=0.3.2"
 

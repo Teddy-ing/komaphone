@@ -249,13 +249,13 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.horizontal_centered(|ui| {
                 ui.add_space(caption_left);
                 ui.strong("Komaphone · Canvases");
-                let response = ui.add_enabled(app.ui.canvas.gesture.is_none() && app.ui.canvas.unsaved_stroke.is_none(), egui::Button::new("Party & drawings"));
+                let response = ui
+                    .add_enabled(app.ui.canvas.gesture.is_none() && app.ui.canvas.unsaved_stroke.is_none(), egui::Button::new("Workroom"))
+                    .on_hover_text("Return to your drawing workroom with open drawings");
                 remember(ui, "canvas.return", &response);
+                remember(ui, "workspace.workroom", &response);
                 if response.clicked() {
-                    app.ui.canvas.open = false;
-                    if app.session.canvases.flight.is_some() {
-                        run(app, "komaphone.canvas.flight", json!({"state":"cancel"}));
-                    }
+                    crate::komaphone_workspace::open_workroom(app);
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Local only").color(tokens.text_dim));
@@ -278,33 +278,40 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 crate::titlebar::caption_buttons(app, ui, full);
             }
         });
-    sidebar(app, ui);
     toolbar(app, ui);
     egui::Panel::bottom("komaphone-canvas-status").exact_size(64.0).frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(5)).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(if app.ui.canvas.unsaved_stroke.is_some() {
+            if let Some(camera) = &app.session.canvases.camera {
+                let scale = crate::komaphone_workspace::deep_canvas_scale_label(camera);
+                let zoom_resp = ui.label(egui::RichText::new(&scale).size(12.0));
+                remember(ui, "canvas.zoom", &zoom_resp);
+                let dim_resp = ui
+                    .label(egui::RichText::new(crate::komaphone_workspace::UNBOUNDED_CANVAS_LABEL).color(tokens.text_dim).size(12.0))
+                    .on_hover_text("Deep-zoom canvas without fixed pixel dimensions");
+                remember(ui, "canvas.dimensions", &dim_resp);
+                ui.separator();
+            }
+            let status_text = if app.ui.canvas.unsaved_stroke.is_some() {
                 "Unsaved stroke · retry to save it".into()
             } else if matches!(app.ui.canvas.gesture, Some(Gesture::Draw(_))) {
                 "Drawing · current stroke not saved".into()
             } else {
                 app.session.canvases.status_text()
-            });
-            if let Some(camera) = &app.session.canvases.camera {
-                let zoom = camera.zoom * 100.0_f64.powi(i32::from(camera.region.depth));
-                ui.label(if zoom < 100_000.0 { format!("Zoom {zoom:.2}×") } else { format!("Zoom {zoom:.1e}×") });
-            }
+            };
+            ui.add(egui::Label::new(&status_text).truncate()).on_hover_text(&status_text);
             if app.session.canvases.error.is_some() {
                 button(app, ui, "Retry save", "komaphone.canvas.retry", json!({}), true);
             }
         });
         if let Some(error) = app.session.canvases.error.as_ref().or(app.ui.canvas.message.as_ref()) {
-            ui.colored_label(tokens.danger, error);
+            ui.add(egui::Label::new(egui::RichText::new(error).color(tokens.danger)).truncate()).on_hover_text(error);
         } else if let Some(notice) = &app.session.canvases.notice {
             ui.add(egui::Label::new(egui::RichText::new(notice).color(tokens.warning)).truncate()).on_hover_text(notice);
         } else {
-            ui.label(egui::RichText::new("Wheel: zoom at pointer · Middle drag or Space: pan").color(tokens.text_dim));
+            ui.add(egui::Label::new(egui::RichText::new("Wheel: zoom at pointer · Middle drag or Space: pan").color(tokens.text_dim)).truncate());
         }
     });
+    sidebar(app, ui);
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(tokens.canvas)).show(ui, |ui| {
         if !app.session.canvases.available() {
             ui.centered_and_justified(|ui| {
@@ -356,7 +363,15 @@ fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     if response.clicked() {
                         run(app, "komaphone.canvas.open", json!({"canvas":item.id}));
                     }
-                    ui.small(format!("{} strokes · {}", item.stroke_count, item.id.as_str().get(..6).unwrap_or_default()));
+                    if item.updated_at.trim().is_empty() {
+                        ui.small(format!("{} strokes · {}", item.stroke_count, item.id.as_str().get(..6).unwrap_or_default()));
+                    } else {
+                        let updated = crate::komaphone_time::format_compact(&item.updated_at);
+                        let resp = ui.small(format!("{} strokes · {}", item.stroke_count, updated.display));
+                        if let Some(tooltip) = &updated.tooltip {
+                            resp.on_hover_text(tooltip);
+                        }
+                    }
                 });
             }
             let Some(active) = app.session.canvases.active.clone() else { return };

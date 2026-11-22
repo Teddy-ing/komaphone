@@ -251,7 +251,7 @@ fn choose_recovery(app: &mut PhotocraftApp, retry: bool) -> Result<(), String> {
         crate::notices::post(
             app,
             "GPU retry scheduled",
-            vec!["Save your work and restart PhotoCraft to retry GPU acceleration. CPU rendering remains active for this session.".into()],
+            vec!["Save your work and restart Komaphone to retry GPU acceleration. CPU rendering remains active for this session.".into()],
             false,
             None,
         );
@@ -273,7 +273,8 @@ pub fn show_fallback(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.label(egui::RichText::new(tl!("GPU acceleration could not continue. Your documents are unchanged.")).color(t.warning));
-            ui.label(tl!("PhotoCraft is using the CPU image compositor. The window may still use your graphics adapter."));
+            let body = tl!("PhotoCraft is using the CPU image compositor. The window may still use your graphics adapter.").replace("PhotoCraft", "Komaphone");
+            ui.label(body);
             ui.collapsing(tl!("Details"), |ui| {
                 ui.label(&reason);
             });
@@ -468,5 +469,51 @@ mod tests {
         choose_recovery(&mut app, true).unwrap();
         assert!(!app.gpu_active());
         assert_eq!(app.ui.notices.len(), 1, "the restart notice");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn safe_gpu_fallback_modal_names_komaphone_and_keeps_recovery_controls() {
+        use egui_kittest::kittest::Queryable;
+        let services = crate::Services { save_prefs: Some(Box::new(|_| Ok(()))), ..Default::default() };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        app.ui.komaphone.enabled = true;
+        queue_fallback_notice(&mut app, "--safe-gpu: CPU renderer for this launch");
+        let mut styled = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 640.0)).build_ui_state(
+            move |ui, app: &mut PhotocraftApp| {
+                if !styled {
+                    PhotocraftApp::setup_context(ui.ctx(), app.ui.theme);
+                    styled = true;
+                    return;
+                }
+                show_fallback(app, ui.ctx());
+            },
+            app,
+        );
+        h.run_steps(4);
+        let modal_body = "Komaphone is using the CPU image compositor. The window may still use your graphics adapter.";
+        assert!(h.query_by_label(modal_body).is_some(), "modal must name Komaphone");
+        assert!(
+            h.query_by_label("PhotoCraft is using the CPU image compositor. The window may still use your graphics adapter.").is_none(),
+            "inherited PhotoCraft modal copy must not appear"
+        );
+        // Keep Using CPU dismisses the modal and saves CPU mode.
+        h.get_by_label("Keep Using CPU").click();
+        h.run_steps(3);
+        assert!(h.state().ui.gpu_fallback_notice.is_none());
+        assert!(!h.state().session.prefs().performance.use_gpu);
+        // Retry GPU schedules a restart notice naming Komaphone when a live device is unavailable.
+        queue_fallback_notice(h.state_mut(), "--safe-gpu: CPU renderer for this launch");
+        h.run_steps(3);
+        h.get_by_label("Retry GPU").click();
+        h.run_steps(3);
+        assert!(h.state().ui.gpu_fallback_notice.is_none());
+        assert!(h.state().session.prefs().performance.use_gpu);
+        assert!(
+            h.state().ui.notices.iter().any(|n| n.lines.iter().any(|l| l.contains("restart Komaphone") && !l.contains("PhotoCraft"))),
+            "restart notice must name Komaphone: {:?}",
+            h.state().ui.notices
+        );
     }
 }

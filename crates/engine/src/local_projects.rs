@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 
 use photocraft_doc::DocId;
-use photocraft_local_store::{DraftInfo, SaveRequest};
+pub use photocraft_local_store::DraftInfo;
+use photocraft_local_store::SaveRequest;
 use photocraft_party::contracts::ProjectId;
 use serde::Serialize;
 
@@ -133,22 +134,19 @@ impl Session {
         #[cfg(not(target_arch = "wasm32"))]
         self.freeze_room_deadline();
     }
-    pub(crate) fn room_edit_refusal(&self, command: &str) -> Option<String> {
+    /// Whether editing the currently active document is refused by active party-room assignment
+    /// rules (previous assignment in the current game, or frozen/submitted/transferring assignment).
+    pub fn room_active_edit_refusal(&self) -> Option<String> {
         let room = self.rooms.status.room.as_ref()?;
-        if !matches!(command, "file.new" | "file.open")
-            && crate::commands::find(command).is_some_and(|spec| spec.journal)
-            && let Some(project) = self.active().and_then(|document| self.local_projects.status(document.doc.id).project)
-            && self.rooms.status.game_drafts.as_ref().is_some_and(|drafts| drafts.room == room.id && drafts.projects.contains(&project))
+        let document = self.active()?;
+        let project = self.local_projects.status(document.doc.id).project?;
+        if self.rooms.status.game_drafts.as_ref().is_some_and(|drafts| drafts.room == room.id && drafts.projects.contains(&project))
             && room.assignment.as_ref().is_none_or(|assignment| assignment.assignment.project != project)
         {
             return Some("This drawing belongs to a previous assignment in the current game. Open your current assignment; its original remains saved.".into());
         }
         let assignment = room.assignment.as_ref()?;
-        let document = self.active()?;
-        if matches!(command, "file.new" | "file.open")
-            || self.local_projects.status(document.doc.id).project != Some(assignment.assignment.project)
-            || !crate::commands::find(command).is_some_and(|spec| spec.journal)
-        {
+        if project != assignment.assignment.project {
             return None;
         }
         if room.phase == photocraft_party::room::Phase::Transfer
@@ -163,6 +161,30 @@ impl Session {
             || self.rooms.submission_project() == Some(assignment.assignment.project)
         {
             return Some("This assigned drawing is frozen for submission. Its saved local revision is retained.".into());
+        }
+        None
+    }
+    pub fn room_edit_refusal(&self, command: &str) -> Option<String> {
+        if matches!(
+            command,
+            "file.new"
+                | "file.open"
+                | "layer.select"
+                | "select.deselectLayers"
+                | "layer.selectLinkedLayers"
+                | "layer.selectAbove"
+                | "layer.selectBelow"
+                | "layer.selectTop"
+                | "layer.selectBottom"
+        ) || !crate::commands::find(command).is_some_and(|spec| spec.journal)
+        {
+            return None;
+        }
+        if let Some(reason) = self.room_active_edit_refusal() {
+            return Some(reason);
+        }
+        if self.room_canvas_size().is_some() && matches!(command, "layer.new.artboard" | "layer.new.artboardFromLayers" | "layer.new.artboardFromGroup") {
+            return Some("Artboards are unavailable in a fixed-size party assignment; use layers or groups within this frame or band.".into());
         }
         None
     }
@@ -300,5 +322,143 @@ impl Session {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod room_layer_guard_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::rooms::GameDrafts;
+    use photocraft_party::room::{Assignment, AssignmentView, MemberView, Phase, RoomView};
+    use photocraft_party::{AssignmentId, DeviceId, GameId, Mode, Participant, ParticipantId, RoomId};
+
+    fn participant(seed: u8) -> Participant {
+        Participant {
+            id: ParticipantId::new(&format!("{seed:02x}").repeat(16)).unwrap(),
+            device: DeviceId::new(&format!("{seed:02x}").repeat(16)).unwrap(),
+            display_name: "Alice".into(),
+        }
+    }
+
+    fn project_id(seed: u8) -> ProjectId {
+        ProjectId::new(&format!("{seed:02x}").repeat(16)).unwrap()
+    }
+
+    fn bind_assignment(session: &mut Session, mode: Mode, project: ProjectId, submitted: bool, phase: Phase) {
+        let doc_id = session.active().unwrap().doc.id;
+        session.local_projects.states.entry(doc_id).or_default().project = Some(project);
+        let alice = participant(1);
+        let room_id = RoomId::new(&"aa".repeat(16)).unwrap();
+        let game_id = GameId::new(&"bb".repeat(16)).unwrap();
+        session.rooms.status.profile = Some(alice.clone());
+        session.rooms.status.room = Some(RoomView {
+            id: room_id,
+            revision: 3,
+            epoch: 1,
+            phase,
+            round: 1,
+            mode,
+            timer_ms: None,
+            moderator: alice.id,
+            members: vec![MemberView { participant: alice.clone(), connected: true, ready: true }],
+            waiting: vec![],
+            paused: None,
+            deadline_ms: None,
+            assignment: Some(AssignmentView {
+                assignment: Assignment { id: AssignmentId { game: game_id, chain: 0, round: 1 }, player: alice.id, project },
+                submitted,
+                reference: None,
+            }),
+            reveal: vec![],
+        });
+    }
+
+    #[test]
+    fn active_party_assignment_allows_layers_and_blocks_artboards_with_reason() {
+        for (mode, width, height) in [(Mode::ExquisiteCorpse, 1024, 512), (Mode::Animation { rotations: 2 }, 1536, 1024)] {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width": width, "height": height, "background": "white"})).unwrap();
+            bind_assignment(&mut s, mode, project_id(5), false, Phase::Drawing);
+            assert!(s.room_active_edit_refusal().is_none());
+
+            // Normal layer workflows remain fully enabled inside the fixed frame/band.
+            let layer = s.execute("layer.new.layer", json!({"name": "Sketch"})).unwrap()["layer"].as_u64().unwrap();
+            s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+            s.execute("layer.setLabelColor", json!({"layer": layer, "color": "blue"})).unwrap();
+            s.execute("layer.groupLayers", json!({"name": "Lines"})).unwrap();
+            let before = s.active().unwrap().doc.clone();
+
+            for cmd in ["layer.new.artboard", "layer.new.artboardFromLayers", "layer.new.artboardFromGroup"] {
+                assert!(!s.is_enabled(cmd), "{cmd} must be disabled in fixed-size party assignment");
+                let reason = s.disabled_reason(cmd).expect("explicit refusal reason");
+                assert!(reason.contains("fixed-size party assignment"), "{cmd}: {reason}");
+                assert!(s.execute(cmd, json!({})).is_err(), "{cmd} execute must fail");
+            }
+            assert_eq!(s.active().unwrap().doc.as_ref(), before.as_ref());
+        }
+    }
+
+    #[test]
+    fn frozen_party_assignment_refuses_cross_document_copy_and_smart_object_commit() {
+        let mut s = Session::new();
+        // Doc 0: active party assignment with a Smart Object, initially editable.
+        s.execute("file.new", json!({"width": 1024, "height": 512, "background": "white"})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Patch"})).unwrap();
+        s.execute("edit.fill", json!({"color": "#cc3344"})).unwrap();
+        s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        bind_assignment(&mut s, Mode::ExquisiteCorpse, project_id(7), false, Phase::Drawing);
+
+        // Open Edit Contents child tab (Doc 1) while assignment is editable.
+        s.execute("layer.smartObjects.editContents", json!({})).unwrap();
+        let child_index = s.active_index().unwrap();
+        assert_eq!(child_index, 1);
+        s.execute("layer.new.layer", json!({"name": "Child edit"})).unwrap();
+
+        // Also open an unrelated editable local drawing (Doc 2).
+        s.execute("file.new", json!({"width": 64, "height": 64, "background": "white"})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Foreign"})).unwrap();
+        let foreign_index = s.active_index().unwrap();
+        assert_eq!(foreign_index, 2);
+
+        // Freeze the party assignment (submitted = true).
+        s.rooms.status.room.as_mut().unwrap().assignment.as_mut().unwrap().submitted = true;
+        let frozen_before = s.documents()[0].doc.clone();
+
+        // 1. Copying a layer from the editable local draft into the frozen assignment must fail
+        //    and leave the frozen document untouched while keeping the source active.
+        let copy_err = s.execute("layer.copyToDocument", json!({"document": 0})).unwrap_err().to_string();
+        assert!(copy_err.contains("frozen for submission"), "unexpected copy error: {copy_err}");
+        assert_eq!(s.active_index(), Some(foreign_index));
+        assert_eq!(s.documents()[0].doc.as_ref(), frozen_before.as_ref());
+
+        // 2. Committing the Smart Object child tab back into the now-frozen parent must also fail
+        //    and leave the frozen parent untouched.
+        let commit_err = crate::smart_cmds::commit_child(&mut s, child_index).unwrap_err().to_string();
+        assert!(commit_err.contains("frozen for submission"), "unexpected smart commit error: {commit_err}");
+        assert_eq!(s.documents()[0].doc.as_ref(), frozen_before.as_ref());
+    }
+
+    #[test]
+    fn previous_game_assignment_is_refused_by_room_active_edit_refusal_and_edit_with() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 1024, "height": 512, "background": "white"})).unwrap();
+        let prev_project = project_id(8);
+        let current_project = project_id(9);
+        bind_assignment(&mut s, Mode::ExquisiteCorpse, current_project, false, Phase::Drawing);
+        // Bind Doc 0 to the previous assignment in the same room.
+        let doc_id = s.active().unwrap().doc.id;
+        s.local_projects.states.entry(doc_id).or_default().project = Some(prev_project);
+        let room_id = s.rooms.status.room.as_ref().unwrap().id;
+        let game_id = s.rooms.status.room.as_ref().unwrap().assignment.as_ref().unwrap().assignment.id.game;
+        s.rooms.status.game_drafts = Some(GameDrafts { room: room_id, game: game_id, projects: vec![prev_project, current_project] });
+
+        let reason = s.room_active_edit_refusal().expect("previous assignment refused");
+        assert!(reason.contains("previous assignment"), "{reason}");
+        assert!(s.execute("layer.new.layer", json!({})).is_err());
+        // Read-only view commands remain allowed.
+        assert!(s.room_edit_refusal("layer.select").is_none());
+        assert!(s.room_edit_refusal("layer.setExpanded").is_none());
     }
 }

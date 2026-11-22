@@ -139,10 +139,35 @@ fn profile_name(doc: &Document) -> String {
     name.to_owned()
 }
 
+/// Document dimensions string in the active ruler units (e.g. `1536 px x 1024 px (72 ppi)`).
+pub fn document_dimensions_text(doc: &Document, units: &photocraft_engine::prefs::UnitsAndRulers) -> String {
+    status_info_text_with_units(doc, "dimensions", "", "", units)
+}
+
+/// Interactive zoom percentage control bound to the active document's `View`.
+/// Reused by both PhotoCraft's status bar and Komaphone's Workroom bottom-left status area.
+pub fn active_zoom_field(app: &mut PhotocraftApp, ui: &mut egui::Ui, width: f32) -> Option<egui::Response> {
+    if app.ui.views.len() != app.session.documents().len() {
+        app.sync_views();
+    }
+    let i = app.session.active_index()?;
+    let animated = app.session.prefs().general.animated_zoom;
+    let view = app.ui.views.get_mut(i)?;
+    let t = Tokens::get(ui.ctx());
+    let control_h = crate::panels::status_bar_heights(&t).1;
+    let mut pct = view.zoom * 100.0;
+    let field =
+        widgets::compact_wrapping_value_field(ui, &mut pct, crate::zoom_levels::percent_range(view), "%", vec2(width, control_h)).accessible_name(tl!("Zoom"));
+    if field.changed() {
+        crate::zoom_levels::set_from_field(view, field.dragged() || field.drag_started(), pct, animated);
+    }
+    Some(field)
+}
+
 /// Status bar body (Pro): zoom %, the chosen info field and its ">" menu, then status messages.
 pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
-    let (Some(st), Some(i)) = (app.session.active(), app.session.active_index()) else {
+    let Some(st) = app.session.active() else {
         ui.label(RichText::new(tl!("No document")).color(t.text_dim));
         // A command run with no document open still reports here (#1567: File › Automate › Batch).
         status_message(app, ui, &t);
@@ -155,14 +180,7 @@ pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         &profile_name(&st.doc),
         &app.session.prefs().units_and_rulers,
     );
-    let mut pct = app.ui.views[i].zoom * 100.0;
-    let control_h = crate::panels::status_bar_heights(&t).1;
-    let field = widgets::compact_wrapping_value_field(ui, &mut pct, crate::zoom_levels::percent_range(&app.ui.views[i]), "%", vec2(64.0, control_h))
-        .accessible_name(tl!("Zoom"));
-    if field.changed() {
-        let animated = app.session.prefs().general.animated_zoom;
-        crate::zoom_levels::set_from_field(&mut app.ui.views[i], field.dragged() || field.drag_started(), pct, animated);
-    }
+    let _ = active_zoom_field(app, ui, 64.0);
     ui.add_space(12.0);
     ui.label(RichText::new(tl!(&text)).color(t.text_dim).size(12.0));
     let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());

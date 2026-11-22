@@ -429,6 +429,8 @@ impl PhotocraftApp {
         tool_memory::persist(self, &ctx);
         // So are View › Extras, Show and Snap To (#3762).
         view_cmds::persist(self, &ctx);
+        // So are Komaphone local view preferences (shared-canvas sidebar & peer name labels).
+        crate::komaphone_world::persist_view_prefs(self, &ctx);
         // Remember the 0.37 panel sizes so a later 0.36 rollback's newer old-key values win on
         // the next upgrade (see `panels::migrate_panel_state`).
         panels::remember_panel_state(&ctx);

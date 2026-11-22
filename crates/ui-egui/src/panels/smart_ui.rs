@@ -115,6 +115,8 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
     if sm.smart_filters.is_empty() {
         return;
     }
+    let room_refusal = app.session.room_active_edit_refusal();
+    let editable = room_refusal.is_none();
     let t = Tokens::get(ui.ctx());
     let (header_height, mask_size) = smart_filters_header_geometry(app.ui.layers_panel_options.thumbnail_size, t.pro);
     let indent = 30.0 + crate::layer_row_ui::indent(depth, ui.available_width(), 130.0);
@@ -124,7 +126,7 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
     let rows = std::iter::once(None).chain((0..sm.smart_filters.len()).rev().map(Some));
     for index in rows {
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if index.is_none() { header_height } else { SUB_ROW_H }), Sense::click_and_drag());
-        if let Some((to, action)) = reorder_drop(ui, l, sm.smart_filters.len(), index, rect) {
+        if editable && let Some((to, action)) = reorder_drop(ui, l, sm.smart_filters.len(), index, rect) {
             // The moved filter ends up selected, with its smart object active, as after a click.
             ui.ctx().data_mut(|d| d.insert_temp::<FilterDrag>(selected_key(doc.id), (l.id.0, Some(to))));
             actions.push(action);
@@ -144,17 +146,7 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
         }
         let (name, on, shown) = filter_row_label(sm, index);
         let eye = Rect::from_center_size(pos2(rect.left() + indent + if index.is_none() { 9.0 } else { 41.0 }, rect.center().y), vec2(18.0, 18.0));
-        let eye_resp = ui.interact(eye, ui.scope_id().with(("sf-eye", l.id.0, index)), Sense::click());
-        if shown {
-            icons::paint(ui, eye, "eye", 12.0, if on { t.icon } else { t.text_faint });
-        }
-        eye_resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, shown, format!("{} {name}", tl!("Visibility"))));
-        if eye_resp.clicked() {
-            actions.push(match index {
-                None => ("layer.smartFilter.disableSmartFilters".into(), json!({"layer": l.id.0})),
-                Some(i) => ("layer.smartFilter.setVisible".into(), json!({"layer": l.id.0, "index": i})),
-            });
-        }
+        paint_filter_eye(app, ui, &t, l.id, index, &name, on, shown, eye, room_refusal.as_deref(), actions);
         // The shared mask scales with the thumbnail setting (hidden at None); the header name
         // follows it, while filter names stay aligned past their eyes.
         let mask_left = rect.left() + indent + 28.0;
@@ -203,7 +195,7 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
             None => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, &name)),
         }
         let hit = |f: fn(&egui::Response) -> bool| f(&resp) || name_resp.as_ref().is_some_and(f);
-        if hit(egui::Response::drag_started) {
+        if editable && hit(egui::Response::drag_started) {
             ui.ctx().data_mut(|d| d.insert_temp::<FilterDrag>(drag_key(), (l.id.0, index)));
         }
         if hit(egui::Response::clicked) {
@@ -214,21 +206,16 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
         }
         if let Some(i) = index
             && hit(egui::Response::double_clicked)
-            && (active || select_before_editor(app, l.id.0, actions))
         {
-            open_editor(app, ui.ctx(), l.id.0, sm, i);
+            if let Some(reason) = &room_refusal {
+                app.ui.status = reason.clone();
+                app.ui.status_error = true;
+            } else if active || select_before_editor(app, l.id.0, actions) {
+                open_editor(app, ui.ctx(), l.id.0, sm, i);
+            }
         }
         if let (Some(i), Some(r)) = (index, blend) {
-            let blend_resp = ui.interact(r, ui.scope_id().with(("sf-blend", l.id.0, i)), Sense::click());
-            icons::paint(ui, r, "sliders-horizontal", 13.0, if blend_resp.hovered() { t.text } else { t.icon });
-            let label = crate::i18n::fmt(tl!("Blending Options ({filter})"), &[("filter", &name)]);
-            blend_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
-            if blend_resp.double_clicked()
-                && let Err(e) = crate::smart_filter_dialog::open(app, l.id, i)
-            {
-                crate::notices::error(app, e);
-            }
-            blend_resp.on_hover_text(label);
+            paint_filter_blend_button(app, ui, &t, l.id, i, &name, r, room_refusal.as_deref());
         }
     }
     // Every row of `l` is drawn, so a filter of it selected (now, after this pass's clicks) is on
@@ -236,6 +223,80 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, doc: &Document, l
     if ui.ctx().data(|d| d.get_temp::<FilterDrag>(selected_key(doc.id))).is_some_and(|(layer, _)| layer == l.id.0) {
         let pass = ui.ctx().cumulative_pass_nr();
         ui.ctx().data_mut(|d| d.insert_temp(drawn_key(doc.id), pass));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_filter_eye(
+    app: &mut PhotocraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    layer: LayerId,
+    index: Option<usize>,
+    name: &str,
+    on: bool,
+    shown: bool,
+    eye: Rect,
+    room_refusal: Option<&str>,
+    actions: &mut Vec<(String, Value)>,
+) {
+    let editable = room_refusal.is_none();
+    let eye_resp = ui.interact(eye, ui.scope_id().with(("sf-eye", layer.0, index)), Sense::click());
+    if shown {
+        icons::paint(ui, eye, "eye", 12.0, if on && editable { t.icon } else { t.text_faint });
+    }
+    eye_resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, editable, shown, format!("{} {name}", tl!("Visibility"))));
+    if eye_resp.clicked() {
+        if let Some(reason) = room_refusal {
+            app.ui.status = reason.to_owned();
+            app.ui.status_error = true;
+        } else {
+            actions.push(match index {
+                None => ("layer.smartFilter.disableSmartFilters".into(), json!({"layer": layer.0})),
+                Some(i) => ("layer.smartFilter.setVisible".into(), json!({"layer": layer.0, "index": i})),
+            });
+        }
+    }
+    if let Some(reason) = room_refusal {
+        eye_resp.on_hover_text(reason);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_filter_blend_button(
+    app: &mut PhotocraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    layer: LayerId,
+    index: usize,
+    name: &str,
+    r: Rect,
+    room_refusal: Option<&str>,
+) {
+    let editable = room_refusal.is_none();
+    let blend_resp = ui.interact(r, ui.scope_id().with(("sf-blend", layer.0, index)), Sense::click());
+    let color = if !editable {
+        t.text_faint
+    } else if blend_resp.hovered() {
+        t.text
+    } else {
+        t.icon
+    };
+    icons::paint(ui, r, "sliders-horizontal", 13.0, color);
+    let label = crate::i18n::fmt(tl!("Blending Options ({filter})"), &[("filter", name)]);
+    blend_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, editable, &label));
+    if blend_resp.double_clicked() {
+        if let Some(reason) = room_refusal {
+            app.ui.status = reason.to_owned();
+            app.ui.status_error = true;
+        } else if let Err(e) = crate::smart_filter_dialog::open(app, layer, index) {
+            crate::notices::error(app, e);
+        }
+    }
+    if let Some(reason) = room_refusal {
+        blend_resp.on_hover_text(reason);
+    } else {
+        blend_resp.on_hover_text(label);
     }
 }
 

@@ -163,10 +163,10 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.heading("Gallery");
         button(app, ui, "Refresh", "komaphone.gallery.list", json!({}));
-        let response = ui.button("Draw");
+        let response = ui.button("Draw").on_hover_text("Return to your drawing workroom");
         remember(ui, "gallery.draw", &response);
         if response.clicked() {
-            app.ui.gallery.open = false;
+            crate::komaphone_workspace::open_workroom(app);
         }
         let response = ui.button("Import & backups");
         remember(ui, "gallery.storage", &response);
@@ -273,11 +273,20 @@ fn list(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> Option<(ProjectId, bool)>
                             remember(ui, &format!("gallery.item.{}", item.id.as_str()), &response);
                         }
                         if response.clicked() && !app.session.gallery.busy() {
+                            if !selected {
+                                app.ui.gallery.playing_animation = false;
+                                app.ui.gallery.playing_replay = false;
+                                app.ui.gallery.accumulator = 0.0;
+                            }
                             run(app, "komaphone.gallery.open", json!({"entry":item.id,"draft":item.draft}));
                         }
                         ui.small(format!("{}{}", item.kind, if item.complete { "" } else { " · incomplete" }));
                         ui.small(item.authors.join(", "));
-                        ui.small(&item.updated_at);
+                        let updated = crate::komaphone_time::format_compact(&item.updated_at);
+                        let time_resp = ui.small(&updated.display);
+                        if let Some(tooltip) = &updated.tooltip {
+                            time_resp.on_hover_text(tooltip);
+                        }
                         ui.small(&item.state);
                     });
                 });
@@ -327,6 +336,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         app.ui.gallery.replay_mode = false;
         app.ui.gallery.playing_animation = false;
         app.ui.gallery.playing_replay = false;
+        app.ui.gallery.accumulator = 0.0;
         app.ui.gallery.show_notes = false;
         app.ui.gallery.gif_preview = false;
         app.ui.gallery.pending_playback = false;
@@ -370,6 +380,11 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
         });
         ui.label(manifest.authors.iter().map(|a| a.display_name.as_str()).collect::<Vec<_>>().join(" · "));
+        let updated = crate::komaphone_time::format_compact(&manifest.updated_at);
+        let detail_time = ui.small(format!("Updated {}", updated.display));
+        if let Some(tooltip) = &updated.tooltip {
+            detail_time.on_hover_text(tooltip);
+        }
         if let Some(source) = &manifest.provenance {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!(
@@ -384,15 +399,25 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 }
             });
         }
+        if usize::from(app.ui.gallery.chain) >= chains {
+            app.ui.gallery.chain = 0;
+            app.ui.gallery.frame = 0;
+            app.ui.gallery.replay_step = 0;
+            app.ui.gallery.playing_animation = false;
+            app.ui.gallery.playing_replay = false;
+            app.ui.gallery.accumulator = 0.0;
+        }
         ui.horizontal_wrapped(|ui| {
             for chain in 0..chains {
                 let response =
                     ui.selectable_value(&mut app.ui.gallery.chain, chain as u8, format!("{} {}", if creature { "Creature" } else { "Animation" }, chain + 1));
                 remember(ui, &format!("gallery.chain.{chain}"), &response);
                 if response.changed() {
+                    app.ui.gallery.frame = 0;
                     app.ui.gallery.replay_step = 0;
                     app.ui.gallery.playing_animation = false;
                     app.ui.gallery.playing_replay = false;
+                    app.ui.gallery.accumulator = 0.0;
                 }
             }
             let before = app.ui.gallery.replay_mode;
@@ -414,6 +439,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 app.ui.gallery.playing_animation = false;
                 app.ui.gallery.playing_replay = false;
                 app.ui.gallery.replay_step = 0;
+                app.ui.gallery.accumulator = 0.0;
             }
         });
         if app.ui.gallery.replay_mode {
@@ -424,6 +450,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if response.changed() {
                     app.ui.gallery.replay_step = 0;
                     app.ui.gallery.playing_replay = false;
+                    app.ui.gallery.accumulator = 0.0;
                 }
                 let can_play = !selected_missing(&manifest, app.ui.gallery.chain, app.ui.gallery.frame)
                     && app.session.gallery.replay.as_ref().is_some_and(|replay| replay.moments.len() > 1);
@@ -457,6 +484,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 remember(ui, "gallery.replayStep", &response);
                 if response.changed() {
                     app.ui.gallery.playing_replay = false;
+                    app.ui.gallery.accumulator = 0.0;
                 }
                 if let Some(moment) = replay.moments.get(app.ui.gallery.replay_step) {
                     ui.small(format!("{:.2}s · {} · {}", moment.elapsed_ms as f64 / 1000.0, moment.kind, moment.command));
@@ -478,6 +506,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 remember(ui, "gallery.frame", &response);
                 if response.changed() {
                     app.ui.gallery.playing_animation = false;
+                    app.ui.gallery.accumulator = 0.0;
                 }
                 let fps = ui.add(egui::DragValue::new(&mut app.ui.gallery.fps).range(1..=24).suffix(" fps"));
                 remember(ui, "gallery.fps", &fps);

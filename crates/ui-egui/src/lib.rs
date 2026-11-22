@@ -44,6 +44,7 @@ pub mod komaphone_corpse;
 pub mod komaphone_gallery;
 pub mod komaphone_game_view;
 pub mod komaphone_rooms;
+pub mod komaphone_time;
 pub mod komaphone_workspace;
 pub mod komaphone_world;
 #[cfg(not(target_arch = "wasm32"))]
@@ -933,3 +934,9 @@ mod saved_path_edit_tests;
 
 #[cfg(test)]
 mod pen_path_ownership_tests;
+
+#[cfg(test)]
+mod komaphone_qol_ui_tests;
+
+#[cfg(test)]
+mod komaphone_qol005_tests;

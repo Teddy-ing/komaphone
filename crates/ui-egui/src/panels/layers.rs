@@ -104,7 +104,7 @@ fn inactive_blend_rows(ui: &mut egui::Ui, pro: bool) {
     ui.add_space(2.0);
 }
 
-pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+pub(crate) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     // A new active layer opens its parent groups and is scrolled into view (#152).
     let reveal = crate::layer_reveal::track(app, ui.ctx());
     let Some(st) = app.session.active() else {
@@ -116,6 +116,8 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let active_layer = active.and_then(|id| doc.layer(id));
     let selection = st.selected_layers();
     let isolated = st.isolated_layers.clone();
+    let room_refusal = app.session.room_active_edit_refusal();
+    let editable = room_refusal.is_none();
     let mut actions: Vec<(String, Value)> = Vec::new();
 
     let t = Tokens::get(ui.ctx());
@@ -142,10 +144,12 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         // Photoshop greys blend mode, Opacity and Fill for the Background layer. (With the
         // Background among several selected, what Photoshop does awaits a check: #5856.)
         let bg = crate::doc_props_ui::is_background(&doc, l);
+        let bg_lock_tip = "Locked Background layer does not support this control. Unlock or convert Background to a normal layer first.";
+        let top_disabled_tip = room_refusal.as_deref().or(bg.then_some(bg_lock_tip));
         // Pass Through is a group's mode: offered only when every target is a group.
         let all_groups = ids.iter().all(|id| doc.layer(*id).is_some_and(|x| x.is_group()));
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(!bg, |ui| {
+            let row_resp = ui.add_enabled_ui(!bg && editable, |ui| {
                 let mut m = l.blend;
                 // Reserve space for the numeric field first. On a narrow dock, hide the
                 // redundant visible Opacity label rather than force the dropdown beyond
@@ -177,6 +181,9 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                 });
             });
+            if let Some(reason) = top_disabled_tip {
+                row_resp.response.on_disabled_hover_text(reason);
+            }
         });
         // Docks zero the item spacing: keep the Opacity and Fill fields apart (#155).
         ui.add_space((theme::ROW_GAP - ui.spacing().item_spacing.y).max(0.0));
@@ -207,8 +214,18 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         ("all", "lock", tl!("Lock all"), lk.all),
                     ] {
                         // Lock Image Pixels includes Lock Transparent Pixels, which waits for it (#4892).
-                        let enabled = key != "transparency" || !lk.pixels;
-                        if ui.add_enabled_ui(enabled, |ui| icons::button(ui, icon, 20.0, on, tip)).inner.clicked() {
+                        let enabled = editable && !bg && (key != "transparency" || !lk.pixels);
+                        let mut resp = ui.add_enabled_ui(enabled, |ui| icons::button(ui, icon, 20.0, on, tip)).inner;
+                        if !enabled {
+                            let reason = room_refusal
+                                .as_deref()
+                                .or(bg.then_some(
+                                    "Background layer is locked. Click its row lock icon or double-click Background to convert it to a normal layer.",
+                                ))
+                                .unwrap_or("Included while Lock image pixels is active.");
+                            resp = resp.on_disabled_hover_text(reason);
+                        }
+                        if resp.clicked() {
                             let mut p = targets.clone();
                             p["locks"] = json!({ key: !on });
                             actions.push(("layer.setProps".into(), p));
@@ -218,11 +235,16 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             if !t.pro {
                 let locked = l.locks.any();
-                if icons::button(ui, if locked { "lock" } else { "lock-open" }, 22.0, locked, tl!("Lock layer")).clicked() {
+                let mut resp =
+                    ui.add_enabled_ui(editable, |ui| icons::button(ui, if locked { "lock" } else { "lock-open" }, 22.0, locked, tl!("Lock layer"))).inner;
+                if let Some(reason) = &room_refusal {
+                    resp = resp.on_disabled_hover_text(reason);
+                }
+                if resp.clicked() {
                     actions.push(simple_lock_toggle(crate::doc_props_ui::is_background(&doc, l), l, &targets));
                 }
             }
-            ui.add_enabled_ui(!bg, |ui| {
+            let fill_resp = ui.add_enabled_ui(!bg && editable, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut f = l.fill_opacity * 100.0;
                     let field = widgets::popup_value_field(ui, fill_label, &mut f, 0.0..=100.0, "%", LAYER_PCT_W);
@@ -232,6 +254,9 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                 })
             });
+            if let Some(reason) = top_disabled_tip {
+                fill_resp.response.on_disabled_hover_text(reason);
+            }
         });
         ui.add_space(2.0);
     } else {
@@ -329,7 +354,9 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 actions.push(done);
             }
             // ⌥-click the line between two layers: clip / release the upper one (#967).
-            crate::clip_line_ui::show(ui, &doc, &mut actions);
+            if editable {
+                crate::clip_line_ui::show(ui, &doc, &mut actions);
+            }
             // A rename whose row is gone (deleted, filtered out, inside a closed group) ends,
             // committed: nothing else could commit or cancel it.
             if let Some(layer) = crate::layer_row_ui::renaming(ui.ctx())
@@ -381,9 +408,17 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         } else {
             ("layer.delete", "Delete layer")
         };
-        let trash = icons::button(ui, icons::FOOTER_DELETE, icons::FOOTER_SIZE, false, tl!(label));
         // A selected smart filter row is what Delete removes, as in Photoshop (#4751).
         let picked_filter = crate::smart_ui::selected(&ctx, &doc, active);
+        let can_delete = editable && (picked_filter.is_some() || delete != "layer.delete" || (doc.layers.len() > 1 && !selection.is_empty()));
+        let mut trash = ui.add_enabled_ui(can_delete, |ui| icons::button(ui, icons::FOOTER_DELETE, icons::FOOTER_SIZE, false, tl!(label))).inner;
+        if !can_delete {
+            let reason = room_refusal
+                .as_deref()
+                .or_else(|| selection.is_empty().then_some("Select a layer first."))
+                .unwrap_or("A document must keep at least one layer.");
+            trash = trash.on_disabled_hover_text(reason);
+        }
         if trash.clicked()
             && let Some(picked) = picked_filter
         {
@@ -395,25 +430,34 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             let params = if confirm { json!({"__trash": true}) } else { json!({}) };
             actions.push((delete.into(), params));
         }
-        actions.extend(footer_drop(ui, &trash, footer_drag, "layer.delete"));
-        actions.extend(fx_trash_drop(ui, &trash, fx_footer_drag));
-        if let Some(drag) = filter_footer_drag
-            && dropped_on(ui, &trash)
-        {
-            actions.push(crate::smart_ui::trash_action(drag));
-        }
-        // Photoshop asks "Apply mask to layer before removing?" or "Delete the vector mask?"
-        // (`mask_trash_prompt`).
-        if let Some((layer, kind)) = mask_footer_drag
-            && dropped_on(ui, &trash)
-        {
-            actions.push(crate::mask_trash_prompt::drop_action(layer, kind));
+        if editable {
+            actions.extend(footer_drop(ui, &trash, footer_drag, "layer.delete"));
+            actions.extend(fx_trash_drop(ui, &trash, fx_footer_drag));
+            if let Some(drag) = filter_footer_drag
+                && dropped_on(ui, &trash)
+            {
+                actions.push(crate::smart_ui::trash_action(drag));
+            }
+            // Photoshop asks "Apply mask to layer before removing?" or "Delete the vector mask?"
+            // (`mask_trash_prompt`).
+            if let Some((layer, kind)) = mask_footer_drag
+                && dropped_on(ui, &trash)
+            {
+                actions.push(crate::mask_trash_prompt::drop_action(layer, kind));
+            }
         }
         // A click follows the selected thumbnail; name that action for screen readers even
         // though dropping a whole layer row onto the same button always deletes the layer.
-        trash.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!(label)));
-        let new_layer =
-            icons::button(ui, icons::FOOTER_NEW, icons::FOOTER_SIZE, false, &crate::shortcuts::tip_label(app, "Create a new layer", "layer.new.layer"));
+        trash.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_delete, tl!(label)));
+        let can_new_layer = crate::menus::is_enabled(app, "layer.new.layer");
+        let mut new_layer = ui
+            .add_enabled_ui(can_new_layer, |ui| {
+                icons::button(ui, icons::FOOTER_NEW, icons::FOOTER_SIZE, false, &crate::shortcuts::tip_label(app, "Create a new layer", "layer.new.layer"))
+            })
+            .inner;
+        if !can_new_layer && let Some(reason) = crate::enable_rules::disabled_reason(app, "layer.new.layer") {
+            new_layer = new_layer.on_disabled_hover_text(reason);
+        }
         if new_layer.clicked() {
             // A click makes the layer above the selection; ⌥-click asks first (the New Layer
             // dialog) and ⌘/Ctrl-click adds it below, as in Photoshop.
@@ -427,8 +471,17 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             };
             actions.push(("layer.new.layer".into(), params));
         }
-        actions.extend(footer_drop(ui, &new_layer, footer_drag, "layer.duplicate"));
-        let group = icons::button(ui, icons::FOOTER_NEW_GROUP, icons::FOOTER_SIZE, false, tl!("Create a new group"));
+        if editable {
+            actions.extend(footer_drop(ui, &new_layer, footer_drag, "layer.duplicate"));
+        } else {
+            new_layer.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_new_layer, footer_label("layer.duplicate")));
+        }
+        let can_group = crate::menus::is_enabled(app, "layer.new.group");
+        let mut group =
+            ui.add_enabled_ui(can_group, |ui| icons::button(ui, icons::FOOTER_NEW_GROUP, icons::FOOTER_SIZE, false, tl!("Create a new group"))).inner;
+        if !can_group && let Some(reason) = crate::enable_rules::disabled_reason(app, "layer.new.group") {
+            group = group.on_disabled_hover_text(reason);
+        }
         if group.clicked() {
             // Like Photoshop CC 2014 and later, a click with two or more layers selected puts them
             // in the new group (Layer › Group Layers); with one layer or none it adds an empty
@@ -448,66 +501,37 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 actions.push((cmd.into(), json!({})));
             }
         }
-        actions.extend(footer_drop(ui, &group, footer_drag, "layer.groupLayers"));
-        let adj = footer_menu_button(ui, "adjustment-layer", 26.0, tl!("Create new fill or adjustment layer"));
-        // Opens on the press like Photoshop's: drag onto an item and release to choose it (#2071).
-        crate::press_menu::show(&adj, |ui, menu| {
-            ui.set_min_width(190.0);
-            for c in photocraft_engine::command_specs().iter().filter(|c| c.id.starts_with("layer.newAdjustmentLayer.")) {
-                if menu.item(ui, tl!(c.label).trim_end_matches('…')) {
-                    actions.push((c.id.into(), json!({})));
-                }
-            }
-            ui.separator();
-            if menu.item(ui, tl!("Solid Color…")) {
-                actions.push(("layer.newFillLayer.solidColor".into(), json!({})));
-            }
-            if menu.item(ui, tl!("Gradient…")) {
-                actions.push(("layer.newFillLayer.gradient".into(), json!({})));
-            }
-            if menu.item(ui, tl!("Pattern…")) {
-                actions.push(("layer.newFillLayer.pattern".into(), json!({})));
-            }
-        });
-        // Like Photoshop the button never replaces a mask (#2075): with a layer mask it adds a
-        // vector mask, and with both it is greyed.
-        let alt = ui.input(|i| i.modifiers.alt);
-        let mask_cmd = crate::layer_menu_ui::mask_button_command(active_layer, doc.selection.is_some(), alt);
-        let mask_tip = if active_layer.is_some_and(|l| l.mask.is_some()) {
-            tl!("Add vector mask").to_string()
+        if editable {
+            actions.extend(footer_drop(ui, &group, footer_drag, "layer.groupLayers"));
         } else {
-            crate::i18n::fmt(tl!("Add a mask  (from the selection; {key} inverts)"), &[("key", &crate::shortcuts::pretty("Alt"))])
-        };
-        let mask_btn = ui.add_enabled_ui(mask_cmd.is_some(), |ui| icons::button(ui, "layer-mask", 26.0, false, &mask_tip)).inner;
-        mask_btn.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &mask_tip));
-        if mask_btn.clicked()
-            && let Some(cmd) = mask_cmd
-        {
-            // A path selected in the Paths panel becomes the vector mask, as in Photoshop (#4728);
-            // Alt still inverts it.
-            match crate::vector_ui::selected_document_path(app).filter(|_| cmd.starts_with("layer.vectorMask.")) {
-                Some(name) => actions.push(("layer.vectorMask.currentPath".into(), json!({"name": name, "hide": alt}))),
-                None => actions.push((cmd.into(), json!({}))),
-            }
+            group.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, can_group, footer_label("layer.groupLayers")));
         }
-        let fx = fx_button(ui, 26.0, tl!("Add a layer style"));
-        crate::press_menu::show(&fx, |ui, menu| {
-            ui.set_min_width(180.0);
-            if menu.item(ui, tl!("Blending Options…")) {
-                crate::layer_style::open(app, None);
-            }
-            ui.separator();
-            for &(kind, label) in crate::layer_style::KINDS {
-                if menu.item(ui, format!("{}…", tl!(label))) {
-                    crate::layer_style::open(app, Some(kind));
+        let mut adj = ui.add_enabled_ui(editable, |ui| footer_menu_button(ui, "adjustment-layer", 26.0, tl!("Create new fill or adjustment layer"))).inner;
+        if let Some(reason) = &room_refusal {
+            adj = adj.on_disabled_hover_text(reason);
+        }
+        if editable {
+            // Opens on the press like Photoshop's: drag onto an item and release to choose it (#2071).
+            crate::press_menu::show(&adj, |ui, menu| {
+                ui.set_min_width(190.0);
+                for c in photocraft_engine::command_specs().iter().filter(|c| c.id.starts_with("layer.newAdjustmentLayer.")) {
+                    if menu.item(ui, tl!(c.label).trim_end_matches('…')) {
+                        actions.push((c.id.into(), json!({})));
+                    }
                 }
-            }
-        });
-        // Photoshop's footer starts with Link Layers (enabled with two or more layers selected).
-        let can_link = app.session.is_enabled("layer.linkLayers");
-        if ui.add_enabled_ui(can_link, |ui| icons::button(ui, "link-2", 26.0, false, tl!("Link layers"))).inner.clicked() {
-            actions.push(("layer.linkLayers".into(), json!({})));
+                ui.separator();
+                if menu.item(ui, tl!("Solid Color…")) {
+                    actions.push(("layer.newFillLayer.solidColor".into(), json!({})));
+                }
+                if menu.item(ui, tl!("Gradient…")) {
+                    actions.push(("layer.newFillLayer.gradient".into(), json!({})));
+                }
+                if menu.item(ui, tl!("Pattern…")) {
+                    actions.push(("layer.newFillLayer.pattern".into(), json!({})));
+                }
+            });
         }
+        footer_mask_fx_and_link(app, ui, &doc, active_layer, room_refusal.as_deref(), &mut actions);
     });
     for (id, p) in actions {
         // A row click commits even when it selects the layer already being edited (#5584).
@@ -543,6 +567,9 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             app.ui.panels.properties = true;
             app.ui.dock_tabs.properties = 0;
             app.ui.dock.collapsed.retain(|g| *g != crate::dock::Group::Properties);
+            if app.ui.komaphone.enabled {
+                app.ui.komaphone.properties_open = true;
+            }
             continue;
         }
         if p.is_null() || id == "layer.newFillLayer.solidColor" || id == photocraft_engine::pattern_fill_cmds::CREATE {
@@ -557,7 +584,17 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             continue;
         }
-        let _ = app.run(&id, p);
+        match app.run(&id, p) {
+            Ok(_) => {
+                if app.ui.komaphone.enabled && (id.starts_with("layer.newAdjustmentLayer.") || id == "layer.newFillLayer.gradient") {
+                    app.ui.komaphone.properties_open = true;
+                }
+            }
+            Err(e) => {
+                app.ui.status = e;
+                app.ui.status_error = true;
+            }
+        }
     }
 }
 
@@ -569,17 +606,85 @@ pub(super) fn footer_label(command: &str) -> &'static str {
     }
 }
 
+fn footer_mask_fx_and_link(
+    app: &mut PhotocraftApp,
+    ui: &mut egui::Ui,
+    doc: &photocraft_doc::Document,
+    active_layer: Option<&Layer>,
+    room_refusal: Option<&str>,
+    actions: &mut Vec<(String, Value)>,
+) {
+    let editable = room_refusal.is_none();
+    // Like Photoshop the button never replaces a mask (#2075): with a layer mask it adds a
+    // vector mask, and with both it is greyed.
+    let alt = ui.input(|i| i.modifiers.alt);
+    let mask_cmd = crate::layer_menu_ui::mask_button_command(active_layer, doc.selection.is_some(), alt);
+    let mask_enabled = editable && mask_cmd.is_some_and(|cmd| crate::menus::is_enabled(app, cmd));
+    let mask_tip = if active_layer.is_some_and(|l| l.mask.is_some()) {
+        tl!("Add vector mask").to_string()
+    } else {
+        crate::i18n::fmt(tl!("Add a mask  (from the selection; {key} inverts)"), &[("key", &crate::shortcuts::pretty("Alt"))])
+    };
+    let mut mask_btn = ui.add_enabled_ui(mask_enabled, |ui| icons::button(ui, "layer-mask", 26.0, false, &mask_tip)).inner;
+    if !mask_enabled {
+        let reason = room_refusal
+            .map(str::to_owned)
+            .or_else(|| mask_cmd.and_then(|cmd| crate::enable_rules::disabled_reason(app, cmd)))
+            .unwrap_or_else(|| if active_layer.is_none() { "Select a layer first.".into() } else { "This layer already has all supported masks.".into() });
+        mask_btn = mask_btn.on_disabled_hover_text(reason);
+    }
+    mask_btn.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, mask_enabled, &mask_tip));
+    if mask_btn.clicked()
+        && let Some(cmd) = mask_cmd
+    {
+        // A path selected in the Paths panel becomes the vector mask, as in Photoshop (#4728);
+        // Alt still inverts it.
+        match crate::vector_ui::selected_document_path(app).filter(|_| cmd.starts_with("layer.vectorMask.")) {
+            Some(name) => actions.push(("layer.vectorMask.currentPath".into(), json!({"name": name, "hide": alt}))),
+            None => actions.push((cmd.into(), json!({}))),
+        }
+    }
+    let can_fx = crate::menus::is_enabled(app, "layer.layerStyle.blendingOptions");
+    let mut fx = ui.add_enabled_ui(can_fx, |ui| fx_button(ui, 26.0, tl!("Add a layer style"))).inner;
+    if !can_fx && let Some(reason) = crate::enable_rules::disabled_reason(app, "layer.layerStyle.blendingOptions") {
+        fx = fx.on_disabled_hover_text(reason);
+    }
+    if can_fx {
+        crate::press_menu::show(&fx, |ui, menu| {
+            ui.set_min_width(180.0);
+            if menu.item(ui, tl!("Blending Options…")) {
+                crate::layer_style::open(app, None);
+            }
+            ui.separator();
+            for &(kind, label) in crate::layer_style::KINDS {
+                if menu.item(ui, format!("{}…", tl!(label))) {
+                    crate::layer_style::open(app, Some(kind));
+                }
+            }
+        });
+    }
+    // Photoshop's footer starts with Link Layers (enabled with two or more layers selected).
+    let can_link = crate::menus::is_enabled(app, "layer.linkLayers");
+    let mut link = ui.add_enabled_ui(can_link, |ui| icons::button(ui, "link-2", 26.0, false, tl!("Link layers"))).inner;
+    if !can_link && let Some(reason) = crate::enable_rules::disabled_reason(app, "layer.linkLayers") {
+        link = link.on_disabled_hover_text(reason);
+    }
+    if link.clicked() {
+        actions.push(("layer.linkLayers".into(), json!({})));
+    }
+}
+
 /// The small down-arrow makes it clear that the footer icon expands into a menu.
 fn footer_menu_arrow(ui: &egui::Ui, rect: Rect) {
     let t = Tokens::get(ui.ctx());
     let arrow = Rect::from_min_size(rect.right_bottom() - vec2(11.0, 10.0), vec2(9.0, 9.0));
-    icons::paint(ui, arrow, "chevron-down", 8.0, t.text_dim);
+    icons::paint(ui, arrow, "chevron-down", 8.0, if ui.is_enabled() { t.text_dim } else { t.text_faint });
 }
 
 fn footer_menu_button(ui: &mut egui::Ui, icon: &str, size: f32, tip: &str) -> egui::Response {
     let response = icons::button(ui, icon, size, false, tip);
     // Named for screen readers (and tests) after its tooltip.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tip));
     footer_menu_arrow(ui, response.rect);
     response
 }
@@ -587,16 +692,18 @@ fn footer_menu_button(ui: &mut egui::Ui, icon: &str, size: f32, tip: &str) -> eg
 /// Photoshop's italic "fx" footer button (no icon-font equivalent).
 pub(crate) fn fx_button(ui: &mut egui::Ui, size: f32, tip: &str) -> egui::Response {
     let t = Tokens::get(ui.ctx());
+    let enabled = ui.is_enabled();
     let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-    if resp.hovered() {
+    if enabled && resp.hovered() {
         ui.painter().rect_filled(r, t.radius_sm, t.hover);
     }
+    let color = if enabled { t.icon } else { t.text_faint };
     let mut job = egui::text::LayoutJob::default();
-    job.append("fx", 0.0, egui::TextFormat { font_id: egui::FontId::proportional(15.0), color: t.icon, italics: true, ..Default::default() });
+    job.append("fx", 0.0, egui::TextFormat { font_id: egui::FontId::proportional(15.0), color, italics: true, ..Default::default() });
     let g = ui.painter().layout_job(job);
-    ui.painter().galley(r.center() - g.size() / 2.0, g, t.icon);
+    ui.painter().galley(r.center() - g.size() / 2.0, g, color);
     footer_menu_arrow(ui, r);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, tip));
     resp.on_hover_text(tip)
 }
 

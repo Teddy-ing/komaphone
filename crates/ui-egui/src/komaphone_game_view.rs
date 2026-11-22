@@ -309,7 +309,7 @@ pub fn reveal(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let position = json!({"game":game,"chain":chain,"frame":frame,"fps":app.ui.rooms.animation.fps,"looping":app.ui.rooms.animation.looping,"visible_parts":app.ui.rooms.corpse_view.visible_parts});
     let saved = app.session.rooms.status.reveal_position.as_ref().and_then(|p| serde_json::to_value(p).ok());
     let now = ui.input(|input| input.time);
-    let playback_due = !app.ui.rooms.animation.playing || now - app.ui.rooms.last_reveal_save_time >= 1.0;
+    let playback_due = matches!(room.mode, Mode::ExquisiteCorpse) || !app.ui.rooms.animation.playing || now - app.ui.rooms.last_reveal_save_time >= 1.0;
     if saved.as_ref() != Some(&position) && !app.session.rooms.busy() && playback_due {
         run(app, "komaphone.reveal.position", position);
         app.ui.rooms.last_reveal_save_time = now;

@@ -150,7 +150,17 @@ pub fn show(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bo
         let has_selection = app.session.active().is_some_and(|s| s.doc.selection.is_some());
         items(app, ui, l, on_set, entries(l, on_set, has_selection), actions);
         ui.separator();
-        if ui.button(tl!("Rename Layer…")).clicked() {
+        let is_bg = app.session.active().is_some_and(|st| crate::doc_props_ui::is_background(&st.doc, l));
+        let rename_reason = app
+            .session
+            .room_edit_refusal("layer.renameLayer")
+            .or_else(|| is_bg.then(|| "Locked Background layer cannot be renamed in place. Unlock or convert Background to a normal layer first.".into()));
+        let can_rename = rename_reason.is_none();
+        let mut rename_btn = ui.add_enabled(can_rename, egui::Button::new(tl!("Rename Layer…")));
+        if let Some(reason) = rename_reason {
+            rename_btn = rename_btn.on_disabled_hover_text(reason);
+        }
+        if rename_btn.clicked() {
             rename = true;
             ui.close();
         }
@@ -173,17 +183,29 @@ pub fn show_mask(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, actio
         items(app, ui, l, false, edits, actions);
         ui.separator();
         // ⌘⇧-, ⌘⌥- and ⌘⇧⌥-clicking the thumbnail, as menu items.
+        let load_refusal = app.session.room_edit_refusal("select.loadSelection");
         let loads =
             [(tl!("Add Mask to Selection"), "add"), (tl!("Subtract Mask from Selection"), "subtract"), (tl!("Intersect Mask with Selection"), "intersect")];
         for (label, operation) in loads {
-            if ui.button(label).clicked() {
+            let mut btn = ui.add_enabled(load_refusal.is_none(), egui::Button::new(label));
+            if let Some(reason) = &load_refusal {
+                btn = btn.on_disabled_hover_text(reason);
+            }
+            if btn.clicked() {
                 actions.push(("layer.select".into(), json!({"layer": l.id.0})));
                 actions.push(("select.loadSelection".into(), json!({"channel": "mask", "layer": l.id.0, "operation": operation})));
                 ui.close();
             }
         }
         ui.separator();
-        if ui.add_enabled(crate::menus::is_enabled(app, "select.selectAndMask"), egui::Button::new(tl!("Select and Mask…"))).clicked() {
+        let can_refine = crate::menus::is_enabled(app, "select.selectAndMask") && app.session.room_edit_refusal("select.refineEdge").is_none();
+        let mut refine_btn = ui.add_enabled(can_refine, egui::Button::new(tl!("Select and Mask…")));
+        if !can_refine
+            && let Some(reason) = app.session.room_edit_refusal("select.refineEdge").or_else(|| crate::enable_rules::disabled_reason(app, "select.refineEdge"))
+        {
+            refine_btn = refine_btn.on_disabled_hover_text(reason);
+        }
+        if refine_btn.clicked() {
             // Like double-clicking the thumbnail with that preference on: it refines the mask.
             actions.push(("layer.select".into(), json!({"layer": l.id.0})));
             actions.push(("ui.maskTarget".into(), json!(true)));
@@ -191,7 +213,12 @@ pub fn show_mask(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, actio
             ui.close();
         }
         // Layer Mask Display Options: the rubylith's colour and opacity (`channel.options`).
-        if ui.button(tl!("Mask Options…")).clicked() {
+        let options_refusal = app.session.room_edit_refusal("channel.options");
+        let mut options_btn = ui.add_enabled(options_refusal.is_none(), egui::Button::new(tl!("Mask Options…")));
+        if let Some(reason) = &options_refusal {
+            options_btn = options_btn.on_disabled_hover_text(reason);
+        }
+        if options_btn.clicked() {
             actions.push(("layer.select".into(), json!({"layer": l.id.0})));
             actions.push(("ui.maskTarget".into(), json!(true)));
             actions.push(("channel.options".into(), Value::Null));
@@ -207,6 +234,43 @@ pub fn show_effects(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, ac
         ui.set_min_width(200.0);
         items(app, ui, l, false, effects_entries(), actions);
     });
+}
+
+/// Why a layer context-menu entry is disabled for `l` (or the current selection when `on_set`).
+fn item_disabled_reason(app: &crate::PhotocraftApp, l: &Layer, on_set: bool, id: &str) -> Option<String> {
+    if on_set && single_layer_only(id) {
+        return Some("Applies to a single layer; select one layer first.".into());
+    }
+    if let Some(reason) = app.session.room_edit_refusal(id) {
+        return Some(reason);
+    }
+    let Some(st) = app.session.active() else {
+        return Some("No document open.".into());
+    };
+    let is_active = st.active_layer == Some(l.id);
+    if on_set || is_active {
+        if crate::menus::is_enabled(app, id) {
+            None
+        } else {
+            Some(crate::enable_rules::disabled_reason(app, id).unwrap_or_else(|| "Not available for the current layer state.".into()))
+        }
+    } else {
+        if let Some(reason) = crate::enable_rules::disabled_reason_for(&st.doc, Some(l), id) {
+            return Some(reason.into());
+        }
+        match id {
+            "layer.delete" if st.doc.layers.len() <= 1 => Some("A document must keep at least one layer.".into()),
+            "layer.linkLayers" => Some("Select two or more layers to link.".into()),
+            "layer.selectLinkedLayers" if l.link_group.is_none() => Some("This layer is not linked to any other layer.".into()),
+            "layer.layerStyle.pasteLayerStyle" if !app.session.is_enabled(id) => {
+                Some(app.session.disabled_reason(id).unwrap_or_else(|| "Copy a layer style first.".into()))
+            }
+            "layer.mergeDown" | "layer.createClippingMask" if st.doc.path_of(l.id).and_then(|p| p.last().copied()).unwrap_or(0) == 0 => {
+                Some("There is no layer directly below this layer.".into())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The command items of a layer menu, separators collapsed.
@@ -226,11 +290,13 @@ fn items(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bool,
                     continue;
                 }
                 last_sep = false;
-                // Enablement is exact for the active layer (or the selection); another row is
-                // selected first when clicked, so its items stay available.
-                let is_active = app.session.active().is_some_and(|s| s.active_layer == Some(l.id));
-                let enabled = !(on_set && single_layer_only(id)) && if on_set || is_active { crate::menus::is_enabled(app, id) } else { true };
-                if ui.add_enabled(enabled, egui::Button::new(tl!(&label))).clicked() {
+                let reason = item_disabled_reason(app, l, on_set, id);
+                let enabled = reason.is_none();
+                let mut btn = ui.add_enabled(enabled, egui::Button::new(tl!(&label)));
+                if let Some(why) = reason {
+                    btn = btn.on_disabled_hover_text(why);
+                }
+                if btn.clicked() {
                     if !on_set {
                         actions.push(("layer.select".into(), json!({"layer": l.id.0})));
                     }
@@ -258,21 +324,32 @@ fn common_color(app: &crate::PhotocraftApp, l: &Layer, on_set: bool) -> Option<L
 }
 
 fn color_menu(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bool, actions: &mut Vec<(String, Value)>) {
-    ui.menu_button(tl!("Color"), |ui| {
-        color_choices(app, ui, l, on_set, actions);
+    let refusal = app.session.room_edit_refusal("layer.setLabelColor");
+    ui.add_enabled_ui(refusal.is_none(), |ui| {
+        let resp = ui.menu_button(tl!("Color"), |ui| {
+            color_choices(app, ui, l, on_set, actions);
+        });
+        if let Some(reason) = &refusal {
+            resp.response.on_disabled_hover_text(reason);
+        }
     });
 }
 
 /// The eye column opens the same color choices directly, without the row's full context menu.
 pub(crate) fn color_choices(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bool, actions: &mut Vec<(String, Value)>) {
     let current = common_color(app, l, on_set);
+    let refusal = app.session.room_edit_refusal("layer.setLabelColor");
     crate::widgets::menu_scroll(ui, |ui| {
         ui.set_min_width(170.0);
         for color in LabelColor::ALL {
             if color == LabelColor::Red {
                 ui.separator();
             }
-            if color_button(ui, color, current == Some(color)).clicked() {
+            let mut btn = ui.add_enabled_ui(refusal.is_none(), |ui| color_button(ui, color, current == Some(color))).inner;
+            if let Some(reason) = &refusal {
+                btn = btn.on_disabled_hover_text(reason);
+            }
+            if btn.clicked() {
                 let params = if on_set {
                     json!({"color": color.id()})
                 } else {

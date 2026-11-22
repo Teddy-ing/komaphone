@@ -246,6 +246,9 @@ impl Session {
     /// [`Self::edit`], recording a history state only when `record` is set. An unrecorded change
     /// still marks the document modified and leaves the redo states alone.
     pub(crate) fn edit_with<R>(&mut self, label: &str, record: bool, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
+        if let Some(reason) = self.room_active_edit_refusal() {
+            return Err(EngineError::Other(reason));
+        }
         self.check_local_replay_capacity()?;
         let assigned_size = self.room_canvas_size();
         if record {

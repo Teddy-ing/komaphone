@@ -152,15 +152,17 @@ fn paint_overlays(app: &mut PhotocraftApp, ui: &egui::Ui, painter: &egui::Painte
             let position = rect.min + egui::vec2(x as f32, y as f32);
             if rect.contains(position) {
                 painter.circle_stroke(position, 5.0, egui::Stroke::new(1.5, tokens.accent));
-                let label = super::panels::display_name(app, peer.profile);
-                let label = painter.layout_no_wrap(label.to_owned(), egui::FontId::proportional(12.0), tokens.text);
-                let at = position + egui::vec2(8.0, -8.0 - label.size().y);
-                let backing = Rect::from_min_size(at, label.size()).expand(3.0);
                 app.world_probe.obscured(Rect::from_center_size(position, egui::vec2(16.0, 16.0)));
-                app.world_probe.obscured(backing);
-                painter.rect_filled(backing, 3.0, tokens.card);
-                painter.rect_stroke(backing, 3.0, egui::Stroke::new(1.0, tokens.card_border), egui::StrokeKind::Inside);
-                painter.galley(at, label, tokens.text);
+                if app.ui.world.show_peer_labels {
+                    let label = super::panels::display_name(app, peer.profile);
+                    let label = painter.layout_no_wrap(label.to_owned(), egui::FontId::proportional(12.0), tokens.text);
+                    let at = position + egui::vec2(8.0, -8.0 - label.size().y);
+                    let backing = Rect::from_min_size(at, label.size()).expand(3.0);
+                    app.world_probe.obscured(backing);
+                    painter.rect_filled(backing, 3.0, tokens.card);
+                    painter.rect_stroke(backing, 3.0, egui::Stroke::new(1.0, tokens.card_border), egui::StrokeKind::Inside);
+                    painter.galley(at, label, tokens.text);
+                }
             }
         }
     }

@@ -26,6 +26,7 @@ fn background_blocks(id: &str, has_selection: bool) -> bool {
             | "layer.releaseClippingMask"
             | "layer.mergeDown"
             | "layer.lockLayers"
+            | "layer.renameLayer"
             | "layer.maskAllObjects"
             | "edit.contentAwareScale"
             | "edit.puppetWarp"
@@ -53,20 +54,52 @@ fn kind_blocks(id: &str, l: &Layer) -> bool {
     }
 }
 
-/// Is `id` greyed in Photoshop for this document state, regardless of the engine's own check?
-pub fn disabled_for(doc: &Document, active: Option<&Layer>, id: &str) -> bool {
+/// User-facing explanation when [`disabled_for`] greys `id` for `active` in `doc`.
+pub(crate) fn disabled_reason_for(doc: &Document, active: Option<&Layer>, id: &str) -> Option<&'static str> {
     let only_background = doc.layers.len() == 1 && doc.layers.first().is_some_and(|b| crate::doc_props_ui::is_background(doc, b));
     if only_background && matches!(id, "layer.mergeVisible" | "layer.flattenImage" | "layer.mergeLayers" | "layer.rasterize.allLayers") {
-        return true;
+        return Some("Document already consists of only the Background layer.");
     }
     if id == "layer.delete.hiddenLayers" && doc.walk().iter().all(|(_, _, l)| l.visible) {
-        return true;
+        return Some("There are no hidden layers to delete.");
     }
-    let Some(l) = active else { return false };
+    let l = active?;
     if crate::doc_props_ui::is_background(doc, l) && background_blocks(id, doc.selection.is_some()) {
-        return true;
+        return Some("Locked Background layer does not support this action. Unlock or convert Background to a normal layer first.");
     }
-    kind_blocks(id, l)
+    if kind_blocks(id, l) {
+        return Some(match id {
+            "layer.layerStyle.copyLayerStyle" | "layer.layerStyle.clear" => "This layer has no layer style to copy or clear.",
+            "layer.rasterize.layerStyle" => "This layer has no layer style to rasterize.",
+            i if i.starts_with("layer.rasterize.") => "This layer does not need rasterizing.",
+            _ => "Not applicable to the selected layer type.",
+        });
+    }
+    None
+}
+
+/// User-facing explanation when `id` is currently disabled in menus or the Layers panel.
+pub(crate) fn disabled_reason(app: &crate::PhotocraftApp, id: &str) -> Option<String> {
+    if let Some(reason) = app.session.room_edit_refusal(id) {
+        return Some(reason);
+    }
+    if let Some(st) = app.session.active() {
+        let active = st.active_layer.and_then(|a| st.doc.layer(a));
+        let selected = st.selected_layers();
+        if selection_targets(id).is_some() && selected.len() > 1 {
+            if disabled_for_selection(&st.doc, &selected, active, id) {
+                return Some("None of the selected layers support this action.".into());
+            }
+        } else if let Some(reason) = disabled_reason_for(&st.doc, active, id) {
+            return Some(reason.into());
+        }
+    }
+    app.session.disabled_reason_with(id, &app.with_mask_target(id, serde_json::Value::Null))
+}
+
+/// Is `id` greyed in Photoshop for this document state, regardless of the engine's own check?
+pub fn disabled_for(doc: &Document, active: Option<&Layer>, id: &str) -> bool {
+    disabled_reason_for(doc, active, id).is_some()
 }
 
 /// How a command that acts on the whole layer selection decides it is available.

@@ -21,10 +21,37 @@ pub(super) fn list_rows(ui: &mut egui::Ui, id: &'static str, lines: usize, count
 
 pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
+    if app.ui.world.sidebar_collapsed {
+        egui::Panel::left("world-sidebar-collapsed")
+            .exact_size(32.0)
+            .frame(egui::Frame::NONE.fill(tokens.card).inner_margin(egui::Margin::symmetric(4, 8)))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    let resp = crate::icons::button_with_icon_size(ui, "chevron-right", 24.0, 14.0, false, "Expand sidebar");
+                    remember(ui, "world.sidebar.toggle", &resp);
+                    if resp.clicked() {
+                        app.ui.world.sidebar_collapsed = false;
+                    }
+                });
+            });
+        return;
+    }
     egui::Panel::left("world-sidebar").exact_size(260.0).frame(egui::Frame::NONE.fill(tokens.card).inner_margin(10)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let resp = crate::icons::button_with_icon_size(ui, "chevron-left", 24.0, 14.0, false, "Collapse sidebar");
+                remember(ui, "world.sidebar.toggle", &resp);
+                if resp.clicked() {
+                    app.ui.world.sidebar_collapsed = true;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new("Your shared canvases").heading()).truncate());
+                });
+            });
+        });
+        ui.add_space(4.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             let idle = !app.ui.world.has_stranded_draft();
-            ui.heading("Your shared canvases");
             if !app.session.worlds.connected() {
                 if ui.button("Open Private room").clicked() {
                     app.ui.world.open = false;
@@ -61,10 +88,15 @@ pub(super) fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             let section = ui.collapsing("Trash", |ui| {
                 button(app, ui, "Refresh Trash", "komaphone.world.trash", json!({}), idle);
                 ui.small("Only owners can restore deleted canvases. Restoration brings back their artwork and previous members.");
-                list_rows(ui, "world-trash-list", 2, app.session.worlds.trash.len(), |ui, index| {
+                list_rows(ui, "world-trash-list", 3, app.session.worlds.trash.len(), |ui, index| {
                     let Some(item) = app.session.worlds.trash.get(index) else { return };
-                    let (canvas, epoch) = (item.canvas, item.owner_epoch);
+                    let (canvas, epoch, deleted_at_ms) = (item.canvas, item.owner_epoch, item.deleted_at_ms);
                     ui.label(&item.name);
+                    let deleted = crate::komaphone_time::format_unix_ms(deleted_at_ms);
+                    let time_resp = ui.small(format!("Deleted {}", deleted.display));
+                    if let Some(tooltip) = &deleted.tooltip {
+                        time_resp.on_hover_text(tooltip);
+                    }
                     let response = ui.add_enabled(idle, egui::Button::new("Restore canvas and members"));
                     remember(ui, &format!("world.undelete.{}", canvas.as_str()), &response);
                     if response.clicked() && !app.ui.world.unfinished() {

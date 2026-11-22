@@ -47,6 +47,8 @@ pub(crate) fn prune(app: &mut PhotocraftApp, ctx: &egui::Context) {
 #[serde(default)]
 pub struct WorldUi {
     pub open: bool,
+    pub sidebar_collapsed: bool,
+    pub show_peer_labels: bool,
     pub tools: crate::komaphone_canvas::CanvasUi,
     #[serde(skip)]
     pub name: String,
@@ -102,6 +104,8 @@ impl Default for WorldUi {
     fn default() -> Self {
         Self {
             open: false,
+            sidebar_collapsed: false,
+            show_peer_labels: true,
             tools: Default::default(),
             name: "Our canvas".into(),
             rename: String::new(),
@@ -180,6 +184,46 @@ impl WorldUi {
     }
     pub(crate) fn prepare_close(&mut self) {
         self.cancel_gesture_for_switch();
+    }
+}
+
+/// Non-default Komaphone local view preferences stored in `Preferences::komaphone_view`.
+/// `Value::Null` when everything matches the defaults.
+fn remembered_view_prefs(app: &PhotocraftApp) -> Value {
+    let mut map = serde_json::Map::new();
+    if app.ui.world.sidebar_collapsed {
+        map.insert("worldSidebarCollapsed".into(), Value::Bool(true));
+    }
+    if !app.ui.world.show_peer_labels {
+        map.insert("worldShowPeerLabels".into(), Value::Bool(false));
+    }
+    if map.is_empty() { Value::Null } else { Value::Object(map) }
+}
+
+/// Persist local Komaphone view preferences (shared-canvas sidebar collapse & collaborator name
+/// label visibility) once the pointer is released. Never synced to the server or other users.
+pub(crate) fn persist_view_prefs(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if ctx.input(|i| i.pointer.any_down()) {
+        return;
+    }
+    let now = remembered_view_prefs(app);
+    if app.session.prefs().komaphone_view != now {
+        app.session.prefs.edit(|p| p.komaphone_view = now);
+    }
+}
+
+/// Restore local Komaphone view preferences at launch; invalid or unexpected values keep defaults.
+pub(crate) fn restore_view_prefs(app: &mut PhotocraftApp) {
+    let saved = app.session.prefs().komaphone_view.clone();
+    if !saved.is_null() && !saved.is_object() {
+        log::warn!("Preferences: komaphoneView is not an object; using defaults");
+        return;
+    }
+    if let Some(collapsed) = saved.get("worldSidebarCollapsed").and_then(Value::as_bool) {
+        app.ui.world.sidebar_collapsed = collapsed;
+    }
+    if let Some(show_labels) = saved.get("worldShowPeerLabels").and_then(Value::as_bool) {
+        app.ui.world.show_peer_labels = show_labels;
     }
 }
 pub(crate) fn can_retry_unfinished(app: &PhotocraftApp) -> bool {
@@ -266,17 +310,24 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 ui.add_space(left);
                 ui.strong("Komaphone · Shared canvases");
                 let visual_enabled = !app.ui.world.has_stranded_draft();
+                let response =
+                    ui.add_enabled(visual_enabled, egui::Button::new("Workroom")).on_hover_text("Return to your drawing workroom with open drawings");
+                remember(ui, "world.return", &response);
+                remember(ui, "workspace.workroom", &response);
+                if response.clicked() && !app.ui.world.unfinished() {
+                    crate::komaphone_workspace::open_workroom(app);
+                }
                 let response = ui.add_enabled(visual_enabled, egui::Button::new("Local canvases"));
                 remember(ui, "world.local", &response);
                 if response.clicked() && !app.ui.world.unfinished() {
                     app.ui.world.open = false;
                     crate::komaphone_canvas::open(app);
                 }
-                let response = ui.add_enabled(visual_enabled, egui::Button::new("Party & drawings"));
-                remember(ui, "world.return", &response);
-                if response.clicked() && !app.ui.world.unfinished() {
-                    app.ui.world.open = false;
-                }
+                ui.separator();
+                let labels_resp = ui
+                    .checkbox(&mut app.ui.world.show_peer_labels, "Collaborator names")
+                    .on_hover_text("Show or hide name labels above collaborator cursors and live previews (local view only)");
+                remember(ui, "world.peerLabels", &labels_resp);
                 let (rect, response) = ui.allocate_exact_size(egui::vec2((ui.available_width() - right - 6.0).max(0.0), 32.0), Sense::click_and_drag());
                 ui.ctx().data_mut(|data| data.insert_temp(crate::titlebar::modal_drag_area_id(), rect));
                 if response.drag_started() && app.custom_titlebar {
@@ -288,22 +339,38 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
         });
     toolbar(app, ui);
-    panels::sidebar(app, ui);
     egui::Panel::bottom("world-status").exact_size(64.0).frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(5)).show(ui, |ui| {
-        ui.label(if app.ui.world.draft.is_some() { "Current stroke has not been saved".into() } else { app.session.worlds.status() });
+        ui.horizontal(|ui| {
+            if let Some(active) = app.session.worlds.active.as_ref() {
+                let scale = crate::komaphone_workspace::deep_canvas_scale_label(&active.viewer.camera);
+                let zoom_resp = ui.label(egui::RichText::new(&scale).size(12.0));
+                remember(ui, "world.zoom", &zoom_resp);
+                let dim_resp = ui
+                    .label(egui::RichText::new(crate::komaphone_workspace::UNBOUNDED_CANVAS_LABEL).color(tokens.text_dim).size(12.0))
+                    .on_hover_text("Deep-zoom canvas without fixed pixel dimensions");
+                remember(ui, "world.dimensions", &dim_resp);
+                ui.separator();
+            }
+            let status_text = if app.ui.world.draft.is_some() { "Current stroke has not been saved".into() } else { app.session.worlds.status() };
+            ui.add(egui::Label::new(&status_text).truncate()).on_hover_text(&status_text);
+        });
         if let Some(message) = app.ui.world.message.as_ref().or(app.session.worlds.error.as_ref()) {
-            ui.colored_label(tokens.danger, message);
+            ui.add(egui::Label::new(egui::RichText::new(message).color(tokens.danger)).truncate()).on_hover_text(message);
         } else if let Some(notice) = app.session.worlds.active.as_ref().and_then(|a| a.notice.as_ref()).or(app.session.worlds.notice.as_ref()) {
-            ui.label(notice);
+            ui.add(egui::Label::new(notice).truncate()).on_hover_text(notice);
         } else {
-            ui.label(
-                egui::RichText::new(
-                    "Wheel: zoom · Middle drag or Space: pan · Right-click: brush presets · Eraser and undo affect your device’s drawing layer",
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Wheel: zoom · Middle drag or Space: pan · Right-click: brush presets · Eraser and undo affect your device’s drawing layer",
+                    )
+                    .color(tokens.text_dim),
                 )
-                .color(tokens.text_dim),
+                .truncate(),
             );
         }
     });
+    panels::sidebar(app, ui);
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(tokens.canvas)).show(ui, |ui| {
         if !app.session.worlds.connected() {
             ui.centered_and_justified(|ui| {

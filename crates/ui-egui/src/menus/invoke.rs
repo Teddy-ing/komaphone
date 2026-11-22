@@ -195,16 +195,28 @@ fn invoke_file_commands(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, 
         }
         // Layer › Rename Layer from a menu starts in-place renaming in the Layers panel.
         "layer.renameLayer" if params.get("name").is_none() => {
+            if let Some(reason) = app.session.room_edit_refusal(id) {
+                return Err(reason);
+            }
             let st = app.session.active().ok_or("no document")?;
             let id = params.get("layer").and_then(Value::as_u64).or(st.active_layer.map(|l| l.0)).ok_or("no active layer")?;
-            let name = st.doc.layer(photocraft_doc::LayerId(id)).map(|l| l.name.clone()).ok_or("no such layer")?;
+            let layer = st.doc.layer(photocraft_doc::LayerId(id)).ok_or("no such layer")?;
+            if crate::doc_props_ui::is_background(&st.doc, layer) {
+                return Err("Locked Background layer cannot be renamed in place. Unlock or convert Background to a normal layer first.".into());
+            }
+            let name = layer.name.clone();
             // Another rename in progress is committed first (#314).
             if let Some((cmd, p)) = crate::layer_row_ui::start_rename(ctx, id, &name) {
                 app.run(&cmd, p)?;
             }
             Ok(Value::Null)
         }
-        "layer.duplicate" if params.as_object().is_none_or(|o| o.is_empty()) => crate::duplicate_layer_ui::open(app),
+        "layer.duplicate" if params.as_object().is_none_or(|o| o.is_empty()) => {
+            if let Some(reason) = app.session.room_edit_refusal(id) {
+                return Err(reason);
+            }
+            crate::duplicate_layer_ui::open(app)
+        }
         "file.new" if params.as_object().is_none_or(|o| o.is_empty()) => {
             let fields = app.new_document_fields();
             let d = app.ui.open_dialog(DialogKind::NewDocument, fields);
@@ -354,18 +366,27 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
             crate::smart_filter_dialog::open(app, layer, index).map(|id| json!({"dialog": id}))
         }
         "layer.layerStyle.blendingOptions" if params.as_object().is_none_or(|o| o.is_empty()) => {
+            if let Some(reason) = app.session.room_edit_refusal(id) {
+                return Err(reason);
+            }
             crate::layer_style::open(app, Some(crate::layer_style::BLENDING)).map(|d| json!({"dialog": d})).ok_or_else(|| "no active layer".to_string())
         }
         // Only interactive creation opens the Color Picker; it creates the layer on OK,
         // so Cancel leaves neither an orphan layer nor an undo/redo history entry.
         // Explicit parameters continue straight to the engine.
         "layer.newFillLayer.solidColor" if params.as_object().is_none_or(|o| o.is_empty()) => {
+            if let Some(reason) = app.session.room_edit_refusal(id) {
+                return Err(reason);
+            }
             let dialog = crate::solid_fill_ui::open_new(app).ok_or("no document is open")?;
             Ok(json!({"dialog": dialog}))
         }
         // Solid Color fills and solid-colour shapes use the Color Picker, Pattern fills the Pattern
         // Fill dialog; other adjustment / fill / shape controls use Properties.
         "layer.layerContentOptions" => {
+            if let Some(reason) = app.session.room_active_edit_refusal() {
+                return Err(reason);
+            }
             if let Some(dialog) = crate::solid_fill_ui::open(app).or_else(|| crate::shape_fill_ui::open(app)) {
                 return Ok(json!({"dialog": dialog}));
             }
@@ -375,12 +396,15 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
             let r = app.run(id, params)?;
             app.ui.panels.properties = true;
             app.ui.dock_tabs.properties = 0;
+            if app.ui.komaphone.enabled {
+                app.ui.komaphone.properties_open = true;
+            }
             Ok(r)
         }
         // Edit › Stroke…: open its full options dialog when called from menus/context
         // menus. Explicit params from Actions, CLI, MCP and control channel execute directly.
         crate::stroke_ui::COMMAND if params.as_object().is_none_or(|o| o.is_empty()) => {
-            if let Some(Err(why)) = photocraft_engine::commands::find(id).map(|c| (c.enabled)(&app.session)) {
+            if let Some(why) = app.session.disabled_reason(id) {
                 return Err(why);
             }
             Ok(json!({"dialog": crate::stroke_ui::open(app)}))
@@ -389,7 +413,7 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
         // New Group button): Photoshop's New Group dialog. Explicit params run the engine directly,
         // and Group Layers (⌘G) never asks.
         _ if crate::new_group_ui::fronts(id) && params.as_object().is_none_or(|o| o.is_empty()) => {
-            if let Some(Err(why)) = photocraft_engine::commands::find(id).map(|c| (c.enabled)(&app.session)) {
+            if let Some(why) = app.session.disabled_reason(id) {
                 return Err(why);
             }
             Ok(json!({"dialog": crate::new_group_ui::open(app, id)}))
@@ -420,6 +444,9 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
         // Layer › New Fill Layer › Pattern… from the menu: the Pattern Fill dialog (with params:
         // the engine directly).
         photocraft_engine::pattern_fill_cmds::CREATE if params.as_object().is_none_or(|o| o.is_empty()) => {
+            if let Some(reason) = app.session.room_edit_refusal(id) {
+                return Err(reason);
+            }
             Ok(json!({"dialog": crate::pattern_fill_ui::open_new(app)?}))
         }
         // Edit › Fill… from the menu or its shortcuts: the Fill dialog (with params: the engine).

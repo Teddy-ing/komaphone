@@ -135,7 +135,7 @@ fn layer_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui, layer: &Layer) {
 }
 
 /// Docked Properties body (Pro theme).
-pub(super) fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+pub(crate) fn properties_body(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let identity = app.session.active().map(|st| (st.doc.id, st.active_layer, app.ui.mask_target, app.ui.vector_mask_target, app.ui.properties_layer));
     ui.push_id(("properties-target", identity), |ui| properties_body_inner(app, ui));
 }

@@ -81,13 +81,6 @@ impl Workspace {
         self.frame(vec![]);
     }
 
-    fn replace_text(&mut self, name: &str, value: &str) {
-        self.click(name);
-        let modifiers = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
-        self.frame(vec![Event::ModifiersChanged(modifiers), Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers }]);
-        self.frame(vec![Event::ModifiersChanged(Default::default()), Event::Text(value.into())]);
-    }
-
     fn pixel(&self, x: i32, y: i32) -> [f32; 4] {
         let state = self.app.session.active().unwrap();
         let surface = state.doc.layer(state.active_layer.unwrap()).unwrap().surface().unwrap();
@@ -109,30 +102,67 @@ fn every_essential_tool_is_one_mouse_click_away_at_1280() {
 
 #[test]
 fn layer_buttons_preserve_real_undo_and_visibility() {
-    let mut workspace = Workspace::new();
-    let original_count = workspace.app.session.active().unwrap().doc.layer_count();
-    workspace.click("layer.new.layer");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layer_count(), original_count + 1);
-    workspace.click("layer.duplicate");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layer_count(), original_count + 2);
-    workspace.click("edit.undo");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layer_count(), original_count + 1);
-    workspace.click("edit.redo");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layer_count(), original_count + 2);
-    let layer = workspace.app.session.active().unwrap().active_layer.unwrap();
-    workspace.click(&format!("layer.visible.{}", layer.0));
-    assert!(!workspace.app.session.active().unwrap().doc.layer(layer).unwrap().visible);
-    workspace.click("edit.undo");
-    assert!(workspace.app.session.active().unwrap().doc.layer(layer).unwrap().visible);
-    workspace.click("layer.lock");
-    assert!(workspace.app.session.active().unwrap().doc.layer(layer).unwrap().locks.all);
-    workspace.click("layer.lock");
-    assert!(!workspace.app.session.active().unwrap().doc.layer(layer).unwrap().locks.any());
-    workspace.replace_text("layer.opacity", "50");
-    workspace.click("tool.Move");
-    assert!((workspace.app.session.active().unwrap().doc.layer(layer).unwrap().opacity - 0.5).abs() < 0.01);
-    workspace.click("layer.delete");
-    assert!(workspace.app.session.active().unwrap().doc.layer(layer).is_none());
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    let mut harness = native_harness(Default::default());
+    let original_count = harness.state().session.active().unwrap().doc.layer_count();
+    let new_layer = harness.get_by_label("Create a new layer").rect().center();
+    native_press(&mut harness, new_layer, true);
+    native_press(&mut harness, new_layer, false);
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.active().unwrap().doc.layer_count(), original_count + 1);
+
+    let first_added = harness.state().session.active().unwrap().active_layer.unwrap();
+    let row = photocraft_ui_egui::layer_row_ui::recorded(&harness.ctx).into_iter().find(|r| r.layer == first_added.0).expect("row drawn");
+    let new_layer = harness.get_by_label("Create a new layer").rect().center();
+    native_drag(&mut harness, row.row.center(), new_layer);
+    assert_eq!(harness.state().session.active().unwrap().doc.layer_count(), original_count + 2);
+
+    native_click(&mut harness, "edit.undo");
+    assert_eq!(harness.state().session.active().unwrap().doc.layer_count(), original_count + 1);
+    native_click(&mut harness, "edit.redo");
+    assert_eq!(harness.state().session.active().unwrap().doc.layer_count(), original_count + 2);
+
+    let layer = harness.state().session.active().unwrap().active_layer.unwrap();
+    let row = photocraft_ui_egui::layer_row_ui::recorded(&harness.ctx).into_iter().find(|r| r.layer == layer.0).expect("active row drawn");
+    let eye = egui::pos2(row.row.left() + 15.0, row.row.center().y);
+    native_press(&mut harness, eye, true);
+    native_press(&mut harness, eye, false);
+    harness.run_steps(3);
+    assert!(!harness.state().session.active().unwrap().doc.layer(layer).unwrap().visible);
+    native_click(&mut harness, "edit.undo");
+    assert!(harness.state().session.active().unwrap().doc.layer(layer).unwrap().visible);
+
+    harness.get_by_label("Lock all").click();
+    harness.run_steps(3);
+    assert!(harness.state().session.active().unwrap().doc.layer(layer).unwrap().locks.all);
+    harness.get_by_label("Lock all").click();
+    harness.run_steps(3);
+    assert!(!harness.state().session.active().unwrap().doc.layer(layer).unwrap().locks.any());
+
+    let opacity = harness
+        .query_all_by_role(egui::accesskit::Role::SpinButton)
+        .find(|node| node.accesskit_node().label().as_deref() == Some("Opacity") && node.rect().left() > 900.0)
+        .expect("Layers Opacity field")
+        .rect()
+        .center();
+    native_press(&mut harness, opacity, true);
+    native_press(&mut harness, opacity, false);
+    harness.run_steps(2);
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+    harness.event(Event::Text("50".into()));
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert!((harness.state().session.active().unwrap().doc.layer(layer).unwrap().opacity - 0.5).abs() < 0.01);
+
+    let trash = harness.get_by_label("Delete layer").rect().center();
+    native_press(&mut harness, trash, true);
+    native_press(&mut harness, trash, false);
+    harness.run_steps(3);
+    assert!(harness.state().session.active().unwrap().doc.layer(layer).is_some(), "trash click prompts before deleting layer");
+    harness.get_by_label("Delete").click();
+    harness.run_steps(3);
+    assert!(harness.state().session.active().unwrap().doc.layer(layer).is_none());
 }
 
 #[test]
@@ -150,8 +180,14 @@ fn advanced_roundtrip_keeps_document_and_tool_intact() {
 
 #[test]
 fn workspace_view_state_roundtrips_without_claiming_durability() {
-    let state =
-        komaphone_workspace::WorkspaceState { enabled: true, drafts_open: true, rename_layer: Some(27), rename_document: Some(2), layer_name: "Ink".into() };
+    let state = komaphone_workspace::WorkspaceState {
+        enabled: true,
+        drafts_open: true,
+        rename_layer: Some(27),
+        rename_document: Some(2),
+        layer_name: "Ink".into(),
+        properties_open: false,
+    };
     let value = serde_json::to_value(&state).unwrap();
     assert_eq!(serde_json::from_value::<komaphone_workspace::WorkspaceState>(value.clone()).unwrap(), state);
     assert!(value.get("saved").is_none());
@@ -420,17 +456,45 @@ fn import_button_decodes_selected_png_without_replacing_the_drawing() {
 
 #[test]
 fn layer_rename_and_reorder_work_with_mouse_controls() {
-    let mut workspace = Workspace::new();
-    workspace.click("layer.new.layer");
-    workspace.click("layer.new.layer");
-    let layer = workspace.app.session.active().unwrap().active_layer.unwrap();
-    workspace.click("layer.rename");
-    workspace.replace_text("layer.rename.text", "Foreground ink");
-    workspace.click("layer.rename.apply");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layer(layer).unwrap().name, "Foreground ink");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layers.last().unwrap().id, layer);
-    workspace.click("layer.arrange.sendBackward");
-    assert_ne!(workspace.app.session.active().unwrap().doc.layers.last().unwrap().id, layer);
-    workspace.click("layer.arrange.bringForward");
-    assert_eq!(workspace.app.session.active().unwrap().doc.layers.last().unwrap().id, layer);
+    use egui_kittest::kittest::Queryable;
+
+    let mut harness = native_harness(Default::default());
+    for _ in 0..2 {
+        let new_layer = harness.get_by_label("Create a new layer").rect().center();
+        native_press(&mut harness, new_layer, true);
+        native_press(&mut harness, new_layer, false);
+        harness.run_steps(3);
+    }
+    let layer = harness.state().session.active().unwrap().active_layer.unwrap();
+    let row = photocraft_ui_egui::layer_row_ui::recorded(&harness.ctx).into_iter().find(|r| r.layer == layer.0).expect("row drawn");
+    let name_pos = row.name.expect("layer name rect").center();
+    // Double-click the layer name in PhotoCraft's reused Layers panel to rename in place.
+    for _ in 0..40 {
+        harness.step();
+    }
+    for _ in 0..2 {
+        native_press(&mut harness, name_pos, true);
+        native_press(&mut harness, name_pos, false);
+    }
+    harness.run_steps(3);
+    harness.event(Event::Text("Foreground ink".into()));
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.active().unwrap().doc.layer(layer).unwrap().name, "Foreground ink");
+    assert_eq!(harness.state().session.active().unwrap().doc.layers.last().unwrap().id, layer);
+
+    // Drag the top row below the row underneath it to reorder in the document stack.
+    let rows = photocraft_ui_egui::layer_row_ui::recorded(&harness.ctx);
+    assert!(rows.len() >= 2);
+    let from = rows[0].row.center();
+    let below_second = egui::pos2(rows[1].row.center().x, rows[1].row.top() + rows[1].row.height() * 0.8);
+    native_drag(&mut harness, from, below_second);
+    assert_ne!(harness.state().session.active().unwrap().doc.layers.last().unwrap().id, layer);
+
+    // Drag it back above the top row.
+    let rows = photocraft_ui_egui::layer_row_ui::recorded(&harness.ctx);
+    let moved_row = rows.iter().find(|r| r.layer == layer.0).expect("moved row").row;
+    let above_top = egui::pos2(rows[0].row.center().x, rows[0].row.top() + rows[0].row.height() * 0.2);
+    native_drag(&mut harness, moved_row.center(), above_top);
+    assert_eq!(harness.state().session.active().unwrap().doc.layers.last().unwrap().id, layer);
 }

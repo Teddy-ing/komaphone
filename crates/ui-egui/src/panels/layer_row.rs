@@ -146,16 +146,20 @@ pub(super) fn layer_row(
         crate::mask_thumbs_ui::forget(ctx, l.id.0);
     }
     // A drag from a mask's thumbnail drags that mask, not the layer (#3113, #3119).
-    let mask_drag = starts_mask_drag(ctx, l, &resp);
+    let room_refusal = app.session.room_active_edit_refusal();
+    let editable = room_refusal.is_none();
+    let mask_drag = if editable { starts_mask_drag(ctx, l, &resp) } else { None };
     if let Some(kind) = mask_drag {
         ctx.data_mut(|d| d.insert_temp::<MaskDrag>(mask_drag_key(), (l.id.0, kind)));
     }
     let mask_drag = mask_drag.is_some();
-    layer_drag_and_drop(app, ctx, ui, l, rect, &resp, actions);
-    fx_drop(ctx, ui, l, rect, actions);
-    crate::smart_ui::drop_on_row(ctx, ui, l, rect, actions);
-    if resp.drag_started() && !mask_drag {
-        crate::layer_transfer::begin_from_panel(app, ctx, l.id);
+    if editable {
+        layer_drag_and_drop(app, ctx, ui, l, rect, &resp, actions);
+        fx_drop(ctx, ui, l, rect, actions);
+        crate::smart_ui::drop_on_row(ctx, ui, l, rect, actions);
+        if resp.drag_started() && !mask_drag {
+            crate::layer_transfer::begin_from_panel(app, ctx, l.id);
+        }
     }
     // Rows are painted: name them for screen readers and UI tests.
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, &l.name));
@@ -172,6 +176,7 @@ pub(super) fn layer_row(
     }
     paint_row_background(&painter, &t, l, rect, selected, is_hovered);
     let mut x = rect.left() + 6.0;
+    // The visibility icon: eye toggle (⌥ shows only this layer), sweep-drag and its colour menu.
     let eye_resp = eye_column(app, ui, l, row, rect, actions);
     // Everything but the thumbnails, the indentation and the name, so a narrow panel squeezes
     // the indentation first, then the thumbnails (a layer with two masks has three).
@@ -206,17 +211,27 @@ pub(super) fn layer_row(
     let (name_right, indicators, fx_toggled) = crate::layer_row_ui::indicators(ui, &painter, rect, x, l, fx_open, actions);
     // Dragging the fx badge drags all the layer's effects, not the layer (Photoshop). Like the eye,
     // it takes the drag from the row; clicks still reach the row.
-    if let Some(&(_, badge)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Fx)
+    if editable
+        && let Some(&(_, badge)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Fx)
         && ui.interact(badge, ui.scope_id().with(("fx-badge", l.id.0)), Sense::drag()).drag_started()
     {
         start_fx_drag(ctx, l.id, None);
     }
     // Clicking the lock icon unlocks the layer, and makes the Background a normal one (Photoshop,
     // #4723). It takes the click from the row, so the row isn't selected.
-    if let Some(&(_, lock)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Lock)
-        && ui.interact(lock, ui.scope_id().with(("row-lock", l.id.0)), Sense::click()).clicked()
-    {
-        actions.push(simple_lock_toggle(doc.is_background(l.id), l, &json!({"layer": l.id.0})));
+    if let Some(&(_, lock)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Lock) {
+        let lock_resp = ui.interact(lock, ui.scope_id().with(("row-lock", l.id.0)), Sense::click());
+        if lock_resp.clicked() {
+            if let Some(reason) = &room_refusal {
+                app.ui.status = reason.clone();
+                app.ui.status_error = true;
+            } else {
+                actions.push(simple_lock_toggle(doc.is_background(l.id), l, &json!({"layer": l.id.0})));
+            }
+        }
+        if let Some(reason) = &room_refusal {
+            lock_resp.on_hover_text(reason);
+        }
     }
     let name_rect = paint_row_name(&painter, &t, &rc, x, name_right);
     crate::layer_row_ui::record(
@@ -250,9 +265,21 @@ pub(super) fn layer_row(
         crate::mask_thumbs_ui::click_command(l, kind, m)
     });
     if let Some(p) = thumb_load {
-        actions.push(("select.loadSelection".into(), p));
+        if let Some(reason) = &room_refusal {
+            app.ui.status = reason.clone();
+            app.ui.status_error = true;
+        } else {
+            actions.push(("select.loadSelection".into(), p));
+        }
     } else if let Some(cmd) = mask_toggle {
-        actions.push(cmd);
+        if let Some(reason) = &room_refusal
+            && cmd.0 != photocraft_engine::mask_view_cmds::ID
+        {
+            app.ui.status = reason.clone();
+            app.ui.status_error = true;
+        } else {
+            actions.push(cmd);
+        }
     } else if resp.clicked() && !eye_resp.clicked() && !toggled && !fx_toggled && !masks.clicked {
         select_row_on_click(app, ui, &rc, actions);
     }
@@ -323,6 +350,8 @@ fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Re
 fn eye_column(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, row: RowSel, rect: Rect, actions: &mut Vec<(String, Value)>) -> egui::Response {
     let ctx = &ui.ctx().clone();
     let t = Tokens::get(ctx);
+    let room_refusal = app.session.room_active_edit_refusal();
+    let editable = room_refusal.is_none();
     let selected = row.selected;
     let eye_cell = eye_cell(rect);
     // The whole eye column takes drags too (so a drag starting on it never reorders the row): dragging down
@@ -331,16 +360,25 @@ fn eye_column(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, row: RowSel
     // A hidden layer's eye box is left empty (still clickable; the whole column takes the click, #8467).
     if l.visible {
         // Centre the drawing in the column while preserving the visibility hit area.
-        icons::paint(ui, eye_cell, "eye", 15.0, t.layer_label_icon(l.label));
+        let tint = if editable { t.layer_label_icon(l.label) } else { t.text_faint };
+        icons::paint(ui, eye_cell, "eye", 15.0, tint);
     }
-    eye_sweep(ctx, l, rect, &eye_resp, actions);
+    if editable {
+        eye_sweep(ctx, l, rect, &eye_resp, actions);
+    }
     if eye_resp.clicked() {
-        // ⌥-click shows only this layer; ⌥-click it again to restore the others.
-        if ui.input(|i| i.modifiers.alt) {
+        if let Some(reason) = &room_refusal {
+            app.ui.status = reason.clone();
+            app.ui.status_error = true;
+        } else if ui.input(|i| i.modifiers.alt) {
+            // ⌥-click shows only this layer; ⌥-click it again to restore the others.
             actions.push(("layer.showOnly".into(), json!({"layer": l.id.0})));
         } else {
             actions.push(("layer.setProps".into(), json!({"layer": l.id.0, "visible": !l.visible})));
         }
+    }
+    if let Some(reason) = &room_refusal {
+        eye_resp.clone().on_hover_text(reason);
     }
     eye_resp.context_menu(|ui| {
         crate::widgets::style_spectrum_popup_menu(ui);
@@ -454,6 +492,11 @@ fn select_row_on_click(app: &mut PhotocraftApp, ui: &egui::Ui, rc: &RowCtx<'_>, 
 fn handle_row_double_click(app: &mut PhotocraftApp, ctx: &egui::Context, rc: &RowCtx<'_>, name_rect: Option<Rect>, actions: &mut Vec<(String, Value)>) {
     let (l, doc, resp, masks, ts, thumb, rect) = (rc.l, rc.doc, rc.resp, rc.masks, rc.ts, rc.thumb, rc.rect);
     if resp.double_clicked() {
+        if let Some(reason) = app.session.room_active_edit_refusal() {
+            app.ui.status = reason;
+            app.ui.status_error = true;
+            return;
+        }
         let pos = resp.interact_pointer_pos();
         let on = |r: Rect| pos.is_some_and(|p| r.expand(2.0).contains(p));
         if crate::doc_props_ui::is_background(doc, l) {
@@ -485,6 +528,9 @@ fn handle_row_double_click(app: &mut PhotocraftApp, ctx: &egui::Context, rc: &Ro
             if crate::menus::is_enabled(app, id) {
                 // Null params: run like the menu item, dialog included.
                 actions.push((id.into(), Value::Null));
+            } else if let Some(reason) = crate::enable_rules::disabled_reason(app, id) {
+                app.ui.status = reason;
+                app.ui.status_error = true;
             }
         }
     }

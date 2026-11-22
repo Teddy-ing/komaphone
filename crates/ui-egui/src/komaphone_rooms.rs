@@ -84,7 +84,7 @@ pub(crate) fn button(app: &mut PhotocraftApp, ui: &mut egui::Ui, label: &str, id
     if response.clicked() {
         run(app, id, params);
         if id == "komaphone.room.openDraft" {
-            app.ui.rooms.open = false;
+            crate::komaphone_workspace::open_workroom(app);
         }
     }
 }
@@ -100,11 +100,21 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
         .default_height(560.0)
         .max_height(640.0)
         .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Private games for two or three players").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let response = ui.button("Workroom").on_hover_text("Return to your drawing workroom with open drawings");
+                    crate::komaphone_workspace::remember(ui, "workspace.return", &response);
+                    crate::komaphone_workspace::remember(ui, "rooms.workroom", &response);
+                    if response.clicked() {
+                        crate::komaphone_workspace::open_workroom(app);
+                    }
+                });
+            });
+            ui.label("Your local drawings stay saved when the service is unavailable.");
+            ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let tokens = Tokens::get(ctx);
-                ui.label(RichText::new("Private games for two or three players").strong());
-                ui.label("Your local drawings stay saved when the service is unavailable.");
-                ui.separator();
                 connection(app, ui);
                 let status = app.session.rooms.status.clone();
                 let submission_error = app.session.rooms.submission_error().map(str::to_owned);
@@ -131,12 +141,6 @@ pub fn window(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     room_view(app, ui, &room);
                 } else if status.paired {
                     create_join(app, ui);
-                }
-                ui.separator();
-                let response = ui.button("Return to drawing");
-                crate::komaphone_workspace::remember(ui, "workspace.return", &response);
-                if response.clicked() {
-                    app.ui.rooms.open = false;
                 }
             });
         });

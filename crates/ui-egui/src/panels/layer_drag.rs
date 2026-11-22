@@ -92,6 +92,9 @@ pub(super) fn layer_drag_and_drop(
     resp: &egui::Response,
     actions: &mut Vec<(String, Value)>,
 ) {
+    if app.session.room_active_edit_refusal().is_some() {
+        return;
+    }
     let t = Tokens::get(ctx);
     let key = egui::Id::unique("layer-drag");
     // A drag from the mask thumbnail (`starts_mask_drag`) moves the mask, not the layer.
@@ -195,8 +198,12 @@ pub(super) fn layer_drop_zone(
     position: &'static str,
     actions: &mut Vec<(String, Value)>,
 ) {
+    if app.session.room_active_edit_refusal().is_some() {
+        return;
+    }
     let Some(dragged) = ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))) else { return };
-    let selected = app.session.active().map(|st| st.selected_layers()).unwrap_or_default();
+    let Some(st) = app.session.active() else { return };
+    let selected = st.selected_layers();
     if target.0 == LayerId(dragged) && selected.len() > 1 && selected.contains(&target.0) {
         return;
     }
@@ -204,13 +211,15 @@ pub(super) fn layer_drop_zone(
     if !zone.contains(p) {
         return;
     }
+    let copy = ctx.input(|i| i.modifiers.alt);
+    let mut payload = layer_drop_payload(dragged, target.0, position, &selected);
+    if background_drop_refused(&st.doc, &payload, target.0, position, copy) {
+        return;
+    }
     let t = Tokens::get(ctx);
     let line = if position == "above" { [target.1.left_top(), target.1.right_top()] } else { [target.1.left_bottom(), target.1.right_bottom()] };
     ui.painter().line_segment(line, Stroke::new(2.0, t.accent));
-    let mut payload = layer_drop_payload(dragged, target.0, position, &selected);
-    if ctx.input(|i| i.modifiers.alt)
-        && let Some(o) = payload.as_object_mut()
-    {
+    if copy && let Some(o) = payload.as_object_mut() {
         o.insert("copy".into(), json!(true));
     }
     if ctx.input(|i| i.pointer.any_released()) {
@@ -301,6 +310,8 @@ pub(super) fn fx_drop(ctx: &egui::Context, ui: &egui::Ui, l: &Layer, rect: Rect,
 /// Photoshop shows a layer's effects as indented sub-rows ("Effects", then each effect). The eye
 /// on "Effects" shows or hides them all, the eye on an effect's row just that one (#1622).
 pub(super) fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth: usize, actions: &mut Vec<(String, Value)>) {
+    let room_refusal = app.session.room_active_edit_refusal();
+    let editable = room_refusal.is_none();
     let t = Tokens::get(ui.ctx());
     let indent = 30.0 + depth as f32 * 14.0 + 34.0;
     // English `Effect::label` keys stay for kind matching; display goes through `tl!` (catalogs
@@ -313,7 +324,7 @@ pub(super) fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer,
     for (i, (name, on, kind)) in rows.into_iter().enumerate() {
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
         // Drag the row onto another layer to move its effects there, ⌥-drag to copy them.
-        if resp.drag_started() {
+        if editable && resp.drag_started() {
             start_fx_drag(ui.ctx(), l.id, i.checked_sub(1));
         }
         if !ui.is_rect_visible(rect) {
@@ -329,16 +340,25 @@ pub(super) fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer,
         let eye = Rect::from_min_size(pos2(rect.left() + 36.0, rect.center().y - 9.0), vec2(18.0, 18.0));
         // A hidden effect's eye box is left empty (still clickable), like a hidden layer's.
         if on {
-            icons::paint(ui, eye, "eye", 12.0, t.icon);
+            icons::paint(ui, eye, "eye", 12.0, if editable { t.icon } else { t.text_faint });
         }
         // The whole eye column of the row takes the click, so it never opens the Layer Style dialog.
         let eye_cell = Rect::from_min_max(pos2(rect.left() + 30.0, rect.top()), pos2((rect.left() + 58.0).min(rect.right()), rect.bottom()));
-        if ui.interact(eye_cell, ui.scope_id().with(("fx-eye", l.id.0, i)), Sense::click()).clicked() {
-            let mut params = json!({"layer": l.id.0, "visible": !on});
-            if let (Some(index), Some(o)) = (i.checked_sub(1), params.as_object_mut()) {
-                o.insert("index".into(), json!(index));
+        let eye_resp = ui.interact(eye_cell, ui.scope_id().with(("fx-eye", l.id.0, i)), Sense::click());
+        if eye_resp.clicked() {
+            if let Some(reason) = &room_refusal {
+                app.ui.status = reason.clone();
+                app.ui.status_error = true;
+            } else {
+                let mut params = json!({"layer": l.id.0, "visible": !on});
+                if let (Some(index), Some(o)) = (i.checked_sub(1), params.as_object_mut()) {
+                    o.insert("index".into(), json!(index));
+                }
+                actions.push(("layer.setEffectsVisible".into(), params));
             }
-            actions.push(("layer.setEffectsVisible".into(), params));
+        }
+        if let Some(reason) = &room_refusal {
+            eye_resp.on_hover_text(reason);
         }
         let x = rect.left() + indent + if i == 0 { 8.0 } else { 24.0 };
         if i == 0 {
@@ -354,9 +374,14 @@ pub(super) fn effect_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer,
             egui::FontId::proportional(11.5),
             if on { t.text_dim } else { t.text_faint },
         );
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name.clone()));
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, editable, name.clone()));
         if resp.double_clicked() {
-            crate::layer_style::open_for_layer(app, l.id, kind);
+            if let Some(reason) = &room_refusal {
+                app.ui.status = reason.clone();
+                app.ui.status_error = true;
+            } else {
+                crate::layer_style::open_for_layer(app, l.id, kind);
+            }
         }
         // #2846: right-click opens the layer style menu (Create Layer, Copy Layer Style…), as in Photoshop.
         resp.context_menu(|ui| {

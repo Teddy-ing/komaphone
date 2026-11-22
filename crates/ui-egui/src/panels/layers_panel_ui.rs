@@ -29,7 +29,12 @@ pub fn restore_options(app: &mut PhotocraftApp) {
 
 /// The real menu command dispatcher handles rename's in-place editor and other shell routing.
 pub fn run_menu_command(app: &mut PhotocraftApp, ui: &mut Ui, label: &str, id: &str) {
-    if ui.add_enabled(app.session.is_enabled(id), egui::Button::new(label)).clicked() {
+    let enabled = crate::menus::is_enabled(app, id);
+    let mut resp = ui.add_enabled(enabled, egui::Button::new(label));
+    if !enabled && let Some(reason) = crate::enable_rules::disabled_reason(app, id) {
+        resp = resp.on_disabled_hover_text(reason);
+    }
+    if resp.clicked() {
         let ctx = ui.ctx().clone();
         if let Err(e) = crate::menus::invoke(app, &ctx, id, json!({})) {
             app.ui.status = e;

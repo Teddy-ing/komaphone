@@ -17,6 +17,10 @@ pub struct WorkspaceState {
     pub rename_layer: Option<u64>,
     pub rename_document: Option<u64>,
     pub layer_name: String,
+    /// On-demand Layer Properties window for adjustment/fill/mask controls opened from the
+    /// reused PhotoCraft Layers panel without expanding Komaphone into the full Advanced dock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub properties_open: bool,
 }
 
 /// Tools deliberately visible without a flyout or a keyboard shortcut.
@@ -124,6 +128,9 @@ pub fn home(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 /// Draws curated chrome around the unmodified document canvas. Call once before the central
 /// canvas panel. Shared dialogs, brush pickers and editor overlays still render afterward.
 pub fn chrome(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    if ui.ctx().data(|data| data.get_temp::<Tokens>(egui::Id::unique("photocraft-theme"))).is_none() {
+        PhotocraftApp::setup_context(ui.ctx(), app.ui.theme);
+    }
     header(app, ui);
     if app.ui.gallery.open {
         crate::komaphone_rooms::window(app, ui.ctx());
@@ -138,6 +145,7 @@ pub fn chrome(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     tools(app, ui);
     sidebar(app, ui);
     drafts_window(app, ui.ctx());
+    properties_window(app, ui.ctx());
     crate::komaphone_rooms::window(app, ui.ctx());
 }
 
@@ -159,6 +167,44 @@ pub fn advanced_return(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     );
 }
 
+/// Explicit dimension label for deep-zoom continuous canvases that have no fixed pixel bounds.
+pub(crate) const UNBOUNDED_CANVAS_LABEL: &str = "Unbounded canvas";
+
+/// Accurate scale readout for deep-zoom continuous canvases, retaining exact depth semantics
+/// (`100^depth * zoom`) without inventing finite full-world dimensions or misleading percentages.
+pub(crate) fn deep_canvas_scale_label(camera: &photocraft_engine::scene::Camera) -> String {
+    let scale = camera.zoom * 100.0_f64.powi(i32::from(camera.region.depth));
+    if !scale.is_finite() || scale <= 0.0 {
+        return "Scale unavailable".into();
+    }
+    if scale < 100_000.0 { format!("Zoom {scale:.2}×") } else { format!("Zoom {scale:.1e}×") }
+}
+
+/// Return directly to the Komaphone drawing workroom from Gallery, Canvases, Shared canvases,
+/// Party/Private room, or Reveal without creating a new draft, altering open tabs/selection/unsaved
+/// work, or changing phase/assignment restrictions. Refuses cleanly while a continuous-canvas
+/// stroke is still uncommitted.
+pub fn open_workroom(app: &mut PhotocraftApp) -> bool {
+    if app.ui.world.open && app.ui.world.unfinished() {
+        app.ui.world.message = Some("Save or retry the unfinished stroke before returning to the workroom.".into());
+        return false;
+    }
+    if app.ui.canvas.open && app.ui.canvas.has_uncommitted_drawing() {
+        app.ui.canvas.message = Some("Save the unfinished local stroke before returning to the workroom.".into());
+        return false;
+    }
+    if app.ui.canvas.open && app.session.canvases.flight.is_some() {
+        let _ = app.run("komaphone.canvas.flight", json!({"state":"cancel"}));
+    }
+    app.ui.world.open = false;
+    app.ui.canvas.open = false;
+    app.ui.gallery.open = false;
+    app.ui.rooms.open = false;
+    app.ui.rooms.view_reveal = false;
+    app.ui.komaphone.enabled = true;
+    true
+}
+
 fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
     let (caption_left, caption_right) = crate::titlebar::reserved(app, ui.ctx());
@@ -167,26 +213,27 @@ fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(egui::Margin::symmetric(10, 0)))
         .show(ui, |ui| {
             let full = ui.max_rect();
+            crate::zoom_field::set_title_bar_rect(ui.ctx(), full);
             ui.horizontal_centered(|ui| {
                 ui.add_space(caption_left);
                 ui.strong("Komaphone");
                 ui.separator();
-                let response = ui.button("Private room");
+                let in_workroom = !app.ui.gallery.open && !crate::komaphone_game_view::has_reveal(app);
+                let response = ui.add(egui::Button::new("Workroom").selected(in_workroom)).on_hover_text("Return to your drawing workroom with open drawings");
+                remember(ui, "workspace.workroom", &response);
+                if response.clicked() {
+                    open_workroom(app);
+                }
+                let response = ui.add(egui::Button::new("Private room").selected(app.ui.rooms.open));
                 remember(ui, "workspace.room", &response);
                 if response.clicked() {
                     app.ui.rooms.open = true;
                 }
-                let response = ui.button("New drawing");
-                remember(ui, "komaphone.project.new", &response);
-                if response.clicked() {
-                    project_command(app, "komaphone.project.new", json!({}));
-                }
-                let response = ui.button("Gallery");
+                let response = ui.add(egui::Button::new("Gallery").selected(app.ui.gallery.open));
                 remember(ui, "workspace.gallery", &response);
                 if response.clicked() {
                     crate::komaphone_gallery::open(app);
                 }
-                command(app, ui, "Import image", "file.placeEmbedded", json!({}));
                 let response = ui.button("Canvases");
                 remember(ui, "workspace.canvases", &response);
                 if response.clicked() {
@@ -197,6 +244,18 @@ fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if response.clicked() {
                     crate::komaphone_world::open(app);
                 }
+                ui.separator();
+                let response = ui.button("New drawing");
+                remember(ui, "komaphone.project.new", &response);
+                if response.clicked() {
+                    match app.run("komaphone.project.new", json!({})) {
+                        Ok(_) => {
+                            open_workroom(app);
+                        }
+                        Err(error) => app.ui.status = error,
+                    }
+                }
+                command(app, ui, "Import image", "file.placeEmbedded", json!({}));
                 ui.separator();
                 command(app, ui, "Undo", "edit.undo", json!({}));
                 command(app, ui, "Redo", "edit.redo", json!({}));
@@ -261,16 +320,8 @@ fn brush_options(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 }
 
 fn percent(ui: &mut egui::Ui, value: &mut f32) -> bool {
-    percent_control(ui, value, None)
-}
-
-fn percent_control(ui: &mut egui::Ui, value: &mut f32, name: Option<&str>) -> bool {
     let mut percentage = *value * 100.0;
-    let response = ui.add(egui::DragValue::new(&mut percentage).range(0.0..=100.0).speed(1.0).suffix("%"));
-    if let Some(name) = name {
-        remember(ui, name, &response);
-    }
-    let changed = response.changed();
+    let changed = ui.add(egui::DragValue::new(&mut percentage).range(0.0..=100.0).speed(1.0).suffix("%")).changed();
     if changed {
         *value = percentage / 100.0;
     }
@@ -306,11 +357,12 @@ fn tools(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 
 fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
+    let margin = crate::widgets::body_margin(tokens.pro);
     egui::Panel::right("komaphone-sidebar")
         .default_size(300.0)
-        .min_size(280.0)
-        .max_size(320.0)
-        .frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(egui::Margin::same(10)))
+        .min_size(260.0)
+        .max_size(360.0)
+        .frame(egui::Frame::NONE.fill(tokens.chrome).inner_margin(margin))
         .show(ui, |ui| {
             egui::CollapsingHeader::new("Colors").default_open(true).show(ui, |ui| {
                 ui.data_mut(|data| data.insert_temp(panels::color_field_fill_id(), 160.0));
@@ -323,101 +375,63 @@ fn sidebar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 }
 
 fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    ui.strong("Layers");
-    ui.horizontal_wrapped(|ui| {
-        command(app, ui, "Add", "layer.new.layer", json!({"name":"Layer"}));
-        command(app, ui, "Duplicate", "layer.duplicate", json!({"inPlace":true}));
-        command(app, ui, "Delete", "layer.delete", json!({}));
-    });
-    let Some(state) = app.session.active() else {
-        ui.label("Create or reopen a drawing to begin.");
-        return;
-    };
-    let document = state.doc.clone();
-    let active = state.active_layer;
-    if let Some(layer) = active.and_then(|id| document.layer(id)) {
-        ui.horizontal(|ui| {
-            ui.label("Opacity");
-            let mut opacity = layer.opacity;
-            if percent_control(ui, &mut opacity, Some("layer.opacity")) {
-                project_command(app, "layer.setProps", json!({"layer":layer.id.0,"opacity":opacity}));
-            }
-            let mut locked = layer.locks.any();
-            let response = ui.checkbox(&mut locked, "Lock");
-            remember(ui, "layer.lock", &response);
-            if response.changed() {
-                if !locked && crate::doc_props_ui::is_background(&document, layer) {
-                    project_command(app, "layer.new.layerFromBackground", json!({}));
-                    return;
-                }
-                let locks =
-                    if locked { json!({"all":true}) } else { json!({"all":false,"pixels":false,"position":false,"transparency":false,"artboard":false}) };
-                project_command(app, "layer.setProps", json!({"layer":layer.id.0,"locks":locks}));
-            }
-        });
-        ui.horizontal(|ui| {
-            command(app, ui, "Up", "layer.arrange.bringForward", json!({}));
-            command(app, ui, "Down", "layer.arrange.sendBackward", json!({}));
-            let response = ui.button("Rename");
-            remember(ui, "layer.rename", &response);
-            if response.clicked() {
-                app.ui.komaphone.rename_layer = Some(layer.id.0);
-                app.ui.komaphone.rename_document = Some(document.id.0);
-                app.ui.komaphone.layer_name = layer.name.clone();
-            }
-        });
-    }
-    rename(app, ui);
-    egui::ScrollArea::vertical().id_salt("komaphone-layers-scroll").auto_shrink([false, false]).show(ui, |ui| {
-        for (depth, layer) in panels::layer_tree_ui::display_rows(&document, true) {
-            ui.push_id(layer.id.0, |ui| {
-                ui.horizontal(|ui| {
-                    let mut visible = layer.visible;
-                    let response = ui.checkbox(&mut visible, "").on_hover_text("Show layer");
-                    remember(ui, &format!("layer.visible.{}", layer.id.0), &response);
-                    if response.changed() {
-                        project_command(app, "layer.setProps", json!({"layer":layer.id.0,"visible":visible}));
-                    }
-                    ui.add_space((depth.min(8) * 8) as f32);
-                    let label = if layer.locks.any() { format!("{}  (locked)", layer.name) } else { layer.name.clone() };
-                    let response = ui.add(egui::Button::selectable(active == Some(layer.id), label).truncate());
-                    remember(ui, &format!("layer.select.{}", layer.id.0), &response);
-                    if response.clicked() {
-                        project_command(app, "layer.select", json!({"layer":layer.id.0}));
-                    }
-                    if response.double_clicked() {
-                        app.ui.komaphone.rename_layer = Some(layer.id.0);
-                        app.ui.komaphone.rename_document = Some(document.id.0);
-                        app.ui.komaphone.layer_name = layer.name.clone();
-                    }
-                });
+    let tokens = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.strong(tl!("Layers"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let menu_btn = crate::widgets::panel_menu_button(ui);
+            remember(ui, "layers.menu", &menu_btn);
+            egui::Popup::menu(&menu_btn).show(|ui| {
+                crate::widgets::style_spectrum_popup_menu(ui);
+                ui.set_min_width(190.0);
+                panels::layer_row_ui::panel_menu(app, ui);
             });
-        }
+        });
+    });
+    if let Some(reason) = app.session.room_active_edit_refusal() {
+        egui::Frame::NONE.fill(tokens.field).corner_radius(tokens.radius_sm).inner_margin(egui::Margin::symmetric(8, 5)).show(ui, |ui| {
+            ui.label(RichText::new(reason).small().color(tokens.text_dim));
+        });
+        ui.add_space(4.0);
+    }
+    if app.session.active().is_none() {
+        ui.label(RichText::new("Create or reopen a drawing to begin.").color(tokens.text_dim));
+        return;
+    }
+    ui.scope(|ui| {
+        // Match PhotoCraft's dock body spacing so layer rows, Blend/Opacity/Fill and the footer
+        // lay out identically in both Pro and Studio themes.
+        ui.spacing_mut().item_spacing.y = if tokens.pro { 0.0 } else { 6.0 };
+        panels::layers(app, ui);
     });
 }
 
-fn rename(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
-    let Some(layer) = app.ui.komaphone.rename_layer else { return };
-    if app.session.active().map(|state| state.doc.id.0) != app.ui.komaphone.rename_document {
-        app.ui.komaphone.rename_layer = None;
-        app.ui.komaphone.rename_document = None;
+fn properties_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if !app.ui.komaphone.properties_open {
         return;
     }
-    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.komaphone.layer_name).hint_text("Layer name").desired_width(ui.available_width()));
-    remember(ui, "layer.rename.text", &response);
-    ui.horizontal(|ui| {
-        let apply = ui.button("Apply name");
-        remember(ui, "layer.rename.apply", &apply);
-        if apply.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))) {
-            let name = app.ui.komaphone.layer_name.clone();
-            if app.run("layer.setProps", json!({"layer":layer,"name":name})).is_ok() {
-                app.ui.komaphone.rename_layer = None;
-            }
-        }
-        if ui.button("Cancel").clicked() {
-            app.ui.komaphone.rename_layer = None;
-        }
-    });
+    if app.session.active().is_none() {
+        app.ui.komaphone.properties_open = false;
+        return;
+    }
+    let mut open = true;
+    let content = ctx.content_rect();
+    let default_pos = egui::pos2((content.right() - 600.0).max(120.0), (content.top() + 92.0).max(56.0));
+    egui::Window::new(tl!("Layer Properties"))
+        .id(egui::Id::unique("komaphone-layer-properties"))
+        .open(&mut open)
+        .default_pos(default_pos)
+        .default_width(280.0)
+        .min_width(240.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                panels::properties_body(app, ui);
+            });
+        });
+    if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        open = false;
+    }
+    app.ui.komaphone.properties_open = open;
 }
 
 /// A local acknowledgment describes completed edits, never an in-progress preview. Keeping
@@ -456,23 +470,54 @@ fn footer(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         ui,
         |ui| {
             ui.horizontal(|ui| {
-                if let Some(document) = app.session.active() {
-                    let id = document.doc.id;
+                let show_doc_metrics = !crate::komaphone_game_view::has_reveal(app);
+                if let Some((id, dims)) = app
+                    .session
+                    .active()
+                    .map(|document| (document.doc.id, crate::chrome_ui::document_dimensions_text(&document.doc, &app.session.prefs().units_and_rulers)))
+                {
+                    if show_doc_metrics {
+                        if let Some(field) = crate::chrome_ui::active_zoom_field(app, ui, 64.0) {
+                            remember(ui, "workspace.zoom", &field);
+                        }
+                        ui.add_space(6.0);
+                        let dim_text = tl!(&dims);
+                        let dim_resp = ui.add(egui::Label::new(RichText::new(dim_text).color(tokens.text_dim).size(12.0)).truncate()).on_hover_text(dim_text);
+                        remember(ui, "workspace.dimensions", &dim_resp);
+                        ui.separator();
+                    }
                     let status = local_save_label(app);
-                    ui.add(egui::Label::new(&status).truncate()).on_hover_text(&status);
-                    ui.separator();
-                    ui.label(RichText::new(app.session.room_sync_label(id)).color(tokens.text_dim));
-                    if (app.session.local_projects.status(id).error.is_some() || app.session.local_projects.error.is_some())
-                        && ui.button("Retry save").clicked()
-                    {
-                        project_command(app, "komaphone.project.retry", json!({}));
+                    let sync_label = app.session.room_sync_label(id);
+                    let has_retry = app.session.local_projects.status(id).error.is_some() || app.session.local_projects.error.is_some();
+                    let hint = "Wheel: zoom · Space + drag: pan";
+                    let hint_reserve = 220.0;
+                    // Keep narrow layouts and high DPI free of overlap by bounding left status text
+                    // before placing the right-aligned navigation hint.
+                    let show_hint = ui.available_width() >= hint_reserve + 180.0;
+                    let left_budget = if show_hint { (ui.available_width() - hint_reserve).max(60.0) } else { ui.available_width().max(60.0) };
+                    ui.allocate_ui_with_layout(egui::vec2(left_budget, ui.spacing().interact_size.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(&status).truncate()).on_hover_text(&status);
+                        if has_retry && ui.button("Retry save").clicked() {
+                            project_command(app, "komaphone.project.retry", json!({}));
+                        }
+                        if ui.available_width() >= 70.0 {
+                            ui.separator();
+                            ui.add(egui::Label::new(RichText::new(sync_label).color(tokens.text_dim)).truncate()).on_hover_text(sync_label);
+                        }
+                    });
+                    if show_hint {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(hint).color(tokens.text_dim));
+                        });
                     }
                 } else {
-                    ui.label("Your local drawings stay on this computer.");
+                    ui.add(egui::Label::new("Your local drawings stay on this computer.").truncate());
+                    if ui.available_width() >= 220.0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Wheel: zoom · Space + drag: pan").color(tokens.text_dim));
+                        });
+                    }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("Wheel: zoom · Space + drag: pan").color(tokens.text_dim));
-                });
             });
             if !app.ui.status.is_empty() {
                 ui.add(egui::Label::new(RichText::new(&app.ui.status).small().color(tokens.text_dim)).truncate()).on_hover_text(&app.ui.status);
@@ -526,7 +571,11 @@ fn drafts_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         }
                         ui.vertical(|ui| {
                             ui.strong(title);
-                            ui.small(format!("Revision {revision} · {date}"));
+                            let formatted = crate::komaphone_time::format_compact(&date);
+                            let response = ui.small(format!("Revision {revision} · {}", formatted.display));
+                            if let Some(tooltip) = &formatted.tooltip {
+                                response.on_hover_text(tooltip);
+                            }
                         });
                     });
                     ui.separator();
