@@ -41,11 +41,14 @@ pub struct GalleryUi {
     pub looping: bool,
     pub replay_speed: f32,
     pub name: String,
+    pub export_name: String,
     pub path: String,
     pub restore_destination: String,
     pub storage_open: bool,
     pub gif_preview: bool,
     pub show_notes: bool,
+    #[serde(skip)]
+    export_name_source_title: Option<String>,
     #[serde(skip)]
     pub playing_animation: bool,
     #[serde(skip)]
@@ -80,11 +83,13 @@ impl Default for GalleryUi {
             looping: true,
             replay_speed: 1.0,
             name: String::new(),
+            export_name: String::new(),
             path: String::new(),
             restore_destination: String::new(),
             storage_open: false,
             gif_preview: false,
             show_notes: false,
+            export_name_source_title: None,
             playing_animation: false,
             playing_replay: false,
             confirm_empty_trash: false,
@@ -550,7 +555,20 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         app.ui.gallery.fps = manifest.fps;
         app.ui.gallery.looping = manifest.looping;
         app.ui.gallery.name = manifest.title.clone();
-        app.ui.gallery.requested = None;
+        let suggested = photocraft_engine::gallery_exports::sanitize_default_export_name(&manifest.title);
+        app.ui.gallery.export_name = suggested.clone();
+        app.ui.gallery.export_name_source_title = Some(suggested);
+        let is_creature_cover = matches!(
+            &manifest.content,
+            GalleryContent::Game { room } if room.mode == photocraft_engine::party::Mode::ExquisiteCorpse
+        );
+        app.ui.gallery.requested = Some((0, 0, None, is_creature_cover, false));
+    } else {
+        let suggested = photocraft_engine::gallery_exports::sanitize_default_export_name(&manifest.title);
+        if app.ui.gallery.export_name_source_title.as_deref() == Some(app.ui.gallery.export_name.as_str()) && app.ui.gallery.export_name != suggested {
+            app.ui.gallery.export_name = suggested.clone();
+            app.ui.gallery.export_name_source_title = Some(suggested);
+        }
     }
     let is_game = matches!(manifest.content, GalleryContent::Game { .. });
     let (chains, frames, creature) = match &manifest.content {
@@ -768,7 +786,8 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         }
         if let Some(image) = &app.session.gallery.image {
             let handle = texture(ui, egui::Id::unique("gallery-preview"), app.session.gallery.image_revision, image);
-            ui.add(egui::Image::new(&handle).max_width(ui.available_width()).max_height(340.0).maintain_aspect_ratio(true));
+            let preview_max_h = if is_game { (ui.ctx().content_rect().height() - 560.0).clamp(150.0, 340.0) } else { 340.0 };
+            ui.add(egui::Image::new(&handle).max_width(ui.available_width()).max_height(preview_max_h).maintain_aspect_ratio(true));
         }
         ui.horizontal_wrapped(|ui| {
             if app.session.gallery.active_draft {
@@ -851,17 +870,36 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 }
 
 fn exports(app: &mut PhotocraftApp, ui: &mut egui::Ui, creature: bool, frames: u8) {
+    let tokens = Tokens::get(ui.ctx());
     let is_animation = !creature && frames > 1;
     let hint = if is_animation {
-        "C:\\Users\\…\\animation.gif"
+        "Animation name"
     } else if creature {
-        "C:\\Users\\…\\creature.png"
+        "Creature name"
     } else {
-        "C:\\Users\\…\\drawing.png"
+        "Drawing name"
     };
-    ui.label("New output file or folder");
-    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.path).desired_width(f32::INFINITY).hint_text(hint));
-    remember(ui, "gallery.path", &response);
+    ui.label("Export name");
+    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.export_name).desired_width(f32::INFINITY).hint_text(hint));
+    remember(ui, "gallery.exportName", &response);
+    let location = ui.small(RichText::new("Saves automatically to your Komaphone Exports folder").color(tokens.text_dim));
+    if let Some(dir) = app.session.gallery.exports_dir.as_deref() {
+        location.on_hover_text(dir);
+    }
+    let validation = photocraft_engine::gallery_exports::validate_export_basename(&app.ui.gallery.export_name);
+    if let Err(reason) = &validation
+        && !app.ui.gallery.export_name.trim().is_empty()
+    {
+        ui.colored_label(tokens.danger, reason.to_string());
+    }
+    let disabled_tip = if app.session.gallery.busy() {
+        "Gallery is working".to_owned()
+    } else if let Err(reason) = &validation {
+        reason.to_string()
+    } else {
+        String::new()
+    };
+    let can_export = !app.session.gallery.busy() && validation.is_ok();
     ui.horizontal_wrapped(|ui| {
         let mut formats: Vec<(&str, &str)> = vec![("Editable archive", "archive"), ("PNG image", "png")];
         if creature || frames > 1 {
@@ -871,15 +909,18 @@ fn exports(app: &mut PhotocraftApp, ui: &mut egui::Ui, creature: bool, frames: u
             formats.push(("Animated GIF", "gif"));
         }
         for (label, format) in formats {
-            let response = ui.add_enabled(!app.session.gallery.busy() && !app.ui.gallery.path.trim().is_empty(), egui::Button::new(label));
+            let mut response = ui.add_enabled(can_export, egui::Button::new(label));
+            if !can_export && !disabled_tip.is_empty() {
+                response = response.on_disabled_hover_text(&disabled_tip);
+            }
             remember(ui, &format!("gallery.export.{format}"), &response);
             if response.clicked() {
                 run(
                     app,
-                    "komaphone.gallery.export",
+                    "komaphone.gallery.exportManaged",
                     json!({
                         "format": format,
-                        "path": app.ui.gallery.path,
+                        "name": app.ui.gallery.export_name,
                         "chain": app.ui.gallery.chain,
                         "frame": if creature { None } else { Some(app.ui.gallery.frame) },
                         "fps": app.ui.gallery.fps,
@@ -888,7 +929,34 @@ fn exports(app: &mut PhotocraftApp, ui: &mut egui::Ui, creature: bool, frames: u
                 );
             }
         }
+        if app.session.gallery.exporting() {
+            let cancel = ui.button("Cancel export");
+            remember(ui, "gallery.export.cancel", &cancel);
+            if cancel.clicked() {
+                run(app, "komaphone.gallery.cancelExport", json!({}));
+            }
+        }
     });
+    if let Some(last) = app.session.gallery.last_export.clone() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("Saved to {}", last.path)).color(tokens.text_dim));
+            let button_label = if last.is_directory { "Open folder" } else { "Show in folder" };
+            let reveal = ui.button(button_label);
+            remember(ui, "gallery.export.reveal", &reveal);
+            if reveal.clicked() {
+                match app.services.reveal_in_folder.as_ref() {
+                    Some(service) => {
+                        if let Err(err) = service(&last.path, last.is_directory) {
+                            app.session.gallery.error = Some(err);
+                        }
+                    }
+                    None => {
+                        app.session.gallery.error = Some("Opening folders is unavailable in this environment.".into());
+                    }
+                }
+            }
+        });
+    }
     if is_animation {
         ui.small(photocraft_engine::gallery_media::GIF_NOTICE);
     }

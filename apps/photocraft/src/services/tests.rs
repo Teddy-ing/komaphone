@@ -972,3 +972,43 @@ fn tiff_options_reach_the_written_file() {
     assert_eq!(info.pages.iter().map(|p| (p.width, p.compression)).collect::<Vec<_>>(), [(200, 5), (100, 5), (50, 5)]);
     assert!(!photocraft_codecs::decode(&bytes).unwrap().layout().has_alpha());
 }
+
+#[test]
+fn reveal_in_folder_validation_rejects_escape_mismatch_and_control_chars() {
+    let root = temp("reveal-validate");
+    let exports = root.join("Exports");
+    let outside = root.join("Outside");
+    std::fs::create_dir_all(&exports).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside_file = outside.join("secret.png");
+    let inside_file = exports.join("drawing.png");
+    let inside_dir = exports.join("frames");
+    std::fs::write(&outside_file, b"png").unwrap();
+    std::fs::write(&inside_file, b"png").unwrap();
+    std::fs::create_dir_all(&inside_dir).unwrap();
+
+    let service = reveal_in_folder_service(exports);
+    assert!(service(outside_file.to_str().unwrap(), false).is_err());
+    assert!(service(inside_file.to_str().unwrap(), true).is_err());
+    assert!(service(inside_dir.to_str().unwrap(), false).is_err());
+    assert!(service("does-not-exist.png", false).is_err());
+    assert!(service("bad\"quote.png", false).is_err());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_explorer_command_selects_files_and_opens_directories() {
+    let file_cmd = windows_explorer_command(r"C:\Users\Demo\Komaphone\Exports\My Sunset.png", false).unwrap();
+    assert!(file_cmd.get_program().to_string_lossy().to_ascii_lowercase().ends_with("explorer.exe"));
+    let file_args: Vec<String> = file_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert_eq!(file_args, vec![r#"/select,"C:\Users\Demo\Komaphone\Exports\My Sunset.png""#]);
+
+    let dir_cmd = windows_explorer_command(r"C:\Users\Demo\Komaphone\Exports\My Sunset", true).unwrap();
+    let dir_args: Vec<String> = dir_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert_eq!(dir_args, vec![r"C:\Users\Demo\Komaphone\Exports\My Sunset"]);
+
+    assert!(windows_explorer_command(r#"C:\Users\Demo\bad"name.png"#, false).is_err());
+    assert!(windows_explorer_command("", false).is_err());
+}

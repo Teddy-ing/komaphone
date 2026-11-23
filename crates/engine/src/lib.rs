@@ -24,6 +24,7 @@ pub mod doc_path;
 pub mod filters;
 pub mod filters_ext;
 pub mod gallery;
+pub mod gallery_exports;
 pub mod world_brush;
 pub mod world_cmds;
 mod world_recovery;

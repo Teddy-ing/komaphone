@@ -23,6 +23,13 @@ pub trait PreparedGalleryFiles: Send {
     fn finish(&mut self) -> Result<()>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastExport {
+    pub path: String,
+    pub is_directory: bool,
+    pub format: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GalleryItem {
     pub id: ProjectId,
@@ -128,6 +135,14 @@ pub enum GalleryAction {
         fps: u8,
         looping: bool,
     },
+    ExportManaged {
+        format: String,
+        name: String,
+        chain: u8,
+        frame: Option<u8>,
+        fps: u8,
+        looping: bool,
+    },
     Import {
         path: String,
     },
@@ -163,6 +178,13 @@ impl GalleryAction {
         {
             return Err(EngineError::Other("Choose a valid export format and 1–24 fps".into()));
         }
+        if let Self::ExportManaged { fps, format, name, .. } = &action {
+            crate::gallery_exports::ExportFormat::from_str_name(format)?;
+            if !(1..=24).contains(fps) {
+                return Err(EngineError::Other("Choose a valid export format and 1–24 fps".into()));
+            }
+            crate::gallery_exports::validate_export_basename(name)?;
+        }
         let valid_path = |path: &str| !path.trim().is_empty() && path.len() <= 32768 && !path.contains('\0');
         let valid = match &action {
             Self::Export { path, .. } | Self::Import { path } | Self::Backup { path } => valid_path(path),
@@ -194,6 +216,8 @@ pub struct Gallery {
     pub remote_cursor: Option<u64>,
     pub error: Option<String>,
     pub notice: Option<String>,
+    pub last_export: Option<LastExport>,
+    pub exports_dir: Option<String>,
     pub downloading: bool,
     pub downloaded_bytes: u64,
     pub download_bytes: u64,
@@ -202,7 +226,10 @@ pub struct Gallery {
     pub usage_bytes: u64,
     pub quota_bytes: u64,
     busy: bool,
+    exporting: bool,
     configured: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    configured_exports_dir: Option<std::path::PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
     worker: Option<native::Worker>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -217,6 +244,9 @@ impl Gallery {
     }
     pub fn busy(&self) -> bool {
         self.busy
+    }
+    pub fn exporting(&self) -> bool {
+        self.exporting
     }
 }
 
@@ -284,6 +314,7 @@ impl Session {
             GalleryAction::Render { .. }
                 | GalleryAction::Remix { .. }
                 | GalleryAction::Export { .. }
+                | GalleryAction::ExportManaged { .. }
                 | GalleryAction::Playback { .. }
                 | GalleryAction::PreviewGif { .. }
         ) && self.gallery.active.is_none()
@@ -296,6 +327,7 @@ impl Session {
                 GalleryAction::Render { .. }
                     | GalleryAction::Remix { .. }
                     | GalleryAction::Export { .. }
+                    | GalleryAction::ExportManaged { .. }
                     | GalleryAction::Playback { .. }
                     | GalleryAction::PreviewGif { .. }
             )
@@ -393,12 +425,28 @@ impl Session {
             let protected = self.active_protected_projects();
             let worker = self.gallery.worker.as_ref().ok_or_else(|| EngineError::Other("Gallery storage is unavailable".into()))?;
             let source = self.gallery.active.as_ref().map(|active| (active.id, self.gallery.active_draft));
+            let is_export = matches!(action, GalleryAction::Export { .. } | GalleryAction::ExportManaged { .. });
+            if matches!(
+                action,
+                GalleryAction::Export { .. }
+                    | GalleryAction::ExportManaged { .. }
+                    | GalleryAction::Open { .. }
+                    | GalleryAction::Delete { .. }
+                    | GalleryAction::EmptyTrash
+                    | GalleryAction::Import { .. }
+                    | GalleryAction::OpenEditable { .. }
+                    | GalleryAction::Remix { .. }
+            ) {
+                self.gallery.last_export = None;
+            }
+            worker.cancel_export.store(false, std::sync::atomic::Ordering::Release);
             let request = match files {
                 Some(files) => native::Request::ScopedAction { action, source, protected, files },
                 None => native::Request::Action { action, source, protected },
             };
             worker.send(request)?;
             self.gallery.busy = true;
+            self.gallery.exporting = is_export;
             self.gallery.error = None;
             Ok(())
         }
@@ -406,6 +454,47 @@ impl Session {
         {
             let _ = (action, files);
             Err(EngineError::Other("Gallery storage requires the Windows desktop app".into()))
+        }
+    }
+
+    /// Request cooperative cancellation of an in-flight gallery export.
+    pub fn cancel_gallery_export(&mut self) -> Result<bool> {
+        if !self.gallery.available() {
+            return Err(EngineError::Other("Gallery requires the native app's local storage".into()));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if self.gallery.exporting
+                && let Some(worker) = &self.gallery.worker
+            {
+                worker.cancel_export.store(true, std::sync::atomic::Ordering::Release);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(false)
+        }
+    }
+
+    /// Configure the dedicated app-managed Exports folder (used by `komaphone.gallery.exportManaged`).
+    pub fn set_gallery_exports_dir(&mut self, dir: std::path::PathBuf) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let resolved = crate::gallery_exports::resolve_exports_dir(&dir, Some(&dir))?;
+            let display = crate::gallery_exports::strip_windows_verbatim(&resolved);
+            if let Some(worker) = &self.gallery.worker {
+                *worker.exports_dir.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Ok(resolved.clone());
+            }
+            self.gallery.configured_exports_dir = Some(resolved);
+            self.gallery.exports_dir = Some(display);
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = dir;
+            Err(EngineError::Other("Gallery exports require the Windows desktop app".into()))
         }
     }
 

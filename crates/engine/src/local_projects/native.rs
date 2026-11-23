@@ -150,10 +150,15 @@ fn random_hex() -> Result<String> {
 impl Session {
     /// Native application-data root; tests pass an isolated path. No I/O runs on this thread.
     pub fn enable_local_projects(&mut self, database: PathBuf, options: StoreOptions) -> Result<()> {
+        self.enable_local_projects_with_exports(database, options, None)
+    }
+
+    /// Native application-data root with an explicit dedicated Exports folder.
+    pub fn enable_local_projects_with_exports(&mut self, database: PathBuf, options: StoreOptions, exports_dir: Option<PathBuf>) -> Result<()> {
         if self.local_projects.available() {
             return Err(EngineError::Other("Local storage is already configured".into()));
         }
-        self.enable_gallery(database.clone(), options)?;
+        self.enable_gallery(database.clone(), options, exports_dir)?;
         self.local_projects.worker = Some(Worker::start(database, options)?);
         self.local_projects.configured = true;
         self.local_replay.enable();

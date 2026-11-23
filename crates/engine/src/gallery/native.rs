@@ -1,4 +1,4 @@
-use super::{GalleryAction, GalleryItem};
+use super::{GalleryAction, GalleryItem, LastExport};
 use crate::{EngineError, Result, Session, gallery_media};
 use photocraft_local_store::gallery::{GalleryKind, GalleryStore, read_archive, write_archive};
 use photocraft_local_store::{LoadedDraft, ReplayKind, ReplayRecord, SaveRequest, Store, StoreOptions};
@@ -9,7 +9,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 pub(super) enum Request {
     Action { action: GalleryAction, source: Option<(ProjectId, bool)>, protected: BTreeSet<ProjectId> },
@@ -47,19 +48,37 @@ enum Response {
     Image((ProjectId, bool), crate::rooms::media::RoomImage, Option<gallery_media::ReplayInfo>),
     Thumbnail(ProjectId, bool, Vec<ProjectId>, crate::rooms::media::RoomImage),
     Edited(Box<LoadedDraft>),
+    Exported {
+        path: String,
+        is_directory: bool,
+        format: String,
+    },
     Notice(String),
     Error(String),
 }
 pub(super) struct Worker {
     tx: mpsc::SyncSender<Request>,
     rx: mpsc::Receiver<Response>,
+    pub(super) cancel_export: Arc<AtomicBool>,
+    pub(super) exports_dir: Arc<Mutex<std::result::Result<PathBuf, String>>>,
 }
 fn error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Other(error.to_string())
 }
 
 impl Worker {
-    fn start(drafts: PathBuf, options: StoreOptions) -> Result<Self> {
+    fn start(drafts: PathBuf, options: StoreOptions, initial_exports: Option<PathBuf>) -> Result<(Self, Option<String>)> {
+        let root = drafts.parent().ok_or_else(|| error("Gallery data directory is missing"))?;
+        let env_exports = std::env::var_os("KOMAPHONE_EXPORTS_DIR").map(PathBuf::from);
+        let initial_resolved = match initial_exports {
+            Some(dir) => crate::gallery_exports::resolve_exports_dir(root, Some(&dir)).map_err(|e| e.to_string()),
+            None => crate::gallery_exports::resolve_exports_dir(root, env_exports.as_deref()).map_err(|e| e.to_string()),
+        };
+        let display_exports = initial_resolved.as_ref().ok().map(|p| crate::gallery_exports::strip_windows_verbatim(p));
+        let exports_dir = Arc::new(Mutex::new(initial_resolved));
+        let worker_exports_dir = Arc::clone(&exports_dir);
+        let cancel_export = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel_export);
         let (tx, requests) = mpsc::sync_channel(2);
         let (responses, rx) = mpsc::sync_channel(2);
         std::thread::Builder::new()
@@ -77,6 +96,8 @@ impl Worker {
                                 active_draft: false,
                                 options,
                                 gif: None,
+                                cancel_export: Arc::clone(&worker_cancel),
+                                exports_dir: Arc::clone(&worker_exports_dir),
                             });
                         }
                         state.as_mut().ok_or_else(|| error("Gallery store unavailable"))?.handle(request)
@@ -88,7 +109,7 @@ impl Worker {
                 }
             })
             .map_err(error)?;
-        Ok(Self { tx, rx })
+        Ok((Self { tx, rx, cancel_export, exports_dir }, display_exports))
     }
     pub(super) fn send(&self, request: Request) -> Result<()> {
         self.tx.try_send(request).map_err(|_| error("Gallery storage is busy; retry"))
@@ -106,6 +127,8 @@ struct State {
     active_draft: bool,
     options: StoreOptions,
     gif: Option<GifPreview>,
+    cancel_export: Arc<AtomicBool>,
+    exports_dir: Arc<Mutex<std::result::Result<PathBuf, String>>>,
 }
 impl State {
     fn active(&self) -> Result<&GalleryBundle> {
@@ -184,6 +207,7 @@ impl State {
                     GalleryAction::Render { .. }
                         | GalleryAction::Remix { .. }
                         | GalleryAction::Export { .. }
+                        | GalleryAction::ExportManaged { .. }
                         | GalleryAction::Playback { .. }
                         | GalleryAction::PreviewGif { .. }
                 ) && (source.is_none() || source != self.active.as_ref().map(|bundle| (bundle.manifest.id, self.active_draft)))
@@ -333,6 +357,7 @@ impl State {
                 }
                 Ok(Response::Notice(format!("Export saved: {}", path.display())))
             }
+            GalleryAction::ExportManaged { format, name, chain, frame, fps, looping } => self.export_managed(&format, &name, chain, frame, fps, looping),
             GalleryAction::Import { path } => {
                 let info = self
                     .gallery
@@ -647,6 +672,59 @@ impl State {
         Ok((items, local.stored_bytes.saturating_add(gallery.stored_bytes), local.quota_bytes.saturating_add(gallery.quota_bytes)))
     }
 
+    fn export_managed(&mut self, format: &str, name: &str, chain: u8, frame: Option<u8>, fps: u8, looping: bool) -> Result<Response> {
+        let fmt = crate::gallery_exports::ExportFormat::from_str_name(format)?;
+        let bundle = self.active()?;
+        let (creature, frames) = match &bundle.manifest.content {
+            GalleryContent::Game { room } => {
+                (room.mode == photocraft_party::Mode::ExquisiteCorpse, usize::from(room.mode.rounds(room.members.len()).unwrap_or(1)))
+            }
+            GalleryContent::Project { .. } => (false, gallery_media::frame_count(bundle, chain)?),
+        };
+        if fmt == crate::gallery_exports::ExportFormat::Gif && (creature || frames <= 1) {
+            return Err(error("Animated GIF export is only available for multi-frame animations."));
+        }
+        if fmt == crate::gallery_exports::ExportFormat::Sequence && !creature && frames <= 1 {
+            return Err(error("PNG frames export is only available for animations and creatures."));
+        }
+        if self.cancel_export.load(Ordering::Acquire) {
+            return Err(error("Export cancelled; the original is unchanged"));
+        }
+        let exports_root = self.exports_dir.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map_err(|e| error(e.as_str()))?.clone();
+        let stage = crate::gallery_exports::ManagedExportStage::prepare(&exports_root, name, fmt)?;
+        let staged = stage.staged_output_path();
+        match fmt {
+            crate::gallery_exports::ExportFormat::Archive => {
+                if self.active_draft {
+                    write_archive(bundle, &staged).map_err(error)?;
+                } else {
+                    let id = bundle.manifest.id;
+                    self.gallery.export_archive(id, &staged).map_err(error)?;
+                }
+            }
+            crate::gallery_exports::ExportFormat::Png => {
+                gallery_media::export_png(bundle, chain, frame, &staged)?;
+            }
+            crate::gallery_exports::ExportFormat::Gif => {
+                let bytes = gallery_media::gif_bytes_with(bundle, chain, gallery_media::AnimationOptions { fps, looping }, |_, _| {
+                    !self.cancel_export.load(Ordering::Acquire)
+                })?;
+                if self.cancel_export.load(Ordering::Acquire) {
+                    return Err(error("Export cancelled; the original is unchanged"));
+                }
+                gallery_media::write_new_file(&staged, &bytes)?;
+            }
+            crate::gallery_exports::ExportFormat::Sequence => {
+                gallery_media::export_sequence(bundle, chain, &staged, |_, _| !self.cancel_export.load(Ordering::Acquire))?;
+            }
+        }
+        if self.cancel_export.load(Ordering::Acquire) {
+            return Err(error("Export cancelled; the original is unchanged"));
+        }
+        let published = stage.publish()?;
+        Ok(Response::Exported { path: published.display_path, is_directory: published.is_directory, format: fmt.as_str().into() })
+    }
+
     fn backup(&mut self, path: &Path) -> Result<()> {
         if path.exists() {
             return Err(error("Choose a new backup directory; existing files are preserved"));
@@ -898,8 +976,13 @@ fn cover(bundle: &GalleryBundle) -> Result<crate::rooms::media::RoomImage> {
 }
 
 impl Session {
-    pub(crate) fn enable_gallery(&mut self, database: PathBuf, options: StoreOptions) -> Result<()> {
-        self.gallery.worker = Some(Worker::start(database, options)?);
+    pub(crate) fn enable_gallery(&mut self, database: PathBuf, options: StoreOptions, explicit_exports: Option<PathBuf>) -> Result<()> {
+        let initial_exports = explicit_exports.or_else(|| self.gallery.configured_exports_dir.clone());
+        let (worker, exports_display) = Worker::start(database, options, initial_exports)?;
+        self.gallery.worker = Some(worker);
+        if self.gallery.exports_dir.is_none() {
+            self.gallery.exports_dir = exports_display;
+        }
         self.gallery.configured = true;
         Ok(())
     }
@@ -910,6 +993,7 @@ impl Session {
                 break;
             };
             self.gallery.busy = false;
+            self.gallery.exporting = false;
             match response {
                 Response::Listed { items, used, quota } => {
                     let protected = self.active_protected_projects();
@@ -950,6 +1034,7 @@ impl Session {
                         self.gallery.active_sources.clear();
                         self.gallery.image = None;
                         self.gallery.replay = None;
+                        self.gallery.last_export = None;
                     }
                     self.gallery.items = items;
                     self.gallery.usage_bytes = used;
@@ -970,6 +1055,7 @@ impl Session {
                         self.gallery.active_sources.clear();
                         self.gallery.image = None;
                         self.gallery.replay = None;
+                        self.gallery.last_export = None;
                     }
                     self.gallery.items = items;
                     self.gallery.usage_bytes = used;
@@ -982,6 +1068,7 @@ impl Session {
                         self.gallery.active_sources.clear();
                         self.gallery.image = None;
                         self.gallery.replay = None;
+                        self.gallery.last_export = None;
                         self.gallery.error = Some("This assignment history is private until reveal".into());
                         continue;
                     }
@@ -992,6 +1079,7 @@ impl Session {
                     self.gallery.image = Some(Arc::new(image));
                     self.gallery.replay = Some(replay);
                     self.gallery.frame_count = frames;
+                    self.gallery.last_export = None;
                     self.gallery.image_revision = self.gallery.image_revision.saturating_add(1);
                     // Import can open a newly stored original before it has a list row.
                     // Keep the operation busy until navigation, metadata controls and usage
@@ -1051,11 +1139,18 @@ impl Session {
                     self.gallery.opened_document = true;
                     self.gallery.notice = Some("Remix saved as a new editable draft. The source and its history are unchanged.".into());
                 }
+                Response::Exported { path, is_directory, format } => {
+                    self.gallery.notice = Some(format!("Saved to {path}"));
+                    self.gallery.last_export = Some(LastExport { path, is_directory, format });
+                }
                 Response::Notice(notice) => {
                     self.gallery.notice = Some(notice);
                     let _ = self.gallery_action(GalleryAction::Refresh);
                 }
-                Response::Error(error) => self.gallery.error = Some(error),
+                Response::Error(error) => {
+                    self.gallery.last_export = None;
+                    self.gallery.error = Some(error);
+                }
             }
         }
         if !self.gallery_active_allowed() {
@@ -1063,6 +1158,7 @@ impl Session {
             self.gallery.active_sources.clear();
             self.gallery.image = None;
             self.gallery.replay = None;
+            self.gallery.last_export = None;
         }
         let private: Vec<_> = self
             .gallery

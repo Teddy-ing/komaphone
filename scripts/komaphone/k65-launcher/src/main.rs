@@ -99,8 +99,9 @@ fn app_command(app: &Path, destination: &Path, safe_gpu: bool) -> Result<Command
     ensure_directory(&exports)?;
     let mut command = Command::new(app);
     command
-        .current_dir(exports)
+        .current_dir(&exports)
         .env("KOMAPHONE_DATA_DIR", destination.join("data"))
+        .env("KOMAPHONE_EXPORTS_DIR", exports)
         .env("PHOTOCRAFT_CONFIG_DIR", destination.join("config"))
         // Only the verified sidecar path enters the child environment, never its value.
         .env("KOMAPHONE_GOOGLE_CLIENT_CONFIG", google_configuration)

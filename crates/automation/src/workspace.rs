@@ -397,6 +397,8 @@ pub fn authorize_engine_command(id: &str, params: &Value) -> Result<(), Automati
                 | "layer.videoLayers.replaceFootage"
                 | "layer.videoLayers.reloadFrame"
                 | "komaphone.gallery.export"
+                | "komaphone.gallery.exportManaged"
+                | "komaphone.gallery.cancelExport"
                 | "komaphone.gallery.import"
                 | "komaphone.gallery.backup"
                 | "komaphone.gallery.restore"

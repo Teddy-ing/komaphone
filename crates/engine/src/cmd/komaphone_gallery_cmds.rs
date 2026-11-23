@@ -68,7 +68,8 @@ pub fn specs() -> Vec<CommandSpec> {
                 "image":s.gallery.image.as_ref().map(|image|json!({"width":image.width,"height":image.height})),
                 "remote":s.gallery.remote,"remoteCursor":s.gallery.remote_cursor,"downloading":s.gallery.downloading,
                 "downloadedBytes":s.gallery.downloaded_bytes,"downloadBytes":s.gallery.download_bytes,"waiting":s.gallery.waiting,
-                "usageBytes":s.gallery.usage_bytes,"quotaBytes":s.gallery.quota_bytes,"error":s.gallery.error,"notice":s.gallery.notice}))
+                "usageBytes":s.gallery.usage_bytes,"quotaBytes":s.gallery.quota_bytes,"error":s.gallery.error,"notice":s.gallery.notice,
+                "lastExport":s.gallery.last_export,"exportsDir":s.gallery.exports_dir,"exporting":s.gallery.exporting()}))
             },
         },
         CommandSpec {
@@ -211,6 +212,26 @@ pub fn specs() -> Vec<CommandSpec> {
         r#"{"format":"archive|png|gif|sequence","path":string,"chain":integer,"frame":integer?,"fps":integer,"looping":bool}"#,
         "export"
     );
+    action!(
+        "komaphone.gallery.exportManaged",
+        "Export gallery artwork to Exports folder",
+        r#"{"format":"archive|png|gif|sequence","name":string,"chain":integer,"frame":integer?,"fps":integer,"looping":bool}"#,
+        "export_managed"
+    );
+    specs.push(CommandSpec {
+        id: "komaphone.gallery.cancelExport",
+        label: "Cancel gallery export",
+        menu: &[],
+        shortcut: None,
+        params: "{}",
+        enabled: available,
+        journal: false,
+        run: |s, p| {
+            fields(p, &[])?;
+            let cancelled = s.cancel_gallery_export()?;
+            Ok(json!({"cancelled":cancelled}))
+        },
+    });
     action!("komaphone.gallery.import", "Import portable archive", r#"{"path":string}"#, "import");
     action!("komaphone.gallery.backup", "Back up all local originals", r#"{"path":string}"#, "backup");
     action!("komaphone.gallery.restore", "Restore into a new data directory", r#"{"path":string,"destination":string}"#, "restore");

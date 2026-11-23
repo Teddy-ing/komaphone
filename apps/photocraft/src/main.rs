@@ -529,6 +529,15 @@ fn main() -> eframe::Result {
             }
             let local_data = std::env::var_os("KOMAPHONE_DATA_DIR")
                 .map(std::path::PathBuf::from)
+                .map(|root| {
+                    if root.is_absolute() {
+                        root
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        cwd.join(&root)
+                    } else {
+                        root
+                    }
+                })
                 .or_else(|| std::env::var_os("LOCALAPPDATA").map(|base| std::path::PathBuf::from(base).join("Komaphone")));
             if let Some(root) = local_data {
                 if let Err(error) = photocraft_engine::rooms::ClientOptions::from_environment()
@@ -537,7 +546,12 @@ fn main() -> eframe::Result {
                 {
                     app.session.rooms.status.error = Some(error.to_string());
                 }
-                if let Err(error) = app.session.enable_local_projects(root.join("drafts.sqlite3"), Default::default()) {
+                let explicit_exports = std::env::var_os("KOMAPHONE_EXPORTS_DIR").map(std::path::PathBuf::from);
+                let exports_dir = photocraft_engine::gallery_exports::resolve_exports_dir(&root, explicit_exports.as_deref()).ok();
+                if let Some(dir) = exports_dir.clone() {
+                    app.services.reveal_in_folder = Some(services::reveal_in_folder_service(dir));
+                }
+                if let Err(error) = app.session.enable_local_projects_with_exports(root.join("drafts.sqlite3"), Default::default(), exports_dir) {
                     app.session.local_projects.error = Some(error.to_string());
                 }
                 if let Err(error) = app.session.enable_canvases(root.join("canvases.sqlite3"), Default::default()) {

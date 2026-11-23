@@ -829,5 +829,59 @@ fn platform_beep() {
     }
 }
 
+/// Build the native service callback for revealing or opening a managed export inside `exports_root`.
+pub fn reveal_in_folder_service(exports_root: PathBuf) -> photocraft_ui_egui::RevealInFolderFn {
+    Box::new(move |path: &str, is_directory: bool| {
+        let canonical = photocraft_engine::gallery_exports::validate_reveal_target(&exports_root, Path::new(path), is_directory).map_err(|e| e.to_string())?;
+        let display = photocraft_engine::gallery_exports::strip_windows_verbatim(&canonical);
+        if display.is_empty() || display.contains(['"', '\0', '\r', '\n']) {
+            return Err("Exported path contains unsupported characters.".into());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = windows_explorer_command(&display, is_directory)?;
+            command.spawn().map_err(|e| format!("Failed to open Explorer: {e}"))?;
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = std::process::Command::new("open");
+            if !is_directory {
+                command.arg("-R");
+            }
+            command.arg(&canonical).spawn().map_err(|e| format!("Failed to open Finder: {e}"))?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let open_target =
+                if is_directory { canonical.as_path() } else { canonical.parent().ok_or_else(|| "Exported target has no parent folder.".to_string())? };
+            open::that_detached(open_target).map_err(|e| e.to_string())
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_explorer_command(clean_text: &str, is_directory: bool) -> Result<std::process::Command, String> {
+    use std::os::windows::process::CommandExt;
+
+    if clean_text.is_empty() || clean_text.contains(['"', '\0', '\r', '\n']) {
+        return Err("Exported path contains unsupported characters.".into());
+    }
+    let explorer = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .filter(|root| !root.as_os_str().is_empty() && root.is_absolute())
+        .map(|root| root.join("explorer.exe"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\explorer.exe"));
+    let mut command = std::process::Command::new(explorer);
+    if is_directory {
+        command.arg(clean_text);
+    } else {
+        command.raw_arg(format!("/select,\"{clean_text}\""));
+    }
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests;

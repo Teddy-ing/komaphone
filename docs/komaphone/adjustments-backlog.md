@@ -29,7 +29,7 @@ An accepted adjustment is not proof of K7 completion. Each change must identify 
 | `QOL-007` | Per-player corpse segment height changes during drawing | Batch D / after C | Ready | [Requirements](adjustments-2026-11-18.md) |
 | `QOL-008` | Audit/enforce invite-only hosted admission | Later / owner deferred | Deferred | [Requirements](adjustments-2026-11-18.md) |
 | `QOL-009` | Shared-canvas party brush and opacity parity | Priority 1 | Awaiting review | [Requirements](adjustments-drawing-exports.md); evidence `log/k7/qol-009-world-brushes-20261119/` |
-| `QOL-010` | Name-only exports into dedicated app Exports folder | Priority 2 / after 009 review | Ready | [Requirements](adjustments-drawing-exports.md) |
+| `QOL-010` | Name-only exports into dedicated app Exports folder | Priority 2 / after 009 review | Complete (worker-verified) | [Requirements](adjustments-drawing-exports.md); evidence `log/k7/qol-010-managed-exports-20261122/` |
 | `QOL-011` | Persistent top-level Workroom navigation | Small UI batch | Complete (worker-verified) | [Requirements](adjustments-drawing-exports.md); evidence `log/k7/qol-small-ui-batch-20261121/` (`02/04/06-*.png`, 2026-11-21) |
 | `QOL-012` | Local toggle for collaborator name labels | Small UI batch | Complete (worker-verified) | [Requirements](adjustments-drawing-exports.md); evidence `log/k7/qol-small-ui-batch-20261121/` (`02/03/07-*.png`, 2026-11-21) |
 | `QOL-013` | Stable shared-canvas catch-up playback | After 012 | Ready | [Requirements](adjustments-drawing-exports.md) |

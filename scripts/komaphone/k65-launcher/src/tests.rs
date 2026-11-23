@@ -78,6 +78,7 @@ fn process_environment_removes_legacy_trust_and_keeps_local_storage() {
         assert_eq!(environment.get(std::ffi::OsStr::new(name)), Some(&None));
     }
     assert_eq!(command.get_current_dir(), Some(destination.join("exports").as_path()));
+    assert_eq!(environment.get(std::ffi::OsStr::new("KOMAPHONE_EXPORTS_DIR")), Some(&Some(destination.join("exports").as_os_str())));
     let config_path = fixture.root.join("candidate").join("google-desktop-client.json");
     assert_eq!(environment.get(std::ffi::OsStr::new("KOMAPHONE_GOOGLE_CLIENT_CONFIG")), Some(&Some(config_path.as_os_str())));
     assert_eq!(command.get_args().collect::<Vec<_>>(), [std::ffi::OsStr::new("--safe-gpu")]);

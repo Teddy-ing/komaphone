@@ -267,6 +267,9 @@ pub type AutomationCommandFn = Box<dyn Fn(&str, &Value) -> Result<(), String>>;
 /// Open a URL in the system browser (native) — reliable cross-platform, unlike `ctx.open_url`.
 pub type OpenUrlFn = Box<dyn Fn(&str) -> Result<(), String>>;
 
+/// Reveal an exported file or open an exported folder inside the app's Exports directory.
+pub type RevealInFolderFn = Box<dyn Fn(&str, bool) -> Result<(), String>>;
+
 pub type EncodePngFn = Box<dyn Fn(u32, u32, &[u8]) -> Result<Vec<u8>, String>>;
 
 /// Put an RGBA8 image (width, height, pixels) on the OS clipboard.
@@ -451,6 +454,8 @@ pub struct Services {
     pub encode_png: Option<EncodePngFn>,
     /// Open a URL in the system browser (native). Falls back to `ctx.open_url` (web) when unset.
     pub open_url: Option<OpenUrlFn>,
+    /// Reveal an exported file or open an exported sequence folder in the system file manager.
+    pub reveal_in_folder: Option<RevealInFolderFn>,
     /// Preferences ▸ General ▸ Beep When Done: the platform's default beep, played when a
     /// background job finishes successfully. `None` in the web build (and in tests).
     pub beep: Option<fn()>,
