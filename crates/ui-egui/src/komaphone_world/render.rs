@@ -33,7 +33,7 @@ pub struct Presentation {
     pub render_ms: f64,
     pub preparing: bool,
     preparing_since: Option<web_time::Instant>,
-    can_render_current: bool,
+    pub(crate) can_render_current: bool,
     pub rendered_revision: Option<u64>,
     pub stats: crate::komaphone_world_gpu::Stats,
 }
@@ -41,6 +41,31 @@ pub struct Presentation {
 impl Presentation {
     fn can_render(&self, wanted: &Key) -> bool {
         self.renderer.is_some() && self.ready.as_ref().is_some_and(|ready| ready == wanted || ready.may_show_before(wanted))
+    }
+
+    pub(crate) fn review_settled_for(&self, end: u64, position: u64) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            !self.preparing
+                && !self.stats.is_refining
+                && self.stats.pending_tiles == 0
+                && self.stats.anim_pending_tiles == 0
+                && self.ready.as_ref().is_some_and(|r| matches!(r.revision, Revision::Review { end: e, position: p } if e == end && p == position))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (end, position);
+            true
+        }
+    }
+
+    pub(crate) fn shows_preparing_overlay(&self) -> bool {
+        self.preparing && (!self.can_render_current || self.preparing_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_millis(300)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gpu_held_review_frames(&self) -> u32 {
+        self.gpu.as_deref().map_or(0, crate::komaphone_world_gpu::WorldGpu::held_review_frames)
     }
 
     #[cfg(test)]
@@ -113,6 +138,11 @@ pub(super) fn paint(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &V
         Ok(None) => {}
         Err(error) => {
             app.ui.world.message = Some(error);
+            if presentation.can_render_current
+                && let Some(texture) = presentation.texture
+            {
+                painter.image(texture, rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
         }
     }
     paint_overlays(app, ui, &painter, rect, view, &presentation);
@@ -175,8 +205,7 @@ fn paint_overlays(app: &mut PhotocraftApp, ui: &egui::Ui, painter: &egui::Painte
             painter.circle_filled(a, 2.5, egui::Color32::WHITE);
         }
     }
-    let show_preparing = presentation.preparing
-        && (!presentation.can_render_current || presentation.preparing_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_millis(300)));
+    let show_preparing = presentation.shows_preparing_overlay();
     if show_preparing || presentation.stats.pending_assets > 0 {
         let message = if show_preparing { "Preparing the selected canvas revision…" } else { "Loading shared media…" };
         painter.text(rect.min + egui::vec2(12.0, 12.0), egui::Align2::LEFT_TOP, message, egui::FontId::proportional(13.0), tokens.text);
@@ -209,6 +238,7 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
         if let Some(gpu) = p.gpu.as_mut() {
             gpu.purge_slots();
         }
+        p.cpu_presenter.reset();
         p.renderer = None;
         p.output.clear();
         p.texture = None;
@@ -302,10 +332,13 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
     let elapsed_ms = ui.input(|input| (input.time.max(0.0) * 1000.0) as u64);
     let (frames, animated) = renderer.media_frames(view, elapsed_ms).map_err(|e| e.to_string())?;
     for frame in &frames {
-        app.session.world_media_bytes(frame).map_err(|e| e.to_string())?;
+        if let Err(error) = app.session.world_media_bytes(frame) {
+            app.ui.world.message = Some(error.to_string());
+            continue;
+        }
         if let Some(mgr) = p.tile_manager.as_mut()
             && !mgr.has_media_frame(&frame.hash)
-            && let Some(bytes) = app.session.worlds.assets.bytes(frame).map_err(|e| e.to_string())?
+            && let Ok(Some(bytes)) = app.session.worlds.assets.bytes(frame)
             && let Ok(decoded) = decode_frame(frame, &bytes)
         {
             mgr.register_media_frame(frame.hash, Arc::new(RgbaFrame::from(decoded)));
@@ -369,6 +402,7 @@ fn paint_inner(app: &mut PhotocraftApp, ui: &egui::Ui, rect: Rect, view: &Viewpo
             &previews,
             p.live_tile.as_deref_mut().map(|(_, lb)| lb),
             &mut resolve_media,
+            retain_stale_for_review,
             &mut p.stats,
         )?
     };
@@ -481,6 +515,7 @@ fn present_cpu_fallback(
     previews: &[SharedStroke],
     mut live_tile_brush: Option<&mut LiveTileBrush>,
     resolve_media: &mut dyn FnMut(&MediaFrame) -> photocraft_engine::Result<Option<Arc<RgbaFrame>>>,
+    retain_stale_for_review: bool,
     stats: &mut crate::komaphone_world_gpu::Stats,
 ) -> Result<egui::TextureId, String> {
     let _ = mgr.poll_completed();
@@ -619,14 +654,15 @@ fn present_cpu_fallback(
         mgr.schedule_split_warm_tiles(std::collections::BTreeSet::new(), &[], &[]);
     }
     mgr.schedule_view_interactive(view, target_lod, &static_visible, &missing, !has_any_local_brush);
+    let incomplete = pending > 0 || anim_pending > 0;
     let refs: Vec<(WorldRect, [f32; 4], &[u8])> = owned_tiles.iter().map(|(r, uv, b)| (*r, *uv, b.as_slice())).collect();
-    let tex = presenter.present_tiles(ctx, view, density, &refs)?;
+    let tex = presenter.present_tiles_for_review(ctx, view, density, scope_gen, incomplete, retain_stale_for_review, &refs)?;
     *stats = crate::komaphone_world_gpu::Stats {
         visible_tiles: visible.len(),
         pending_tiles: pending,
         anim_pending_tiles: anim_pending,
         target_lod,
-        is_refining: pending > 0,
+        is_refining: pending > 0 || (retain_stale_for_review && incomplete),
         ..Default::default()
     };
     Ok(tex)

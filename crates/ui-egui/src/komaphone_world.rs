@@ -76,7 +76,7 @@ pub struct WorldUi {
     #[serde(skip)]
     pub export_tour: Option<scene::shared::TourId>,
     #[serde(skip)]
-    highlights: review::Highlights,
+    pub(crate) highlights: review::Highlights,
     #[serde(skip)]
     pub message: Option<String>,
     #[serde(skip)]
@@ -351,7 +351,21 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 remember(ui, "world.dimensions", &dim_resp);
                 ui.separator();
             }
-            let status_text = if app.ui.world.draft.is_some() { "Current stroke has not been saved".into() } else { app.session.worlds.status() };
+            let status_text = if app.ui.world.draft.is_some() {
+                "Current stroke has not been saved".into()
+            } else if app.session.worlds.error.is_none()
+                && let Some(active) = app.session.worlds.active.as_ref()
+                && active.viewer.review.as_ref().is_some_and(|r| r.interval.is_some())
+                && !app.session.worlds.has_pending_edits()
+            {
+                if active.pending > 0 {
+                    format!("Saved locally · {} edits waiting to sync", active.pending)
+                } else {
+                    format!("Saved locally · Synced revision {}", active.info.revision)
+                }
+            } else {
+                app.session.worlds.status()
+            };
             ui.add(egui::Label::new(&status_text).truncate()).on_hover_text(&status_text);
         });
         if let Some(message) = app.ui.world.message.as_ref().or(app.session.worlds.error.as_ref()) {
@@ -456,10 +470,15 @@ fn sync(app: &mut PhotocraftApp, ui: &egui::Ui) {
             app.ui.world.message = Some(error.to_string());
         }
     }
+    let review_interval = app.session.worlds.active.as_ref().and_then(|active| active.viewer.review.as_ref()).and_then(|review| review.interval.as_ref());
     #[cfg(not(target_arch = "wasm32"))]
-    let review_ready = !app.world_render.preparing;
+    let review_ready = review_interval.is_some_and(|interval| app.world_render.review_settled_for(interval.end_inclusive, interval.position));
     #[cfg(target_arch = "wasm32")]
     let review_ready = true;
+    let review_playing = review_interval.is_some_and(|interval| interval.playing);
+    if review_playing {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
     if let Some(active) = app.session.worlds.active.as_mut() {
         if let Some(review) = active.viewer.review.as_mut()
             && review.interval.is_some()

@@ -237,12 +237,58 @@ pub(super) fn pad_tile_rows(src: &[u8], dst: &mut [u8]) -> Result<()> {
 #[derive(Default)]
 pub struct CpuTilePresenter {
     texture: Option<egui::TextureHandle>,
+    last_scope_gen: u64,
+    last_size: Option<[usize; 2]>,
+    last_presented_view: Option<Viewport>,
+    held_review_frames: u32,
 }
 
 impl CpuTilePresenter {
+    pub fn reset(&mut self) {
+        self.texture = None;
+        self.last_scope_gen = 0;
+        self.last_size = None;
+        self.last_presented_view = None;
+        self.held_review_frames = 0;
+    }
+
+    #[cfg(test)]
     pub fn present_tiles(&mut self, ctx: &egui::Context, view: &Viewport, density: f32, tiles: &[(WorldRect, [f32; 4], &[u8])]) -> Result<egui::TextureId> {
+        self.present_tiles_for_review(ctx, view, density, 0, false, false, tiles)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_tiles_for_review(
+        &mut self,
+        ctx: &egui::Context,
+        view: &Viewport,
+        density: f32,
+        scope_gen: u64,
+        incomplete: bool,
+        retain_stale_for_review: bool,
+        tiles: &[(WorldRect, [f32; 4], &[u8])],
+    ) -> Result<egui::TextureId> {
+        if self.last_scope_gen != scope_gen {
+            self.last_scope_gen = scope_gen;
+            self.last_size = None;
+            self.last_presented_view = None;
+            self.held_review_frames = 0;
+        }
         let w = ((f64::from(view.width) * f64::from(density)).ceil() as usize).clamp(1, 2048);
         let h = ((f64::from(view.height) * f64::from(density)).ceil() as usize).clamp(1, 2048);
+        if retain_stale_for_review
+            && incomplete
+            && self.held_review_frames < 20
+            && self.last_size == Some([w, h])
+            && self.last_presented_view.as_ref() == Some(view)
+            && let Some(tex) = self.texture.as_ref()
+        {
+            self.held_review_frames = self.held_review_frames.saturating_add(1);
+            return Ok(tex.id());
+        }
+        self.held_review_frames = 0;
+        self.last_size = Some([w, h]);
+        self.last_presented_view = Some(view.clone());
         let mut pixels = vec![egui::Color32::WHITE; w * h];
         let sx_scale = w as f64 / f64::from(view.width);
         let sy_scale = h as f64 / f64::from(view.height);

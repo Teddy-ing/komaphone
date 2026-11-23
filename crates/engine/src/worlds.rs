@@ -96,6 +96,10 @@ impl Worlds {
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
     }
+    /// True when local mutation/upload requests other than viewport/review state checkpoints are in flight.
+    pub fn has_pending_edits(&self) -> bool {
+        self.pending.iter().any(|seq| !self.view_pending.contains_key(seq))
+    }
     pub fn pending_local_sequences(&self) -> Vec<u64> {
         self.pending.iter().copied().collect()
     }

@@ -92,6 +92,8 @@ pub struct WorldGpu {
     targets: Option<Targets>,
     last_scope_gen: u64,
     last_lod: Option<u8>,
+    last_presented_view: Option<Viewport>,
+    held_review_frames: u32,
     frame_counter: u64,
     pub stats: Stats,
 }
@@ -229,6 +231,8 @@ impl WorldGpu {
             targets: None,
             last_scope_gen: 0,
             last_lod: None,
+            last_presented_view: None,
+            held_review_frames: 0,
             frame_counter: 0,
             stats: Stats::default(),
         })
@@ -236,6 +240,11 @@ impl WorldGpu {
 
     pub fn budget(&self) -> TileBudget {
         self.budget
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_review_frames(&self) -> u32 {
+        self.held_review_frames
     }
 
     /// Resolve the active target LOD using the presenter's hysteresis state so
@@ -247,6 +256,8 @@ impl WorldGpu {
     pub fn purge_slots(&mut self) {
         self.atlas.clear();
         self.last_lod = None;
+        self.last_presented_view = None;
+        self.held_review_frames = 0;
     }
 
     /// Non-blocking interactive tile presentation: never rasterizes static committed
@@ -271,6 +282,8 @@ impl WorldGpu {
             self.atlas.clear();
             self.last_scope_gen = scope_gen;
             self.last_lod = None;
+            self.last_presented_view = None;
+            self.held_review_frames = 0;
         }
         self.frame_counter = self.frame_counter.saturating_add(1);
         let frame = self.frame_counter;
@@ -333,7 +346,6 @@ impl WorldGpu {
         let mut async_jobs_to_schedule: Vec<(TileKey, u64, u64)> = Vec::new();
         let edit_seq = mgr.edit_seq();
 
-        let _ = retain_stale_for_review;
         let local_counts = self.present_local_brush_tiles(
             mgr,
             view,
@@ -468,7 +480,23 @@ impl WorldGpu {
         mgr.schedule_view_interactive(view, target_lod, &static_schedule, &missing_no_fallback, local_brush_tiles.is_empty());
 
         let uploads_count = uploads.len();
-        let id = self.submit_uploads_and_quads(size, &uploads)?;
+        self.upload_pending_tiles(&uploads)?;
+        let incomplete = pending_tiles > 0 || fallback_tiles > 0 || (anim_pending_tiles > 0 && pending_assets == 0);
+        let can_hold_review = retain_stale_for_review
+            && incomplete
+            && self.held_review_frames < 20
+            && self.targets.as_ref().is_some_and(|t| t.size == size)
+            && self.last_presented_view.as_ref() == Some(view);
+
+        let id = if can_hold_review {
+            self.held_review_frames = self.held_review_frames.saturating_add(1);
+            self.targets.as_ref().ok_or("Missing GPU output target")?.id
+        } else {
+            self.held_review_frames = 0;
+            let id = self.render_quads(size)?;
+            self.last_presented_view = Some(view.clone());
+            id
+        };
 
         let tile_array_bytes = u64::from(TILE_PHYSICAL) * u64::from(TILE_PHYSICAL) * 4 * u64::from(self.budget.gpu_layers);
         self.stats = Stats {
@@ -486,7 +514,7 @@ impl WorldGpu {
             anim_pending_tiles,
             uploads_this_frame: uploads_count,
             target_lod,
-            is_refining: pending_tiles > 0,
+            is_refining: pending_tiles > 0 || (retain_stale_for_review && incomplete),
         };
         if let Some(fault) = self.health.fault() {
             return Err(fault.to_string());
@@ -1104,12 +1132,13 @@ impl WorldGpu {
             let view = texture.create_view(&Default::default());
             let id = self.rs.renderer.write().register_native_texture(&self.rs.device, &view, wgpu::FilterMode::Nearest);
             self.targets = Some(Targets { size, output: OutputSurface { _texture: texture, view }, id });
+            self.last_presented_view = None;
+            self.held_review_frames = 0;
         }
         self.targets.as_ref().map(|t| t.id).ok_or_else(|| "Missing GPU world output surface".into())
     }
 
-    fn submit_uploads_and_quads(&mut self, size: [u32; 2], uploads: &[PendingUpload]) -> Result<egui::TextureId> {
-        let id = self.ensure_output(size)?;
+    fn upload_pending_tiles(&mut self, uploads: &[PendingUpload]) -> Result<()> {
         // Upload in staging-ring chunks so even a blocking multi-tile upload never allocates unbounded staging memory.
         for chunk in uploads.chunks(self.staging_slots.max(1)) {
             let mut encoder = self.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world tile upload") });
@@ -1133,7 +1162,11 @@ impl WorldGpu {
             }
             self.rs.queue.submit([encoder.finish()]);
         }
+        Ok(())
+    }
 
+    fn render_quads(&mut self, size: [u32; 2]) -> Result<egui::TextureId> {
+        let id = self.ensure_output(size)?;
         let targets = self.targets.as_ref().ok_or("Missing GPU output target")?;
         let index_count = self.quads.index_count();
         let mut encoder = self.rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world tile quad pass") });
@@ -1175,6 +1208,12 @@ impl WorldGpu {
         }
         self.rs.queue.submit([encoder.finish()]);
         Ok(id)
+    }
+
+    #[cfg(test)]
+    fn submit_uploads_and_quads(&mut self, size: [u32; 2], uploads: &[PendingUpload]) -> Result<egui::TextureId> {
+        self.upload_pending_tiles(uploads)?;
+        self.render_quads(size)
     }
 }
 

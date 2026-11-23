@@ -6,8 +6,8 @@ use scene::shared::{
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Highlights {
-    author: Option<scene::OwnerId>,
-    include_own: bool,
+    pub(crate) author: Option<scene::OwnerId>,
+    pub(crate) include_own: bool,
     key: Option<(CanvasId, u64, u64, Option<scene::OwnerId>, bool)>,
     page: Vec<Change>,
     scanned: u64,

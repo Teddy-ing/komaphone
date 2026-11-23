@@ -177,9 +177,19 @@ fn installed_review_and_quarantined_future_projection_cannot_masquerade_as_live_
     let live = key(&latest, 1);
     let mut historical = live.clone();
     historical.revision = Revision::Review { end: 2, position: 1 };
+    let mut historical_next = live.clone();
+    historical_next.revision = Revision::Review { end: 2, position: 2 };
+    let mut historical_prev = live.clone();
+    historical_prev.revision = Revision::Review { end: 2, position: 0 };
+    let mut different_interval = live.clone();
+    different_interval.revision = Revision::Review { end: 3, position: 2 };
     let mut presentation =
         super::super::Presentation { renderer: Some(WorldRenderer::new(&earlier).unwrap()), ready: Some(historical.clone()), ..Default::default() };
     assert!(presentation.can_render(&historical));
+    assert!(presentation.can_render(&historical_next), "Forward same-interval review step must retain previous frame without white flash");
+    presentation.ready = Some(historical_next.clone());
+    assert!(presentation.can_render(&historical_prev), "Backward same-interval scrub must retain previous frame without white flash");
+    assert!(!presentation.can_render(&different_interval), "Cross-interval review frames cannot masquerade across different end snapshots");
     assert!(!presentation.can_render(&live), "Leaving review must await a live projection");
     presentation.renderer = Some(WorldRenderer::new(&latest).unwrap());
     presentation.ready = Some(live.clone());

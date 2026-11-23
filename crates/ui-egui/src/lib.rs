@@ -945,4 +945,7 @@ mod komaphone_qol005_tests;
 mod komaphone_qol010_tests;
 
 #[cfg(test)]
+mod komaphone_qol013_tests;
+
+#[cfg(test)]
 mod komaphone_qol016_tests;

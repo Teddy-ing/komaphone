@@ -28,12 +28,18 @@ pub(super) struct Key {
     pub revision: Revision,
 }
 impl Key {
-    /// A clearly labelled older live projection may make progress while newer
-    /// edits arrive. Historical review frames and other accounts never qualify.
+    /// A clearly labelled older live projection or same-interval review frame may
+    /// make progress while the next requested frame arrives. Cross-interval review
+    /// frames, review-to-live transitions, and other accounts never qualify.
     pub fn may_show_before(&self, wanted: &Self) -> bool {
-        self.scope == wanted.scope
-            && matches!((&self.revision, &wanted.revision),
-            (Revision::Live { canonical:a, display:b, .. }, Revision::Live {canonical:c, display:d, ..}) if a <= c && b <= d)
+        if self.scope != wanted.scope {
+            return false;
+        }
+        match (&self.revision, &wanted.revision) {
+            (Revision::Live { canonical: a, display: b, .. }, Revision::Live { canonical: c, display: d, .. }) => a <= c && b <= d,
+            (Revision::Review { end: e1, .. }, Revision::Review { end: e2, .. }) => e1 == e2,
+            _ => false,
+        }
     }
 }
 struct Request {
