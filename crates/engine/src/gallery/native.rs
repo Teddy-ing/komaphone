@@ -1,24 +1,47 @@
 use super::{GalleryAction, GalleryItem};
 use crate::{EngineError, Result, Session, gallery_media};
-use photocraft_local_store::gallery::{GalleryStore, read_archive, write_archive};
+use photocraft_local_store::gallery::{GalleryKind, GalleryStore, read_archive, write_archive};
 use photocraft_local_store::{LoadedDraft, ReplayKind, ReplayRecord, SaveRequest, Store, StoreOptions};
 use photocraft_party::gallery::{GALLERY_SCHEMA, GalleryBundle, GalleryContent, GalleryManifest, MAX_GALLERY_MANIFEST_BYTES};
 use photocraft_party::replay_artifact::{ReplayArtifact, ReplayArtifactStep};
-use photocraft_party::{EventId, ProjectId, ReplayId};
+use photocraft_party::{AssetHash, EventId, ProjectId, ReplayId};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 pub(super) enum Request {
-    Action { action: GalleryAction, source: Option<(ProjectId, bool)> },
-    ScopedAction { action: GalleryAction, source: Option<(ProjectId, bool)>, files: Arc<dyn super::GalleryFileAccess> },
+    Action { action: GalleryAction, source: Option<(ProjectId, bool)>, protected: BTreeSet<ProjectId> },
+    ScopedAction { action: GalleryAction, source: Option<(ProjectId, bool)>, protected: BTreeSet<ProjectId>, files: Arc<dyn super::GalleryFileAccess> },
     Insert(Box<GalleryBundle>),
 }
 enum Response {
-    Listed { items: Vec<GalleryItem>, used: u64, quota: u64 },
+    Listed {
+        items: Vec<GalleryItem>,
+        used: u64,
+        quota: u64,
+    },
+    SavedToGallery {
+        id: ProjectId,
+        title: String,
+        updated_at: String,
+        updated_existing: bool,
+        removed_draft: bool,
+        items: Vec<GalleryItem>,
+        used: u64,
+        quota: u64,
+        deleted_keys: Vec<(ProjectId, bool)>,
+    },
+    Purged {
+        deleted_keys: Vec<(ProjectId, bool)>,
+        items: Vec<GalleryItem>,
+        used: u64,
+        quota: u64,
+        notice: String,
+    },
     Opened(Box<GalleryManifest>, bool, Vec<ProjectId>, crate::rooms::media::RoomImage, gallery_media::ReplayInfo, usize),
+    OpenedEditable(Box<LoadedDraft>),
     Playback((ProjectId, bool), u8, bool, Option<String>),
     Notes(ProjectId, Vec<(photocraft_party::AssignmentId, String)>),
     Image((ProjectId, bool), crate::rooms::media::RoomImage, Option<gallery_media::ReplayInfo>),
@@ -117,8 +140,8 @@ impl State {
         Ok(sources)
     }
     fn handle(&mut self, request: Request) -> Result<Response> {
-        let action = match request {
-            Request::ScopedAction { action, source, files } => {
+        let (action, protected) = match request {
+            Request::ScopedAction { action, source, protected, files } => {
                 if matches!(action, GalleryAction::Export { .. })
                     && (source.is_none() || source != self.active.as_ref().map(|bundle| (bundle.manifest.id, self.active_draft)))
                 {
@@ -136,7 +159,7 @@ impl State {
                     (GalleryAction::Restore { .. }, GalleryAction::Restore { path, destination }) => GalleryAction::Restore { path, destination },
                     _ => return Err(error("Gallery file adapter changed the requested operation")),
                 };
-                let mut response = self.handle(Request::Action { action: staged, source })?;
+                let mut response = self.handle(Request::Action { action: staged, source, protected })?;
                 prepared.finish()?;
                 if let Response::Notice(notice) = &mut response {
                     *notice = match action {
@@ -155,7 +178,7 @@ impl State {
                 let info = self.gallery.insert(&bundle).map_err(error)?;
                 return Ok(Response::Notice(format!("Saved locally: {}. Native artwork and replay are available offline.", info.title)));
             }
-            Request::Action { action, source } => {
+            Request::Action { action, source, protected } => {
                 if matches!(
                     action,
                     GalleryAction::Render { .. }
@@ -167,11 +190,14 @@ impl State {
                 {
                     return Err(error("Gallery selection changed; reopen the intended original"));
                 }
-                action
+                (action, protected)
             }
         };
         match action {
-            GalleryAction::Refresh => self.list(),
+            GalleryAction::Refresh => {
+                let (items, used, quota) = self.list()?;
+                Ok(Response::Listed { items, used, quota })
+            }
             GalleryAction::Open { entry, draft } => {
                 let bundle = self.bundle(entry, draft, true)?;
                 let image = cover(&bundle)?;
@@ -201,8 +227,14 @@ impl State {
                         bundle.manifest.updated_at = updated_at;
                     }
                 }
-                self.list()
+                let (items, used, quota) = self.list()?;
+                Ok(Response::Listed { items, used, quota })
             }
+            GalleryAction::SaveDraft { entry, title } => self.save_draft(entry, title, &protected),
+            GalleryAction::OpenEditable { entry } => self.open_editable(entry),
+            GalleryAction::Delete { entry, draft } => self.delete_item(entry, draft, &protected),
+            GalleryAction::EmptyTrash => self.empty_trash(&protected),
+            GalleryAction::ClearTemp => self.clear_temp(&protected),
             GalleryAction::Thumbnail { entry, draft } => {
                 let bundle = self.bundle(entry, draft, false)?;
                 Ok(Response::Thumbnail(entry, draft, self.sources(&bundle, draft)?, gallery_media::thumbnail(&bundle, 0, 192)?))
@@ -308,7 +340,7 @@ impl State {
                         gallery_media::validate_originals(bundle).map_err(|e| photocraft_local_store::Error::Invalid(e.to_string()))
                     })
                     .map_err(error)?;
-                self.handle(Request::Action { action: GalleryAction::Open { entry: info.id, draft: false }, source: None })
+                self.handle(Request::Action { action: GalleryAction::Open { entry: info.id, draft: false }, source: None, protected })
             }
             GalleryAction::Backup { path } => {
                 self.backup(Path::new(&path))?;
@@ -323,11 +355,227 @@ impl State {
         }
     }
 
-    fn list(&self) -> Result<Response> {
+    fn save_draft(&mut self, entry: Option<ProjectId>, title: Option<String>, protected: &BTreeSet<ProjectId>) -> Result<Response> {
+        let entry = entry.ok_or_else(|| error("Choose a drawing to save to gallery"))?;
+        let updated_existing = self.gallery.list(true).map_err(error)?.iter().any(|item| item.id == entry);
+        let mut bundle = self.bundle(entry, true, true)?;
+        if let Some(title) = title.as_deref() {
+            bundle.manifest.title = title.trim().to_owned();
+        }
+        let info = self.gallery.save_project(&bundle, title.as_deref()).map_err(error)?;
+        let mut removed_draft = false;
+        let mut deleted_keys = Vec::new();
+        if !protected.contains(&entry) && self.local.delete_project(entry).is_ok() {
+            let _ = self.gallery.remove_draft_preference(entry);
+            removed_draft = true;
+            deleted_keys.push((entry, true));
+        }
+        if self.active.as_ref().is_some_and(|active| active.manifest.id == entry) {
+            if let Ok(saved) = self.gallery.load(entry) {
+                self.active = Some(saved);
+                self.active_draft = false;
+            } else if removed_draft {
+                self.active = None;
+                self.active_draft = false;
+            }
+            self.gif = None;
+        }
+        let (items, used, quota) = self.list()?;
+        Ok(Response::SavedToGallery {
+            id: entry,
+            title: info.title,
+            updated_at: info.updated_at,
+            updated_existing,
+            removed_draft,
+            items,
+            used,
+            quota,
+            deleted_keys,
+        })
+    }
+
+    fn open_editable(&mut self, entry: ProjectId) -> Result<Response> {
+        match self.local.load(entry) {
+            Ok(loaded) => Ok(Response::OpenedEditable(Box::new(loaded))),
+            Err(photocraft_local_store::Error::NotFound) => {
+                let bundle = self.gallery.load(entry).map_err(error)?;
+                if !matches!(bundle.manifest.content, GalleryContent::Project { .. }) {
+                    return Err(error("Saved games cannot be edited directly; use Remix to create a new drawing"));
+                }
+                restore_draft(&mut self.local, &bundle)?;
+                let loaded = self.local.load(entry).map_err(error)?;
+                Ok(Response::OpenedEditable(Box::new(loaded)))
+            }
+            Err(err) => Err(error(err)),
+        }
+    }
+
+    fn delete_item(&mut self, entry: ProjectId, draft: bool, protected: &BTreeSet<ProjectId>) -> Result<Response> {
+        if draft {
+            if protected.contains(&entry) {
+                return Err(error("Close this drawing in the Workroom before deleting it permanently"));
+            }
+            let trashed = self.gallery.draft_preferences().map_err(error)?.iter().any(|pref| pref.id == entry && pref.trashed);
+            if !trashed {
+                return Err(error("Move this item to Trash before deleting it permanently"));
+            }
+            self.local.delete_project(entry).map_err(error)?;
+            self.gallery.remove_draft_preference(entry).map_err(error)?;
+        } else {
+            self.gallery.delete_entry(entry).map_err(error)?;
+        }
+        if self.active_draft == draft && self.active.as_ref().is_some_and(|bundle| bundle.manifest.id == entry) {
+            self.active = None;
+            self.gif = None;
+        }
+        let (items, used, quota) = self.list()?;
+        let deleted_keys = vec![(entry, draft)];
+        Ok(Response::Purged { deleted_keys, items, used, quota, notice: "Deleted permanently.".into() })
+    }
+
+    fn empty_trash(&mut self, protected: &BTreeSet<ProjectId>) -> Result<Response> {
+        let deleted_saved = self.gallery.delete_trashed_entries().map_err(error)?;
+        let prefs = self.gallery.draft_preferences().map_err(error)?;
+        let local_ids: BTreeSet<ProjectId> = self.local.list().map_err(error)?.into_iter().map(|draft| draft.project).collect();
+        let mut deletable_drafts = Vec::new();
+        let mut deleted_existing_drafts = 0usize;
+        let mut skipped_open = 0usize;
+        for pref in prefs.into_iter().filter(|pref| pref.trashed) {
+            if local_ids.contains(&pref.id) && protected.contains(&pref.id) {
+                skipped_open = skipped_open.saturating_add(1);
+                continue;
+            }
+            if local_ids.contains(&pref.id) {
+                deleted_existing_drafts = deleted_existing_drafts.saturating_add(1);
+            }
+            deletable_drafts.push(pref.id);
+        }
+        if !deletable_drafts.is_empty() {
+            let existing_only: Vec<ProjectId> = deletable_drafts.iter().copied().filter(|id| local_ids.contains(id)).collect();
+            if !existing_only.is_empty() {
+                self.local.delete_projects(&existing_only).map_err(error)?;
+            }
+            self.gallery.remove_draft_preferences(&deletable_drafts).map_err(error)?;
+        }
+        let deleted_keys: Vec<(ProjectId, bool)> =
+            deleted_saved.iter().copied().map(|id| (id, false)).chain(deletable_drafts.iter().copied().map(|id| (id, true))).collect();
+        if self.active.as_ref().is_some_and(|bundle| deleted_keys.contains(&(bundle.manifest.id, self.active_draft))) {
+            self.active = None;
+            self.gif = None;
+        }
+        let (items, used, quota) = self.list()?;
+        let deleted_total = deleted_saved.len().saturating_add(deleted_existing_drafts);
+        let notice = if deleted_total == 0 && skipped_open == 0 {
+            "Trash is already empty.".into()
+        } else if skipped_open > 0 {
+            format!("Permanently deleted {deleted_total} item(s). Kept {skipped_open} open drawing(s); close them in the Workroom to delete.")
+        } else {
+            format!("Permanently deleted {deleted_total} item(s) from Trash.")
+        };
+        Ok(Response::Purged { deleted_keys, items, used, quota, notice })
+    }
+
+    fn clear_temp(&mut self, protected: &BTreeSet<ProjectId>) -> Result<Response> {
+        let mut deleted_keys: Vec<(ProjectId, bool)> = self.auto_prune_drafts(protected).into_iter().map(|id| (id, true)).collect();
+        let saved_checkpoints = self.gallery.saved_project_checkpoints().unwrap_or_default();
+        let prefs = self.gallery.draft_preferences().map_err(error)?;
+        let mut synced_to_prune = Vec::new();
+        let mut trashed_count = 0usize;
+        let mut skipped_open = 0usize;
+        for draft in self.local.list().map_err(error)? {
+            if prefs.iter().any(|pref| pref.id == draft.project && pref.trashed) {
+                continue;
+            }
+            if protected.contains(&draft.project) {
+                skipped_open = skipped_open.saturating_add(1);
+                continue;
+            }
+            let matches_saved = saved_checkpoints
+                .get(&draft.project)
+                .is_some_and(|saved_hash| self.local.head_checkpoint_hash(draft.project).ok().flatten() == Some(*saved_hash));
+            if matches_saved {
+                synced_to_prune.push(draft.project);
+            } else {
+                self.gallery.update_draft(draft.project, None, None, Some(true)).map_err(error)?;
+                trashed_count = trashed_count.saturating_add(1);
+            }
+        }
+        if !synced_to_prune.is_empty() && self.local.delete_projects(&synced_to_prune).is_ok() {
+            let _ = self.gallery.remove_draft_preferences(&synced_to_prune);
+            for id in synced_to_prune {
+                deleted_keys.push((id, true));
+            }
+        }
+        if self.active.as_ref().is_some_and(|bundle| deleted_keys.contains(&(bundle.manifest.id, self.active_draft))) {
+            self.active = None;
+            self.gif = None;
+        }
+        let pruned_count = deleted_keys.len();
+        let (items, used, quota) = self.list()?;
+        let notice = if trashed_count > 0 && skipped_open > 0 {
+            format!("Moved {trashed_count} temporary draft(s) to Trash. Kept {skipped_open} open drawing(s).")
+        } else if trashed_count > 0 {
+            format!("Moved {trashed_count} temporary draft(s) to Trash. You can restore them from Trash.")
+        } else if pruned_count > 0 {
+            format!("Cleaned up {pruned_count} temporary draft(s).")
+        } else if skipped_open > 0 {
+            "No closed temporary drafts to clear. Open drawings stay in the Workroom.".into()
+        } else {
+            "Temp is already clean.".into()
+        };
+        Ok(Response::Purged { deleted_keys, items, used, quota, notice })
+    }
+
+    fn auto_prune_drafts(&mut self, protected: &BTreeSet<ProjectId>) -> Vec<ProjectId> {
+        let prefs = self.gallery.draft_preferences().unwrap_or_default();
+        let covered = self.gallery.covered_game_projects().unwrap_or_default();
+        let Ok(drafts) = self.local.list() else {
+            return Vec::new();
+        };
+        let mut to_delete = Vec::new();
+        for draft in drafts {
+            if protected.contains(&draft.project) {
+                continue;
+            }
+            if prefs.iter().any(|pref| pref.id == draft.project && (pref.trashed || pref.favorite || pref.title.is_some())) {
+                continue;
+            }
+            if self.local.is_untouched_blank(draft.project).unwrap_or(false) || covered.contains(&draft.project) {
+                to_delete.push(draft.project);
+            }
+        }
+        if to_delete.is_empty() {
+            return Vec::new();
+        }
+        if self.local.delete_projects(&to_delete).is_err() {
+            return Vec::new();
+        }
+        let _ = self.gallery.remove_draft_preferences(&to_delete);
+        if self.active_draft && self.active.as_ref().is_some_and(|bundle| to_delete.contains(&bundle.manifest.id)) {
+            self.active = None;
+            self.gif = None;
+        }
+        to_delete
+    }
+
+    fn list(&self) -> Result<(Vec<GalleryItem>, u64, u64)> {
         let mut items = Vec::new();
         let preferences = self.gallery.draft_preferences().map_err(error)?;
+        let covered = self.gallery.covered_game_projects().unwrap_or_default();
+        let saved_checkpoints = self.gallery.saved_project_checkpoints().unwrap_or_default();
+        let mut draft_heads: BTreeMap<ProjectId, AssetHash> = BTreeMap::new();
         for draft in self.local.list().map_err(error)? {
             let preference = preferences.iter().find(|p| p.id == draft.project);
+            let saved_hash = saved_checkpoints.get(&draft.project).copied();
+            let head_hash = if saved_hash.is_some() { self.local.head_checkpoint_hash(draft.project).ok().flatten() } else { None };
+            if let Some(hash) = head_hash {
+                draft_heads.insert(draft.project, hash);
+            }
+            let has_saved_copy = saved_hash.is_some();
+            let saved_matches_head = saved_hash.is_some() && head_hash == saved_hash;
+            let has_unsaved_edits = has_saved_copy && !saved_matches_head;
+            let untouched_blank = self.local.is_untouched_blank(draft.project).unwrap_or(false);
+            let covered_by_game = covered.contains(&draft.project);
             items.push(GalleryItem {
                 id: draft.project,
                 title: preference.and_then(|p| p.title.clone()).unwrap_or(draft.title),
@@ -339,18 +587,42 @@ impl State {
                 complete: true,
                 draft: true,
                 revision: draft.revision,
-                state: "Saved locally · private draft".into(),
+                state: if has_unsaved_edits { "Unsaved changes to saved drawing" } else { "Temporary draft" }.into(),
                 source_projects: vec![draft.project],
+                saved_matches_head,
+                has_saved_copy,
+                has_unsaved_edits,
+                untouched_blank,
+                covered_by_game,
             });
         }
         for entry in self.gallery.list(true).map_err(error)? {
+            let saved_hash = saved_checkpoints.get(&entry.id).copied();
+            let has_unsaved_edits =
+                entry.kind == GalleryKind::Project && !entry.trashed && draft_heads.get(&entry.id).is_some_and(|head| Some(*head) != saved_hash);
+            let state = match entry.kind {
+                GalleryKind::Project => {
+                    if has_unsaved_edits {
+                        "Saved drawing · newer draft in Temp"
+                    } else {
+                        "Saved drawing"
+                    }
+                }
+                GalleryKind::Animation | GalleryKind::ExquisiteCorpse => {
+                    if entry.complete {
+                        "Completed game"
+                    } else {
+                        "Incomplete game"
+                    }
+                }
+            };
             items.push(GalleryItem {
                 id: entry.id,
                 title: entry.title,
                 kind: match entry.kind {
-                    photocraft_local_store::gallery::GalleryKind::Project => "project",
-                    photocraft_local_store::gallery::GalleryKind::Animation => "animation",
-                    photocraft_local_store::gallery::GalleryKind::ExquisiteCorpse => "creature",
+                    GalleryKind::Project => "project",
+                    GalleryKind::Animation => "animation",
+                    GalleryKind::ExquisiteCorpse => "creature",
                 }
                 .into(),
                 authors: entry.authors.into_iter().map(|author| author.display_name).collect(),
@@ -360,18 +632,19 @@ impl State {
                 complete: entry.complete,
                 draft: false,
                 revision: 0,
-                state: if entry.complete { "Saved locally · complete archive" } else { "Saved locally · incomplete game" }.into(),
+                state: state.into(),
                 source_projects: entry.source_projects,
+                saved_matches_head: false,
+                has_saved_copy: false,
+                has_unsaved_edits,
+                untouched_blank: false,
+                covered_by_game: false,
             });
         }
         items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
         let local = self.local.usage().map_err(error)?;
         let gallery = self.gallery.usage().map_err(error)?;
-        Ok(Response::Listed {
-            items,
-            used: local.stored_bytes.saturating_add(gallery.stored_bytes),
-            quota: local.quota_bytes.saturating_add(gallery.quota_bytes),
-        })
+        Ok((items, local.stored_bytes.saturating_add(gallery.stored_bytes), local.quota_bytes.saturating_add(gallery.quota_bytes)))
     }
 
     fn backup(&mut self, path: &Path) -> Result<()> {
@@ -453,7 +726,9 @@ fn restore_draft(store: &mut Store, bundle: &GalleryBundle) -> Result<()> {
     let GalleryContent::Project { checkpoint, replay, .. } = &bundle.manifest.content else {
         return Err(error("Backup contains a game in its draft table"));
     };
-    if let Some(replay) = replay {
+    if let Some(replay) = replay
+        && !replay.steps.is_empty()
+    {
         for step in &replay.steps {
             let bytes = checkpoint_bytes(bundle, replay, step.checkpoint.asset)?;
             let document = photocraft_format::load_from_bytes_with(bytes, &load_options()).map_err(error)?;
@@ -637,6 +912,12 @@ impl Session {
             self.gallery.busy = false;
             match response {
                 Response::Listed { items, used, quota } => {
+                    let protected = self.active_protected_projects();
+                    for item in &items {
+                        if item.draft && !item.trashed && !item.favorite && (item.untouched_blank || item.covered_by_game) && !protected.contains(&item.id) {
+                            self.queue_safe_local_prune(item.id);
+                        }
+                    }
                     if let Some(active) = &mut self.gallery.active
                         && let Some(item) = items.iter().find(|item| item.id == active.id && item.draft == self.gallery.active_draft)
                     {
@@ -647,6 +928,53 @@ impl Session {
                     self.gallery.items = items;
                     self.gallery.usage_bytes = used;
                     self.gallery.quota_bytes = quota;
+                }
+                Response::SavedToGallery { id, title, updated_at, updated_existing, removed_draft, items, used, quota, deleted_keys } => {
+                    for key in std::iter::once((id, false)).chain(deleted_keys.iter().copied()) {
+                        self.gallery.thumbnails.remove(&key);
+                        self.gallery.thumbnail_sources.remove(&key);
+                        self.gallery.thumbnail_order.retain(|existing| *existing != key);
+                        if key.1 {
+                            self.local_projects.drafts.retain(|draft| draft.project != key.0);
+                        }
+                    }
+                    if let Some(active) = self.gallery.active.as_mut().filter(|active| active.id == id) {
+                        if self.gallery.active_draft && removed_draft {
+                            self.gallery.active_draft = false;
+                        }
+                        let active = Arc::make_mut(active);
+                        active.title = title.clone();
+                        active.updated_at = updated_at;
+                    } else if self.gallery.active.as_ref().is_some_and(|active| deleted_keys.contains(&(active.id, self.gallery.active_draft))) {
+                        self.gallery.active = None;
+                        self.gallery.active_sources.clear();
+                        self.gallery.image = None;
+                        self.gallery.replay = None;
+                    }
+                    self.gallery.items = items;
+                    self.gallery.usage_bytes = used;
+                    self.gallery.quota_bytes = quota;
+                    self.gallery.notice = Some(if updated_existing { format!("Updated in gallery: {title}") } else { format!("Saved to gallery: {title}") });
+                }
+                Response::Purged { deleted_keys, items, used, quota, notice } => {
+                    for key in &deleted_keys {
+                        self.gallery.thumbnails.remove(key);
+                        self.gallery.thumbnail_sources.remove(key);
+                        self.gallery.thumbnail_order.retain(|existing| existing != key);
+                        if key.1 {
+                            self.local_projects.drafts.retain(|draft| draft.project != key.0);
+                        }
+                    }
+                    if self.gallery.active.as_ref().is_some_and(|active| deleted_keys.contains(&(active.id, self.gallery.active_draft))) {
+                        self.gallery.active = None;
+                        self.gallery.active_sources.clear();
+                        self.gallery.image = None;
+                        self.gallery.replay = None;
+                    }
+                    self.gallery.items = items;
+                    self.gallery.usage_bytes = used;
+                    self.gallery.quota_bytes = quota;
+                    self.gallery.notice = Some(notice);
                 }
                 Response::Opened(manifest, draft, sources, image, replay, frames) => {
                     if !self.gallery_sources_allowed(&sources) {
@@ -671,6 +999,11 @@ impl Session {
                     if refresh && let Err(error) = self.gallery_action(GalleryAction::Refresh) {
                         self.gallery.error = Some(error.to_string());
                     }
+                }
+                Response::OpenedEditable(loaded) => {
+                    self.install_local_draft(*loaded);
+                    self.gallery.opened_document = true;
+                    self.gallery.notice = Some("Opened in Workroom for editing.".into());
                 }
                 Response::Playback(source, fps, looping, updated_at) => {
                     if let Some(active) = self.gallery.active.as_mut().filter(|active| (active.id, self.gallery.active_draft) == source) {

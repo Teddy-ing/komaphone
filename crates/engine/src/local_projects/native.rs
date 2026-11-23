@@ -2,24 +2,27 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
+use photocraft_local_store::gallery::GalleryStore;
 use photocraft_local_store::{DraftInfo, LoadedDraft, SaveAck, SaveRequest, Store, StoreOptions};
 use photocraft_party::contracts::{EventId, ProjectId};
 
-use super::{LocalStatus, Session};
+use super::{LocalStatus, PendingSave, Session};
 use crate::{EngineError, Result};
 
 pub(super) enum Request {
-    Save(Box<SaveRequest>),
+    Save { save: Box<SaveRequest>, dedup_existing: bool, exclude_projects: Vec<ProjectId> },
     List,
     Open(ProjectId),
     OpenAssigned { project: ProjectId, mode: photocraft_party::Mode },
     PrepareRoom(Box<crate::rooms::drafts::PrepareRequest>),
+    PruneClosed(Vec<ProjectId>),
 }
 enum Response {
-    Saved(std::result::Result<SaveAck, Failure>),
+    Saved(std::result::Result<(SaveAck, Option<u64>), Failure>),
     Listed(std::result::Result<(Vec<DraftInfo>, photocraft_local_store::Usage), String>),
     Opened(Box<std::result::Result<LoadedDraft, Failure>>),
     Prepared(Box<std::result::Result<crate::rooms::drafts::Prepared, String>>),
+    Pruned(Vec<ProjectId>),
 }
 
 struct Failure {
@@ -47,12 +50,13 @@ pub(super) struct Worker {
 
 impl Worker {
     fn start(path: PathBuf, options: StoreOptions) -> Result<Self> {
-        let (tx, requests) = mpsc::sync_channel(4);
-        let (responses, rx) = mpsc::sync_channel(4);
+        let (tx, requests) = mpsc::sync_channel(8);
+        let (responses, rx) = mpsc::sync_channel(8);
         std::thread::Builder::new()
             .name("komaphone-local-store".into())
             .spawn(move || {
                 let mut store = None;
+                let gallery_path = path.parent().map(|root| root.join("gallery.sqlite3"));
                 while let Ok(request) = requests.recv() {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if store.is_none() {
@@ -60,7 +64,19 @@ impl Worker {
                         }
                         let store = store.as_mut().ok_or("Local store unavailable")?;
                         Ok::<_, String>(match &request {
-                            Request::Save(save) => Response::Saved(store.save(save).map_err(Failure::save)),
+                            Request::Save { save, dedup_existing, exclude_projects } => {
+                                if *dedup_existing
+                                    && save.expected_revision == 0
+                                    && let Ok(Some((existing_project, existing_revision, existing_elapsed_ms))) =
+                                        store.find_project_matching_document(&save.document, exclude_projects)
+                                {
+                                    return Ok(Response::Saved(Ok((
+                                        SaveAck { project: existing_project, revision: existing_revision, event_id: save.request_id, device_sequence: 0 },
+                                        Some(existing_elapsed_ms),
+                                    ))));
+                                }
+                                Response::Saved(store.save(save).map(|ack| (ack, None)).map_err(Failure::save))
+                            }
                             Request::List => {
                                 Response::Listed(store.list().and_then(|drafts| store.usage().map(|usage| (drafts, usage))).map_err(|e| e.to_string()))
                             }
@@ -69,15 +85,17 @@ impl Worker {
                                 Response::Opened(Box::new(crate::rooms::drafts::open(store, *project, *mode).map_err(Failure::local)))
                             }
                             Request::PrepareRoom(request) => Response::Prepared(Box::new(crate::rooms::drafts::prepare(store, request))),
+                            Request::PruneClosed(projects) => Response::Pruned(prune_closed(store, gallery_path.as_deref(), options, projects)),
                         })
                     }))
                     .unwrap_or_else(|_| Err("The local save worker stopped this operation unexpectedly; retry the retained draft".into()));
                     let response = result.unwrap_or_else(|error| match request {
-                        Request::Save(_) => Response::Saved(Err(Failure::global(error))),
+                        Request::Save { .. } => Response::Saved(Err(Failure::global(error))),
                         Request::List => Response::Listed(Err(error)),
                         Request::Open(_) => Response::Opened(Box::new(Err(Failure::global(error)))),
                         Request::OpenAssigned { .. } => Response::Opened(Box::new(Err(Failure::global(error)))),
                         Request::PrepareRoom(_) => Response::Prepared(Box::new(Err(error))),
+                        Request::PruneClosed(_) => Response::Pruned(Vec::new()),
                     });
                     if responses.send(response).is_err() {
                         break;
@@ -87,6 +105,40 @@ impl Worker {
             .map_err(|e| EngineError::Other(format!("Cannot start local save worker: {e}")))?;
         Ok(Self { tx, rx })
     }
+}
+
+fn prune_closed(store: &mut Store, gallery_path: Option<&std::path::Path>, options: StoreOptions, projects: &[ProjectId]) -> Vec<ProjectId> {
+    if projects.is_empty() {
+        return Vec::new();
+    }
+    let mut gallery = gallery_path.filter(|path| path.exists()).and_then(|path| GalleryStore::open(path, options).ok());
+    let prefs = gallery.as_ref().and_then(|g| g.draft_preferences().ok()).unwrap_or_default();
+    let covered = gallery.as_ref().and_then(|g| g.covered_game_projects().ok()).unwrap_or_default();
+    let saved_checkpoints = gallery.as_ref().and_then(|g| g.saved_project_checkpoints().ok()).unwrap_or_default();
+    let mut to_delete = Vec::new();
+    for &project in projects {
+        let pref = prefs.iter().find(|p| p.id == project);
+        if pref.is_some_and(|p| p.trashed) {
+            continue;
+        }
+        let has_custom_meta = pref.is_some_and(|p| p.title.is_some() || p.favorite);
+        let matches_saved = saved_checkpoints.get(&project).is_some_and(|saved_hash| store.head_checkpoint_hash(project).ok().flatten() == Some(*saved_hash));
+        let is_blank = !has_custom_meta && store.is_untouched_blank(project).unwrap_or(false);
+        let is_covered = !has_custom_meta && covered.contains(&project);
+        if matches_saved || is_blank || is_covered {
+            to_delete.push(project);
+        }
+    }
+    if to_delete.is_empty() {
+        return Vec::new();
+    }
+    if store.delete_projects(&to_delete).is_err() {
+        return Vec::new();
+    }
+    if let Some(gallery) = gallery.as_mut() {
+        let _ = gallery.remove_draft_preferences(&to_delete);
+    }
+    to_delete
 }
 
 fn random_hex() -> Result<String> {
@@ -141,18 +193,31 @@ impl Session {
         }
         if !self.local_projects.writing
             && self.local_projects.error.is_none()
-            && let Some((request, _, _)) = &self.local_projects.pending
+            && let Some(pending) = &self.local_projects.pending
         {
-            match self.local_request(Request::Save(Box::new(request.clone()))) {
+            let exclude_projects = if pending.dedup_existing {
+                self.documents().iter().filter(|d| d.doc.id != pending.doc).filter_map(|d| self.local_projects.status(d.doc.id).project).collect()
+            } else {
+                Vec::new()
+            };
+            match self.local_request(Request::Save { save: Box::new(pending.request.clone()), dedup_existing: pending.dedup_existing, exclude_projects }) {
                 Ok(()) => self.local_projects.writing = true,
                 Err(error) => self.local_projects.error = Some(error.to_string()),
+            }
+        }
+        if !self.local_projects.pruning && !self.local_projects.writing && self.local_projects.error.is_none() && !self.local_projects.prune_queue.is_empty() {
+            let queued = std::mem::take(&mut self.local_projects.prune_queue);
+            if self.local_request(Request::PruneClosed(queued.clone())).is_ok() {
+                self.local_projects.pruning = true;
+            } else {
+                self.local_projects.prune_queue = queued;
             }
         }
         for (&doc, state) in &mut self.local_projects.states {
             state.pending = self
                 .local_replay
                 .pending_for(doc)
-                .saturating_add(usize::from(self.local_projects.pending.as_ref().is_some_and(|(_, id, _)| *id == doc)))
+                .saturating_add(usize::from(self.local_projects.pending.as_ref().is_some_and(|pending| pending.doc == doc)))
                 .saturating_add(usize::from(self.local_projects.failed.contains_key(&doc)));
         }
     }
@@ -161,6 +226,7 @@ impl Session {
         let blocked: HashSet<_> = self.local_projects.failed.keys().copied().collect();
         let Some(edit) = self.local_replay.peek_unblocked(&blocked) else { return Ok(()) };
         let doc = edit.document.id;
+        let dedup_existing = self.local_projects.recovery_dedup.remove(&doc);
         let state = self.local_projects.states.entry(doc).or_default();
         let project = match state.project {
             Some(project) => project,
@@ -174,9 +240,9 @@ impl Session {
             document: edit.document.as_ref().clone(),
             event: edit.record.clone(),
         };
-        let revision = edit.editor_revision;
+        let editor_revision = edit.editor_revision;
         state.project = Some(project);
-        self.local_projects.pending = Some((request, doc, revision));
+        self.local_projects.pending = Some(PendingSave { request, doc, editor_revision, dedup_existing });
         self.local_replay.pop_unblocked(&blocked);
         Ok(())
     }
@@ -195,21 +261,33 @@ impl Session {
             Response::Saved(result) => {
                 self.local_projects.writing = false;
                 match result {
-                    Ok(ack) => {
+                    Ok((ack, dedup_elapsed_ms)) => {
                         self.gallery.thumbnails.remove(&(ack.project, true));
-                        if let Some((request, doc, editor_revision)) = self.local_projects.pending.take() {
-                            if ack.project != request.project
-                                || ack.event_id != request.request_id
-                                || ack.revision != request.expected_revision.saturating_add(1)
-                            {
-                                self.local_projects.pending = Some((request, doc, editor_revision));
+                        if let Some(pending) = self.local_projects.pending.take() {
+                            let exact_new = ack.project == pending.request.project
+                                && ack.event_id == pending.request.request_id
+                                && ack.revision == pending.request.expected_revision.saturating_add(1);
+                            let dedup_match = pending.dedup_existing
+                                && dedup_elapsed_ms.is_some()
+                                && ack.event_id == pending.request.request_id
+                                && ack.revision >= 1
+                                && ack.device_sequence == 0;
+                            if !exact_new && !dedup_match {
+                                self.local_projects.pending = Some(pending);
                                 self.local_projects.error = Some("Local save returned a mismatched acknowledgment; the draft is retained".into());
                                 return;
                             }
-                            let state = self.local_projects.states.entry(doc).or_default();
+                            if let Some(elapsed_ms) = dedup_elapsed_ms {
+                                self.local_replay.advance_elapsed_ms(pending.doc, elapsed_ms);
+                            }
+                            let state = self.local_projects.states.entry(pending.doc).or_default();
+                            state.project = Some(ack.project);
                             state.local_revision = ack.revision;
-                            state.editor_revision = editor_revision;
+                            state.editor_revision = pending.editor_revision;
                             state.error = None;
+                            if !self.documents().iter().any(|d| d.doc.id == pending.doc) {
+                                self.prune_closed_local_project(pending.doc);
+                            }
                         }
                     }
                     Err(error) => self.retain_failed_save(error),
@@ -241,6 +319,21 @@ impl Session {
                     }
                 }
             }
+            Response::Pruned(deleted) => {
+                self.local_projects.pruning = false;
+                if !deleted.is_empty() {
+                    self.local_projects.drafts.retain(|draft| !deleted.contains(&draft.project));
+                    self.gallery.items.retain(|item| !(item.draft && deleted.contains(&item.id)));
+                    for project in &deleted {
+                        self.gallery.thumbnails.remove(&(*project, true));
+                    }
+                    if self.gallery.active_draft && self.gallery.active.as_ref().is_some_and(|active| deleted.contains(&active.id)) {
+                        self.gallery.active = None;
+                        self.gallery.image = None;
+                        self.gallery.replay = None;
+                    }
+                }
+            }
         }
     }
 
@@ -251,10 +344,11 @@ impl Session {
             self.local_projects.error = Some(error.message);
             return;
         }
-        if let Some((_, doc, _)) = &self.local_projects.pending {
-            self.local_projects.states.entry(*doc).or_default().error = Some(error.message.clone());
+        if let Some(pending) = &self.local_projects.pending {
+            self.local_projects.states.entry(pending.doc).or_default().error = Some(error.message.clone());
         }
-        if let Some(failed @ (_, doc, _)) = self.local_projects.pending.take() {
+        if let Some(failed) = self.local_projects.pending.take() {
+            let doc = failed.doc;
             if self.local_projects.failed.contains_key(&doc) {
                 self.local_projects.pending = Some(failed);
                 self.local_projects.error = Some("A local draft already retains a failed request; both edits remain pending".into());

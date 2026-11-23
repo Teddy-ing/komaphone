@@ -37,6 +37,23 @@ pub struct GalleryItem {
     pub revision: u64,
     pub state: String,
     pub source_projects: Vec<ProjectId>,
+    /// True on a draft row when `gallery.sqlite3` holds a non-trashed Saved project with the
+    /// exact same head checkpoint hash (so the Temp tab can hide the redundant working copy).
+    #[serde(default)]
+    pub saved_matches_head: bool,
+    /// True on a draft row when a non-trashed Saved copy with the same ID exists in Gallery.
+    #[serde(default)]
+    pub has_saved_copy: bool,
+    /// True when a working draft diverges from its Saved copy (set on both the draft row and
+    /// the corresponding Saved project row).
+    #[serde(default)]
+    pub has_unsaved_edits: bool,
+    /// True on a draft row that is still an untouched `file.new` baseline (`rev == 1`).
+    #[serde(default)]
+    pub untouched_blank: bool,
+    /// True on a draft row whose `ProjectId` is already preserved in a non-trashed Saved game.
+    #[serde(default)]
+    pub covered_by_game: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +73,22 @@ pub enum GalleryAction {
         favorite: Option<bool>,
         trashed: Option<bool>,
     },
+    SaveDraft {
+        #[serde(default)]
+        entry: Option<ProjectId>,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    OpenEditable {
+        entry: ProjectId,
+    },
+    Delete {
+        entry: ProjectId,
+        #[serde(default)]
+        draft: bool,
+    },
+    EmptyTrash,
+    ClearTemp,
     Thumbnail {
         entry: ProjectId,
         #[serde(default)]
@@ -114,8 +147,17 @@ impl GalleryAction {
         if object.contains_key("action") {
             return Err(EngineError::Other("Unexpected gallery action parameter".into()));
         }
+        if matches!(action, "refresh" | "empty_trash" | "clear_temp") && !object.is_empty() {
+            return Err(EngineError::Other("Unexpected gallery parameter".into()));
+        }
         object.insert("action".into(), serde_json::json!(action));
         let action: Self = serde_json::from_value(value).map_err(|e| EngineError::Other(format!("Invalid gallery request: {e}")))?;
+        if let Self::SaveDraft { title: Some(title), .. } = &action {
+            let trimmed = title.trim();
+            if trimmed.is_empty() || trimmed.len() > 96 || trimmed.chars().any(char::is_control) {
+                return Err(EngineError::Other("Gallery title must be 1–96 characters without control characters".into()));
+            }
+        }
         if let Self::Export { fps, format, .. } = &action
             && (!(1..=24).contains(fps) || !matches!(format.as_str(), "archive" | "png" | "gif" | "sequence"))
         {
@@ -230,7 +272,7 @@ impl Session {
         Ok(serde_json::json!({"pending":true,"saved":false}))
     }
 
-    fn gallery_action_with_files(&mut self, action: GalleryAction, files: Option<Arc<dyn GalleryFileAccess>>) -> Result<()> {
+    fn gallery_action_with_files(&mut self, mut action: GalleryAction, files: Option<Arc<dyn GalleryFileAccess>>) -> Result<()> {
         if !self.gallery.available() {
             return Err(EngineError::Other("Gallery requires the native app's local storage".into()));
         }
@@ -260,7 +302,7 @@ impl Session {
         {
             return Err(EngineError::Other("Previous assignment history is available after this game reveals".into()));
         }
-        match &action {
+        match &mut action {
             GalleryAction::Open { entry, draft } | GalleryAction::Thumbnail { entry, draft } | GalleryAction::Update { entry, draft, .. }
                 if (*draft && !self.gallery_draft_allowed(*entry))
                     || self
@@ -271,6 +313,62 @@ impl Session {
                         .is_some_and(|item| !self.gallery_item_allowed(item)) =>
             {
                 return Err(EngineError::Other("Previous assigned drawings remain private until this game reveals".into()));
+            }
+            GalleryAction::SaveDraft { entry, .. } => match *entry {
+                None => {
+                    let doc = self.active().ok_or_else(|| EngineError::Other("Open a drawing in the Workroom before saving to gallery".into()))?;
+                    let doc_id = doc.doc.id;
+                    if let Some(reason) = self.local_replay.excluded_reason(doc_id) {
+                        return Err(EngineError::Other(format!("External documents use File > Save instead of Gallery: {reason}")));
+                    }
+                    if self.is_active_party_document(doc_id) {
+                        return Err(EngineError::Other("Party room drawings save together when the game reveals".into()));
+                    }
+                    if !self.local_document_saved(doc_id) {
+                        return Err(EngineError::Other("Wait for local saving to finish before saving to gallery".into()));
+                    }
+                    let project =
+                        self.local_projects.status(doc_id).project.ok_or_else(|| EngineError::Other("This drawing has not saved locally yet".into()))?;
+                    *entry = Some(project);
+                }
+                Some(project) => {
+                    if !self.gallery_draft_allowed(project) {
+                        return Err(EngineError::Other("Previous assigned drawings remain private until this game reveals".into()));
+                    }
+                    if self.gallery_game_active() && self.rooms.status.game_drafts.as_ref().is_some_and(|drafts| drafts.projects.contains(&project)) {
+                        return Err(EngineError::Other("Party room drawings save together when the game reveals".into()));
+                    }
+                    if let Some(open_doc) = self.documents().iter().find(|d| self.local_projects.status(d.doc.id).project == Some(project))
+                        && !self.local_document_saved(open_doc.doc.id)
+                    {
+                        return Err(EngineError::Other("Wait for local saving to finish before saving to gallery".into()));
+                    }
+                }
+            },
+            GalleryAction::OpenEditable { entry } => {
+                let entry = *entry;
+                if !self.gallery_draft_allowed(entry)
+                    || self.gallery.items.iter().find(|item| item.id == entry && !item.draft).is_some_and(|item| !self.gallery_item_allowed(item))
+                {
+                    return Err(EngineError::Other("Previous assigned drawings remain private until this game reveals".into()));
+                }
+                if let Some(index) = self.documents().iter().position(|d| self.local_projects.status(d.doc.id).project == Some(entry)) {
+                    self.set_active(index);
+                    self.gallery.opened_document = true;
+                    self.gallery.notice = Some("Switched to open drawing in Workroom.".into());
+                    return Ok(());
+                }
+                self.check_new_local_replay_capacity()?;
+            }
+            GalleryAction::Delete { entry, draft } => {
+                if (*draft && !self.gallery_draft_allowed(*entry))
+                    || self.gallery.items.iter().find(|item| item.id == *entry && item.draft == *draft).is_some_and(|item| !self.gallery_item_allowed(item))
+                {
+                    return Err(EngineError::Other("Previous assigned drawings remain private until this game reveals".into()));
+                }
+                if *draft && self.active_protected_projects().contains(entry) {
+                    return Err(EngineError::Other("Close this drawing in the Workroom before deleting it permanently".into()));
+                }
             }
             GalleryAction::Remix { .. } => {
                 if self
@@ -292,11 +390,12 @@ impl Session {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let protected = self.active_protected_projects();
             let worker = self.gallery.worker.as_ref().ok_or_else(|| EngineError::Other("Gallery storage is unavailable".into()))?;
             let source = self.gallery.active.as_ref().map(|active| (active.id, self.gallery.active_draft));
             let request = match files {
-                Some(files) => native::Request::ScopedAction { action, source, files },
-                None => native::Request::Action { action, source },
+                Some(files) => native::Request::ScopedAction { action, source, protected, files },
+                None => native::Request::Action { action, source, protected },
             };
             worker.send(request)?;
             self.gallery.busy = true;

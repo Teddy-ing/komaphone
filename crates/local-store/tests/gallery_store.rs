@@ -561,3 +561,98 @@ fn corrupt_chunks_metadata_and_dates_are_actionable_without_overwriting_original
     assert!(!dir.path().join("corrupt.komaphone").exists());
     assert_eq!(store.list(true).unwrap().len(), 1, "damaged original is retained for recovery");
 }
+
+#[test]
+fn save_project_updates_in_place_gcs_old_blobs_and_never_overwrites_games() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gallery.sqlite3");
+    let mut store = GalleryStore::open(&path, StoreOptions::default()).unwrap();
+
+    let first = bundle(1, SampleType::U8);
+    let saved = store.save_project(&first, Some("My Sketch")).unwrap();
+    assert_eq!(saved.title, "My Sketch");
+    assert_eq!(saved.kind, GalleryKind::Project);
+    assert!(!saved.trashed);
+
+    // Move to Trash, then explicitly re-saving with updated pixels restores out of Trash
+    // while keeping `created_at` and updating content in place without creating a second row.
+    store.update(project(1), None, Some(true), Some(true)).unwrap();
+    let mut updated_doc = Document::with_background("My Sketch", Size { width: 32, height: 24 }, ColorMode::Rgb, SampleType::U8, Color::rgb(0.9, 0.2, 0.1));
+    updated_doc.layers[0].name = "Updated artwork".into();
+    let (updated_bytes, _) = PcraftWriter::new().save_zip(&updated_doc, &SaveOptions::default()).unwrap();
+    let second_version = from_bytes(1, updated_bytes);
+    let resaved = store.save_project(&second_version, None).unwrap();
+    assert_eq!(resaved.id, project(1));
+    assert_eq!(resaved.title, "My Sketch");
+    assert_eq!(resaved.created_at, saved.created_at);
+    assert!(resaved.favorite);
+    assert!(!resaved.trashed);
+    assert_eq!(store.list(true).unwrap().len(), 1);
+    assert_eq!(store.load(project(1)).unwrap().objects, second_version.objects);
+
+    // Old unreferenced checkpoint blob was garbage-collected.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let obj_count: i64 = db.query_row("SELECT count(*) FROM objects", [], |r| r.get(0)).unwrap();
+    assert_eq!(obj_count, 1);
+    drop(db);
+
+    // `save_project` must refuse to overwrite an existing Game entry.
+    let game = incomplete_game();
+    store.insert(&game).unwrap();
+    let mut colliding = first.clone();
+    colliding.manifest.id = game.manifest.id;
+    assert!(matches!(store.save_project(&colliding, None), Err(Error::Conflict)));
+}
+
+#[test]
+fn permanent_delete_requires_trash_preserves_shared_blobs_and_tracks_game_and_project_refs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gallery.sqlite3");
+    let mut store = GalleryStore::open(&path, StoreOptions::default()).unwrap();
+
+    let shared_a = bundle(1, SampleType::U8);
+    let mut shared_b = shared_a.clone();
+    shared_b.manifest.id = project(2);
+    let unique_doc = Document::with_background("Unique", Size { width: 32, height: 24 }, ColorMode::Rgb, SampleType::U8, Color::rgb(0.1, 0.8, 0.3));
+    let (unique_bytes, _) = PcraftWriter::new().save_zip(&unique_doc, &SaveOptions::default()).unwrap();
+    let unique_c = from_bytes(3, unique_bytes);
+
+    store.insert(&shared_a).unwrap();
+    store.insert(&shared_b).unwrap();
+    store.insert(&unique_c).unwrap();
+
+    let checkpoints = store.saved_project_checkpoints().unwrap();
+    assert_eq!(checkpoints.len(), 3);
+    assert!(checkpoints.contains_key(&project(1)));
+
+    // Untrashed entry cannot be permanently deleted directly.
+    assert!(store.delete_entry(project(1)).is_err());
+
+    // Trash `shared_a` and `unique_c`; permanently delete `shared_a`: shared blob stays for `shared_b`.
+    store.update(project(1), None, None, Some(true)).unwrap();
+    store.update(project(3), None, None, Some(true)).unwrap();
+    assert!(store.delete_entry(project(1)).unwrap());
+    assert_eq!(store.list(true).unwrap().len(), 2);
+    assert_eq!(store.load(project(2)).unwrap().objects, shared_b.objects);
+
+    // Empty trash removes `unique_c` and GCs its unique blob while keeping `shared_b` intact.
+    let deleted = store.delete_trashed_entries().unwrap();
+    assert_eq!(deleted, vec![project(3)]);
+    assert_eq!(store.list(true).unwrap().len(), 1);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let obj_count: i64 = db.query_row("SELECT count(*) FROM objects", [], |r| r.get(0)).unwrap();
+    assert_eq!(obj_count, 1);
+    drop(db);
+
+    // Covered game projects includes only Artwork entries from non-trashed games.
+    let doc = Document::with_background("Band", Size { width: 1024, height: 512 }, ColorMode::Rgb, SampleType::U8, Color::WHITE);
+    let (band_bytes, _) = PcraftWriter::new().save_zip(&doc, &SaveOptions::default()).unwrap();
+    let game = game_with_artwork(from_bytes(50, band_bytes));
+    store.insert(&game).unwrap();
+    let covered = store.covered_game_projects().unwrap();
+    assert_eq!(covered.len(), 1);
+    assert!(covered.contains(&project(100)));
+    // Trashing the game excludes it from `covered_game_projects`.
+    store.update(game.manifest.id, None, None, Some(true)).unwrap();
+    assert!(store.covered_game_projects().unwrap().is_empty());
+}

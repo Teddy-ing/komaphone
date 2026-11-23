@@ -21,6 +21,10 @@ pub struct WorkspaceState {
     /// reused PhotoCraft Layers panel without expanding Komaphone into the full Advanced dock.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub properties_open: bool,
+    /// Tracks an in-flight Save to gallery request started from the Workroom header so its
+    /// confirmation or error surfaces in the Workroom status bar.
+    #[serde(skip)]
+    pub saving_to_gallery: bool,
 }
 
 /// Tools deliberately visible without a flyout or a keyboard shortcut.
@@ -205,7 +209,46 @@ pub fn open_workroom(app: &mut PhotocraftApp) -> bool {
     true
 }
 
+/// Readiness check for the Workroom header's explicit Save to gallery action.
+pub fn workroom_save_to_gallery_state(app: &PhotocraftApp) -> Result<&'static str, &'static str> {
+    if !app.session.gallery.available() {
+        return Err("Gallery storage is unavailable");
+    }
+    if app.session.gallery.busy() {
+        return Err("Gallery is busy; wait a moment");
+    }
+    let Some(doc) = app.session.active() else {
+        return Err("Open or create a drawing first");
+    };
+    if app.session.local_replay.excluded_reason(doc.doc.id).is_some() {
+        return Err("External documents use File > Save instead of Gallery");
+    }
+    if app.session.is_active_party_document(doc.doc.id) {
+        return Err("Party room drawings save together when the game reveals");
+    }
+    if editing_in_progress(app) || !app.session.local_document_saved(doc.doc.id) {
+        return Err("Wait for local saving to finish before saving to gallery");
+    }
+    let has_saved = app
+        .session
+        .local_projects
+        .status(doc.doc.id)
+        .project
+        .is_some_and(|project| app.session.gallery.items.iter().any(|item| item.id == project && !item.draft && !item.trashed));
+    if has_saved { Ok("Update the saved copy of this drawing in Gallery > Saved") } else { Ok("Save this drawing to Gallery > Saved") }
+}
+
 fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    if app.ui.komaphone.saving_to_gallery && !app.session.gallery.busy() {
+        app.ui.komaphone.saving_to_gallery = false;
+        if let Some(error) = &app.session.gallery.error {
+            app.ui.status = error.clone();
+            app.ui.status_error = true;
+        } else if let Some(notice) = &app.session.gallery.notice {
+            app.ui.status = notice.clone();
+            app.ui.status_error = false;
+        }
+    }
     let tokens = Tokens::get(ui.ctx());
     let (caption_left, caption_right) = crate::titlebar::reserved(app, ui.ctx());
     egui::Panel::top("komaphone-header")
@@ -253,6 +296,28 @@ fn header(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             open_workroom(app);
                         }
                         Err(error) => app.ui.status = error,
+                    }
+                }
+                if in_workroom {
+                    let save_state = workroom_save_to_gallery_state(app);
+                    let (enabled, tooltip) = match save_state {
+                        Ok(tip) => (true, tip),
+                        Err(reason) => (false, reason),
+                    };
+                    let response = ui.add_enabled(enabled, egui::Button::new("Save to gallery")).on_hover_text(tooltip).on_disabled_hover_text(tooltip);
+                    remember(ui, "workspace.saveToGallery", &response);
+                    if response.clicked() {
+                        match app.run("komaphone.gallery.save", json!({})) {
+                            Ok(_) => {
+                                app.ui.komaphone.saving_to_gallery = true;
+                                app.ui.status = "Saving to gallery…".into();
+                                app.ui.status_error = false;
+                            }
+                            Err(error) => {
+                                app.ui.status = error;
+                                app.ui.status_error = true;
+                            }
+                        }
                     }
                 }
                 command(app, ui, "Import image", "file.placeEmbedded", json!({}));

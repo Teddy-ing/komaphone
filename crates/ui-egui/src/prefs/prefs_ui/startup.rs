@@ -149,7 +149,7 @@ fn start_next_recovery(app: &mut PhotocraftApp) {
             move |s, doc| {
                 let active = s.active().map(|st| st.doc.id);
                 let first = s.documents().is_empty();
-                s.add_document(doc, r.path);
+                s.add_recovered_document(doc, r.path);
                 let st = s.active_mut().ok_or(photocraft_engine::EngineError::NoDocument)?;
                 st.saved_revision = 0;
                 let (id, revision) = (st.doc.id, st.revision);

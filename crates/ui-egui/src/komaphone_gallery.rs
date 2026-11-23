@@ -1,19 +1,38 @@
 //! Gallery view over the engine command seam. Drawing replay and animation are separate clocks.
 use crate::{PhotocraftApp, theme::Tokens};
 use egui::{RichText, TextureHandle};
+use photocraft_engine::gallery::GalleryItem;
 use photocraft_engine::party::ProjectId;
 use photocraft_engine::party::gallery::GalleryContent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GallerySection {
+    #[default]
+    Saved,
+    Completed,
+    Temp,
+    Trash,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletedFilter {
+    #[default]
+    All,
+    Animation,
+    Creature,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GalleryUi {
     pub open: bool,
     pub filter: String,
-    pub favorites: bool,
-    pub trash: bool,
-    pub kind: String,
+    pub section: GallerySection,
+    pub completed_filter: CompletedFilter,
     pub chain: u8,
     pub frame: u8,
     pub replay_step: usize,
@@ -32,6 +51,10 @@ pub struct GalleryUi {
     #[serde(skip)]
     pub playing_replay: bool,
     #[serde(skip)]
+    pub confirm_empty_trash: bool,
+    #[serde(skip)]
+    pub confirm_delete: Option<(ProjectId, bool)>,
+    #[serde(skip)]
     last_time: f64,
     #[serde(skip)]
     accumulator: f64,
@@ -47,9 +70,8 @@ impl Default for GalleryUi {
         Self {
             open: false,
             filter: String::new(),
-            favorites: false,
-            trash: false,
-            kind: "all".into(),
+            section: GallerySection::Saved,
+            completed_filter: CompletedFilter::All,
             chain: 0,
             frame: 0,
             replay_step: 0,
@@ -65,11 +87,69 @@ impl Default for GalleryUi {
             show_notes: false,
             playing_animation: false,
             playing_replay: false,
+            confirm_empty_trash: false,
+            confirm_delete: None,
             last_time: 0.0,
             accumulator: 0.0,
             selected: None,
             requested: None,
             pending_playback: false,
+        }
+    }
+}
+
+/// Which Gallery section an item belongs to, or `None` when it should be hidden from the
+/// Gallery list (active-game privacy guard, untouched blank canvas, completed-game round draft,
+/// or a Temp copy already matching its Saved version).
+pub fn item_section(app: &PhotocraftApp, item: &GalleryItem) -> Option<GallerySection> {
+    if !app.session.gallery_item_allowed(item) {
+        return None;
+    }
+    if item.trashed {
+        return Some(GallerySection::Trash);
+    }
+    if item.draft {
+        if item.untouched_blank || item.covered_by_game || item.saved_matches_head {
+            return None;
+        }
+        return Some(GallerySection::Temp);
+    }
+    match item.kind.as_str() {
+        "animation" | "creature" => Some(GallerySection::Completed),
+        _ => Some(GallerySection::Saved),
+    }
+}
+
+fn trash_origin_label(item: &GalleryItem) -> &'static str {
+    if item.draft {
+        "From Temp"
+    } else if matches!(item.kind.as_str(), "animation" | "creature") {
+        "From Completed"
+    } else {
+        "From Saved"
+    }
+}
+
+fn item_kind_label(item: &GalleryItem) -> &'static str {
+    if item.draft {
+        if item.has_unsaved_edits { "Unsaved changes" } else { "Temporary draft" }
+    } else {
+        match item.kind.as_str() {
+            "animation" => {
+                if item.complete {
+                    "Animation"
+                } else {
+                    "Animation · incomplete"
+                }
+            }
+            "creature" => {
+                if item.complete {
+                    "Exquisite Corpse"
+                } else {
+                    "Exquisite Corpse · incomplete"
+                }
+            }
+            _ => "Saved drawing",
         }
     }
 }
@@ -95,6 +175,8 @@ fn remember(ui: &egui::Ui, id: &str, response: &egui::Response) {
 
 pub fn open(app: &mut PhotocraftApp) {
     app.ui.gallery.open = true;
+    app.ui.gallery.confirm_empty_trash = false;
+    app.ui.gallery.confirm_delete = None;
     if !app.session.gallery.busy() {
         run(app, "komaphone.gallery.list", json!({}));
     }
@@ -157,106 +239,206 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     if app.session.gallery.opened_document {
         app.session.gallery.opened_document = false;
         app.ui.gallery.open = false;
+        app.ui.gallery.confirm_empty_trash = false;
+        app.ui.gallery.confirm_delete = None;
         app.ui.rooms.view_reveal = false;
         return;
     }
-    ui.horizontal_wrapped(|ui| {
-        ui.heading("Gallery");
-        button(app, ui, "Refresh", "komaphone.gallery.list", json!({}));
-        let response = ui.button("Draw").on_hover_text("Return to your drawing workroom");
-        remember(ui, "gallery.draw", &response);
-        if response.clicked() {
-            crate::komaphone_workspace::open_workroom(app);
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Gallery");
+            button(app, ui, "Refresh", "komaphone.gallery.list", json!({}));
+            let response = ui.button("Import & backups");
+            remember(ui, "gallery.storage", &response);
+            if response.clicked() {
+                app.ui.gallery.storage_open = !app.ui.gallery.storage_open;
+            }
+            if app.session.gallery.busy() {
+                ui.spinner();
+                ui.label("Working…");
+            }
+            if app.session.gallery.quota_bytes > 0 {
+                ui.small(format!(
+                    "{:.1} MiB / {:.0} MiB",
+                    app.session.gallery.usage_bytes as f64 / 1_048_576.0,
+                    app.session.gallery.quota_bytes as f64 / 1_048_576.0
+                ));
+            }
+        });
+        if let Some(error) = &app.session.gallery.error {
+            ui.colored_label(tokens.text, error);
         }
-        let response = ui.button("Import & backups");
-        remember(ui, "gallery.storage", &response);
-        if response.clicked() {
-            app.ui.gallery.storage_open = !app.ui.gallery.storage_open;
+        if let Some(notice) = &app.session.gallery.notice {
+            ui.label(RichText::new(notice).color(tokens.text_dim));
         }
-        if app.session.gallery.busy() {
-            ui.spinner();
-            ui.label("Working…");
+        if app.session.gallery.downloading {
+            let ratio = if app.session.gallery.download_bytes == 0 {
+                0.0
+            } else {
+                app.session.gallery.downloaded_bytes as f32 / app.session.gallery.download_bytes as f32
+            };
+            ui.add(egui::ProgressBar::new(ratio).text(if app.session.gallery.waiting {
+                "Waiting for service · not yet saved"
+            } else {
+                "Downloading originals · not yet saved"
+            }));
+            button(app, ui, "Cancel download", "komaphone.gallery.cancelDownload", json!({}));
         }
-        if app.session.gallery.quota_bytes > 0 {
-            ui.small(format!(
-                "{:.1} MiB / {:.0} MiB",
-                app.session.gallery.usage_bytes as f64 / 1_048_576.0,
-                app.session.gallery.quota_bytes as f64 / 1_048_576.0
-            ));
+        if app.ui.gallery.storage_open {
+            storage(app, ui);
         }
-    });
-    if let Some(error) = &app.session.gallery.error {
-        ui.colored_label(tokens.text, error);
-    }
-    if let Some(notice) = &app.session.gallery.notice {
-        ui.label(RichText::new(notice).color(tokens.text_dim));
-    }
-    if app.session.gallery.downloading {
-        let ratio =
-            if app.session.gallery.download_bytes == 0 { 0.0 } else { app.session.gallery.downloaded_bytes as f32 / app.session.gallery.download_bytes as f32 };
-        ui.add(egui::ProgressBar::new(ratio).text(if app.session.gallery.waiting {
-            "Waiting for service · not yet saved"
-        } else {
-            "Downloading originals · not yet saved"
-        }));
-        button(app, ui, "Cancel download", "komaphone.gallery.cancelDownload", json!({}));
-    }
-    if app.ui.gallery.storage_open {
-        storage(app, ui);
-    }
-    ui.separator();
-    let height = ui.available_height();
-    let mut thumbnail = None;
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(278.0, height), egui::Layout::top_down(egui::Align::Min), |ui| thumbnail = list(app, ui));
         ui.separator();
-        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), egui::Layout::top_down(egui::Align::Min), |ui| detail(app, ui));
+        let height = ui.available_height().max(120.0);
+        let sidebar_width = 344.0_f32.min((ui.available_width() * 0.44).max(240.0));
+        let mut thumbnail = None;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(sidebar_width, height), egui::Layout::top_down(egui::Align::Min), |ui| thumbnail = list(app, ui));
+            ui.separator();
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width().max(120.0), height), egui::Layout::top_down(egui::Align::Min), |ui| detail(app, ui));
+        });
+        tick(app, ui);
+        if let Some((entry, draft)) = thumbnail
+            && !app.session.gallery.busy()
+        {
+            run(app, "komaphone.gallery.thumbnail", json!({"entry":entry,"draft":draft}));
+        }
     });
-    tick(app, ui);
-    if let Some((entry, draft)) = thumbnail
-        && !app.session.gallery.busy()
-    {
-        run(app, "komaphone.gallery.thumbnail", json!({"entry":entry,"draft":draft}));
-    }
 }
 
 fn list(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> Option<(ProjectId, bool)> {
-    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.filter).hint_text("Search titles or authors"));
-    remember(ui, "gallery.filter", &response);
-    ui.horizontal(|ui| {
-        let response = ui.checkbox(&mut app.ui.gallery.favorites, "Favorites");
-        remember(ui, "gallery.favorites", &response);
-        let response = ui.checkbox(&mut app.ui.gallery.trash, "Trash");
-        remember(ui, "gallery.trashFilter", &response);
-    });
-    let combo = craft_ui::ComboBox::from_id_salt("gallery-kind").selected_text(&app.ui.gallery.kind).show_ui(ui, |ui| {
-        for kind in ["all", "draft", "animation", "creature", "project"] {
-            ui.selectable_value(&mut app.ui.gallery.kind, kind.into(), kind);
+    let tokens = Tokens::get(ui.ctx());
+    let (mut saved_count, mut completed_count, mut temp_count, mut trash_count) = (0usize, 0usize, 0usize, 0usize);
+    for item in &app.session.gallery.items {
+        match item_section(app, item) {
+            Some(GallerySection::Saved) => saved_count = saved_count.saturating_add(1),
+            Some(GallerySection::Completed) => completed_count = completed_count.saturating_add(1),
+            Some(GallerySection::Temp) => temp_count = temp_count.saturating_add(1),
+            Some(GallerySection::Trash) => trash_count = trash_count.saturating_add(1),
+            None => {}
+        }
+    }
+
+    let tabs = [
+        (GallerySection::Saved, "Saved", saved_count, "gallery.section.saved", "Drawings you explicitly saved to Gallery"),
+        (GallerySection::Completed, "Completed", completed_count, "gallery.section.completed", "Finished Animation and Exquisite Corpse games"),
+        (GallerySection::Temp, "Temp", temp_count, "gallery.section.temp", "Automatic local recovery drafts of unsaved work"),
+        (GallerySection::Trash, "Trash", trash_count, "gallery.section.trash", "Trashed drawings and games you can restore or delete permanently"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (section, label, count, control_id, tooltip) in tabs {
+            let text = if count > 0 { format!("{label} ({count})") } else { label.into() };
+            let response = ui.add(egui::Button::selectable(app.ui.gallery.section == section, text)).on_hover_text(tooltip);
+            remember(ui, control_id, &response);
+            if response.clicked() && app.ui.gallery.section != section {
+                app.ui.gallery.section = section;
+                app.ui.gallery.confirm_empty_trash = false;
+                app.ui.gallery.confirm_delete = None;
+            }
         }
     });
-    remember(ui, "gallery.kind", &combo.response);
+    ui.add_space(4.0);
+
+    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.filter).desired_width(f32::INFINITY).hint_text("Search titles or authors"));
+    remember(ui, "gallery.filter", &response);
+
+    match app.ui.gallery.section {
+        GallerySection::Saved => {}
+        GallerySection::Completed => {
+            ui.horizontal_wrapped(|ui| {
+                for (filter, label, control_id) in [
+                    (CompletedFilter::All, "All", "gallery.completed.all"),
+                    (CompletedFilter::Animation, "Animations", "gallery.completed.animation"),
+                    (CompletedFilter::Creature, "Creatures", "gallery.completed.creature"),
+                ] {
+                    let response = ui.selectable_value(&mut app.ui.gallery.completed_filter, filter, label);
+                    remember(ui, control_id, &response);
+                }
+            });
+        }
+        GallerySection::Temp => {
+            ui.label(RichText::new("Automatic local copies of unsaved drawings. Save to keep, or clear temp.").small().color(tokens.text_dim));
+            let enabled = temp_count > 0 && app.session.is_enabled("komaphone.gallery.clearTemp");
+            let response = ui
+                .add_enabled(enabled, egui::Button::new("Clear temp"))
+                .on_hover_text("Moves closed temporary drafts to Trash so you can restore or delete them permanently");
+            remember(ui, "komaphone.gallery.clearTemp", &response);
+            if response.clicked() {
+                run(app, "komaphone.gallery.clearTemp", json!({}));
+            }
+        }
+        GallerySection::Trash => {
+            ui.label(RichText::new("Restore items anytime, or delete them permanently to free storage.").small().color(tokens.text_dim));
+            if app.ui.gallery.confirm_empty_trash && trash_count > 0 {
+                ui.label(RichText::new("Delete all trashed items permanently?").small());
+                ui.horizontal(|ui| {
+                    let enabled = app.session.is_enabled("komaphone.gallery.emptyTrash");
+                    let confirm = ui.add_enabled(enabled, egui::Button::new("Confirm empty"));
+                    remember(ui, "komaphone.gallery.emptyTrash", &confirm);
+                    if confirm.clicked() {
+                        app.ui.gallery.confirm_empty_trash = false;
+                        run(app, "komaphone.gallery.emptyTrash", json!({}));
+                    }
+                    let cancel = ui.button("Cancel");
+                    remember(ui, "gallery.emptyTrash.cancel", &cancel);
+                    if cancel.clicked() {
+                        app.ui.gallery.confirm_empty_trash = false;
+                    }
+                });
+            } else {
+                app.ui.gallery.confirm_empty_trash = false;
+                let enabled = trash_count > 0 && app.session.is_enabled("komaphone.gallery.emptyTrash");
+                let response = ui.add_enabled(enabled, egui::Button::new("Empty trash")).on_hover_text("Permanently remove all closed items in Trash");
+                remember(ui, "gallery.emptyTrash", &response);
+                if response.clicked() {
+                    app.ui.gallery.confirm_empty_trash = true;
+                }
+            }
+        }
+    }
+    ui.add_space(4.0);
+
     let filter = app.ui.gallery.filter.to_lowercase();
+    let section = app.ui.gallery.section;
+    let completed_filter = app.ui.gallery.completed_filter;
     let items: Vec<_> = app
         .session
         .gallery
         .items
         .iter()
         .filter(|item| {
-            item.trashed == app.ui.gallery.trash
-                && (!app.ui.gallery.favorites || item.favorite)
-                && (app.ui.gallery.kind == "all" || app.ui.gallery.kind == item.kind)
+            item_section(app, item) == Some(section)
+                && (section != GallerySection::Completed
+                    || match completed_filter {
+                        CompletedFilter::All => true,
+                        CompletedFilter::Animation => item.kind == "animation",
+                        CompletedFilter::Creature => item.kind == "creature",
+                    })
                 && (filter.is_empty() || item.title.to_lowercase().contains(&filter) || item.authors.iter().any(|a| a.to_lowercase().contains(&filter)))
-                && app.session.gallery_item_allowed(item)
         })
         .cloned()
         .collect();
+
+    let show_room_history = section == GallerySection::Completed && app.session.rooms.status.room.is_some();
+    let footer_reserve = if show_room_history { 110.0 } else { 8.0 };
     let mut thumbnail = None;
-    egui::ScrollArea::vertical().id_salt("gallery-list").max_height((ui.available_height() - 100.0).max(80.0)).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("gallery-list").max_height((ui.available_height() - footer_reserve).max(80.0)).show(ui, |ui| {
         if items.is_empty() {
-            ui.label("No saved items match this view.");
+            let empty_text = if !filter.is_empty() {
+                "No items match your search in this section."
+            } else {
+                match section {
+                    GallerySection::Saved => "No saved drawings yet. Click Save to gallery in the Workroom, or save a draft from Temp.",
+                    GallerySection::Completed => "No completed games yet. Finish a Private room game and click Save to gallery at reveal.",
+                    GallerySection::Temp => "No temporary drafts. Unsaved Workroom drawings appear here automatically.",
+                    GallerySection::Trash => "Trash is empty.",
+                }
+            };
+            ui.label(RichText::new(empty_text).color(tokens.text_dim));
         }
         for item in items {
             let row = ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     if let Some(image) = app.session.gallery.thumbnails.get(&(item.id, item.draft)) {
                         let texture = texture(ui, egui::Id::unique(("gallery-thumb", item.id.as_str(), item.draft)), item.revision, image);
@@ -277,17 +459,25 @@ fn list(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> Option<(ProjectId, bool)>
                                 app.ui.gallery.playing_animation = false;
                                 app.ui.gallery.playing_replay = false;
                                 app.ui.gallery.accumulator = 0.0;
+                                app.ui.gallery.confirm_delete = None;
                             }
                             run(app, "komaphone.gallery.open", json!({"entry":item.id,"draft":item.draft}));
                         }
-                        ui.small(format!("{}{}", item.kind, if item.complete { "" } else { " · incomplete" }));
-                        ui.small(item.authors.join(", "));
+                        if section == GallerySection::Trash {
+                            ui.small(format!("{} · {}", item_kind_label(&item), trash_origin_label(&item)));
+                        } else {
+                            ui.small(item_kind_label(&item));
+                        }
+                        let authors = if item.authors.is_empty() { "You".into() } else { item.authors.join(", ") };
+                        ui.small(authors);
                         let updated = crate::komaphone_time::format_compact(&item.updated_at);
                         let time_resp = ui.small(&updated.display);
                         if let Some(tooltip) = &updated.tooltip {
                             time_resp.on_hover_text(tooltip);
                         }
-                        ui.small(&item.state);
+                        if item.has_unsaved_edits && !item.draft {
+                            ui.small(RichText::new("Newer unsaved draft in Temp").color(tokens.text_dim));
+                        }
                     });
                 });
             });
@@ -296,7 +486,7 @@ fn list(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> Option<(ProjectId, bool)>
             }
         }
     });
-    if app.session.rooms.status.room.is_some() {
+    if show_room_history {
         ui.separator();
         button(app, ui, "Previous room games", "komaphone.gallery.history", json!({}));
         for game in app.session.gallery.remote.clone() {
@@ -322,10 +512,26 @@ fn list(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> Option<(ProjectId, bool)>
 }
 
 fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    let tokens = Tokens::get(ui.ctx());
     let Some(manifest) = app.session.gallery.active.clone() else {
         ui.heading("Keep what you make");
-        ui.label("Open a drawing or saved game to replay, export, or make an independent remix.");
-        ui.label("At reveal, use Save to gallery to retain the complete game and drawing histories offline.");
+        match app.ui.gallery.section {
+            GallerySection::Saved => {
+                ui.label("Select a saved drawing to view, replay how it was drawn, reopen in the Workroom, or export.");
+                ui.label(RichText::new("Use Save to gallery in the Workroom when you want to keep a drawing here.").color(tokens.text_dim));
+            }
+            GallerySection::Completed => {
+                ui.label("Select a completed Animation or Exquisite Corpse game to play it back, inspect drawing replays, remix, or export.");
+                ui.label(RichText::new("At reveal, click Save to gallery to store the finished game offline.").color(tokens.text_dim));
+            }
+            GallerySection::Temp => {
+                ui.label("Temporary drafts keep automatic local backups of unsaved Workroom drawings.");
+                ui.label(RichText::new("Select a draft to continue drawing, save it to Gallery, or move it to Trash.").color(tokens.text_dim));
+            }
+            GallerySection::Trash => {
+                ui.label("Select a trashed item to restore it to its original section or delete it permanently.");
+            }
+        }
         return;
     };
     if app.ui.gallery.selected != Some((manifest.id, app.session.gallery.active_draft)) {
@@ -340,46 +546,80 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         app.ui.gallery.show_notes = false;
         app.ui.gallery.gif_preview = false;
         app.ui.gallery.pending_playback = false;
+        app.ui.gallery.confirm_delete = None;
         app.ui.gallery.fps = manifest.fps;
         app.ui.gallery.looping = manifest.looping;
         app.ui.gallery.name = manifest.title.clone();
         app.ui.gallery.requested = None;
     }
+    let is_game = matches!(manifest.content, GalleryContent::Game { .. });
     let (chains, frames, creature) = match &manifest.content {
         GalleryContent::Game { room } => {
             (room.members.len(), room.mode.rounds(room.members.len()).unwrap_or(1), room.mode == photocraft_engine::party::Mode::ExquisiteCorpse)
         }
         GalleryContent::Project { .. } => (1, app.session.gallery.frame_count.clamp(1, 36) as u8, false),
     };
+    let is_animation = !creature && frames > 1;
+    let protected = app.session.active_protected_projects();
     egui::ScrollArea::vertical().id_salt("gallery-detail").show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.heading(&manifest.title);
             let item = app.session.gallery.items.iter().find(|item| item.id == manifest.id && item.draft == app.session.gallery.active_draft).cloned();
             if let Some(item) = item {
-                button(
-                    app,
-                    ui,
-                    if item.favorite { "Unfavorite" } else { "Favorite" },
-                    "komaphone.gallery.update",
-                    json!({"entry":item.id,"draft":item.draft,"favorite":!item.favorite}),
-                );
-                let response = ui.button(if item.trashed { "Restore from trash" } else { "Move to trash" });
-                remember(ui, "gallery.trash", &response);
-                if response.clicked() {
-                    run(app, "komaphone.gallery.update", json!({"entry":item.id,"draft":item.draft,"trashed":!item.trashed}));
+                if item.trashed {
+                    let response = ui.add_enabled(!app.session.gallery.busy(), egui::Button::new("Restore"));
+                    remember(ui, "gallery.trash", &response);
+                    if response.clicked() {
+                        app.ui.gallery.confirm_delete = None;
+                        run(app, "komaphone.gallery.update", json!({"entry":item.id,"draft":item.draft,"trashed":false}));
+                    }
+                    let blocked_open = item.draft && protected.contains(&item.id);
+                    if app.ui.gallery.confirm_delete == Some((item.id, item.draft)) && !blocked_open {
+                        let confirm = ui.add_enabled(app.session.is_enabled("komaphone.gallery.delete"), egui::Button::new("Confirm delete"));
+                        remember(ui, "komaphone.gallery.delete", &confirm);
+                        if confirm.clicked() {
+                            app.ui.gallery.confirm_delete = None;
+                            run(app, "komaphone.gallery.delete", json!({"entry":item.id,"draft":item.draft}));
+                        }
+                        let cancel = ui.button("Cancel");
+                        remember(ui, "gallery.delete.cancel", &cancel);
+                        if cancel.clicked() {
+                            app.ui.gallery.confirm_delete = None;
+                        }
+                    } else {
+                        let delete_enabled = !blocked_open && app.session.is_enabled("komaphone.gallery.delete");
+                        let tip = if blocked_open {
+                            "Close this drawing in the Workroom before deleting it permanently"
+                        } else {
+                            "Permanently delete this item and reclaim its local storage"
+                        };
+                        let response = ui.add_enabled(delete_enabled, egui::Button::new("Delete permanently")).on_hover_text(tip).on_disabled_hover_text(tip);
+                        remember(ui, "gallery.delete", &response);
+                        if response.clicked() {
+                            app.ui.gallery.confirm_delete = Some((item.id, item.draft));
+                        }
+                    }
+                } else {
+                    let response = ui.add_enabled(!app.session.gallery.busy(), egui::Button::new("Move to trash"));
+                    remember(ui, "gallery.trash", &response);
+                    if response.clicked() {
+                        run(app, "komaphone.gallery.update", json!({"entry":item.id,"draft":item.draft,"trashed":true}));
+                    }
                 }
             }
         });
         ui.horizontal(|ui| {
             let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.name).desired_width(210.0));
             remember(ui, "gallery.name", &response);
-            let response = ui.button("Rename");
+            let response = ui.add_enabled(!app.session.gallery.busy(), egui::Button::new("Rename"));
             remember(ui, "gallery.rename", &response);
             if response.clicked() {
                 run(app, "komaphone.gallery.update", json!({"entry":manifest.id,"draft":app.session.gallery.active_draft,"title":app.ui.gallery.name}));
             }
         });
-        ui.label(manifest.authors.iter().map(|a| a.display_name.as_str()).collect::<Vec<_>>().join(" · "));
+        let authors =
+            if manifest.authors.is_empty() { "You".into() } else { manifest.authors.iter().map(|a| a.display_name.as_str()).collect::<Vec<_>>().join(" · ") };
+        ui.label(authors);
         let updated = crate::komaphone_time::format_compact(&manifest.updated_at);
         let detail_time = ui.small(format!("Updated {}", updated.display));
         if let Some(tooltip) = &updated.tooltip {
@@ -408,16 +648,21 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             app.ui.gallery.accumulator = 0.0;
         }
         ui.horizontal_wrapped(|ui| {
-            for chain in 0..chains {
-                let response =
-                    ui.selectable_value(&mut app.ui.gallery.chain, chain as u8, format!("{} {}", if creature { "Creature" } else { "Animation" }, chain + 1));
-                remember(ui, &format!("gallery.chain.{chain}"), &response);
-                if response.changed() {
-                    app.ui.gallery.frame = 0;
-                    app.ui.gallery.replay_step = 0;
-                    app.ui.gallery.playing_animation = false;
-                    app.ui.gallery.playing_replay = false;
-                    app.ui.gallery.accumulator = 0.0;
+            if chains > 1 || is_game {
+                for chain in 0..chains {
+                    let response = ui.selectable_value(
+                        &mut app.ui.gallery.chain,
+                        chain as u8,
+                        format!("{} {}", if creature { "Creature" } else { "Animation" }, chain + 1),
+                    );
+                    remember(ui, &format!("gallery.chain.{chain}"), &response);
+                    if response.changed() {
+                        app.ui.gallery.frame = 0;
+                        app.ui.gallery.replay_step = 0;
+                        app.ui.gallery.playing_animation = false;
+                        app.ui.gallery.playing_replay = false;
+                        app.ui.gallery.accumulator = 0.0;
+                    }
                 }
             }
             let before = app.ui.gallery.replay_mode;
@@ -444,13 +689,15 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         });
         if app.ui.gallery.replay_mode {
             ui.horizontal_wrapped(|ui| {
-                ui.label(if creature { "Part" } else { "Frame" });
-                let response = ui.add(egui::DragValue::new(&mut app.ui.gallery.frame).range(0..=frames.saturating_sub(1)));
-                remember(ui, "gallery.frame", &response);
-                if response.changed() {
-                    app.ui.gallery.replay_step = 0;
-                    app.ui.gallery.playing_replay = false;
-                    app.ui.gallery.accumulator = 0.0;
+                if frames > 1 || is_game {
+                    ui.label(if creature { "Part" } else { "Frame" });
+                    let response = ui.add(egui::DragValue::new(&mut app.ui.gallery.frame).range(0..=frames.saturating_sub(1)));
+                    remember(ui, "gallery.frame", &response);
+                    if response.changed() {
+                        app.ui.gallery.replay_step = 0;
+                        app.ui.gallery.playing_replay = false;
+                        app.ui.gallery.accumulator = 0.0;
+                    }
                 }
                 let can_play = !selected_missing(&manifest, app.ui.gallery.chain, app.ui.gallery.frame)
                     && app.session.gallery.replay.as_ref().is_some_and(|replay| replay.moments.len() > 1);
@@ -490,7 +737,7 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     ui.small(format!("{:.2}s · {} · {}", moment.elapsed_ms as f64 / 1000.0, moment.kind, moment.command));
                 }
             }
-        } else if !creature {
+        } else if is_animation {
             ui.horizontal_wrapped(|ui| {
                 let response =
                     ui.add_enabled(frames > 1, egui::Button::new(if app.ui.gallery.playing_animation { "Pause animation" } else { "Play animation" }));
@@ -524,6 +771,30 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.add(egui::Image::new(&handle).max_width(ui.available_width()).max_height(340.0).maintain_aspect_ratio(true));
         }
         ui.horizontal_wrapped(|ui| {
+            if app.session.gallery.active_draft {
+                let response = ui.button("Continue drawing");
+                remember(ui, "gallery.continue", &response);
+                if response.clicked() {
+                    run(app, "komaphone.project.open", json!({"project":manifest.id}));
+                    app.ui.gallery.open = false;
+                    app.ui.rooms.view_reveal = false;
+                }
+                let save_enabled = app.session.is_enabled("komaphone.gallery.save");
+                let response = ui.add_enabled(save_enabled, egui::Button::new("Save to gallery")).on_hover_text("Keep this drawing in Gallery > Saved");
+                remember(ui, "gallery.saveToGallery", &response);
+                if response.clicked() {
+                    run(app, "komaphone.gallery.save", json!({"entry":manifest.id}));
+                }
+            } else if !is_game {
+                let edit_enabled = app.session.is_enabled("komaphone.gallery.openEditable");
+                let response = ui
+                    .add_enabled(edit_enabled, egui::Button::new("Edit in Workroom"))
+                    .on_hover_text("Open this saved drawing in the Workroom to continue editing");
+                remember(ui, "gallery.editInWorkroom", &response);
+                if response.clicked() {
+                    run(app, "komaphone.gallery.openEditable", json!({"entry":manifest.id}));
+                }
+            }
             button(
                 app,
                 ui,
@@ -532,28 +803,21 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 } else if frames > 1 {
                     "Remix full animation"
                 } else {
-                    "Remix drawing"
+                    "Remix as new drawing"
                 },
                 "komaphone.gallery.remix",
                 json!({"chain":app.ui.gallery.chain}),
             );
-            let response = ui.add_enabled(!app.session.gallery.busy(), egui::Button::new("Remix selected still"));
-            remember(ui, "gallery.remixStill", &response);
-            if response.clicked() {
-                run(app, "komaphone.gallery.remix", json!({"chain":app.ui.gallery.chain,"frame":app.ui.gallery.frame}));
-            }
-            if app.session.gallery.active_draft {
-                let response = ui.button("Continue original draft");
-                remember(ui, "gallery.continue", &response);
+            if frames > 1 || creature {
+                let response = ui.add_enabled(!app.session.gallery.busy(), egui::Button::new("Remix selected still"));
+                remember(ui, "gallery.remixStill", &response);
                 if response.clicked() {
-                    run(app, "komaphone.project.open", json!({"project":manifest.id}));
-                    app.ui.gallery.open = false;
-                    app.ui.rooms.view_reveal = false;
+                    run(app, "komaphone.gallery.remix", json!({"chain":app.ui.gallery.chain,"frame":app.ui.gallery.frame}));
                 }
             }
         });
-        ui.small("Remix creates a new saved project. Source artwork, credits and original drawing history stay intact.");
-        if matches!(manifest.content, GalleryContent::Game { .. }) {
+        ui.small("Remix creates an independent copy. Source artwork, credits and original drawing history stay intact.");
+        if is_game {
             ui.horizontal_wrapped(|ui| {
                 let response = ui.button("Place in a canvas");
                 remember(ui, "gallery.world", &response);
@@ -568,8 +832,6 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                 }
             });
-        }
-        if matches!(manifest.content, GalleryContent::Game { .. }) {
             let response = ui.checkbox(&mut app.ui.gallery.show_notes, "Open handoff notes");
             remember(ui, "gallery.notes", &response);
             if response.clicked() && app.ui.gallery.show_notes && manifest.notes.is_empty() {
@@ -584,32 +846,73 @@ fn detail(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
         }
         ui.separator();
-        exports(app, ui, creature);
+        exports(app, ui, creature, frames);
     });
 }
 
-fn exports(app: &mut PhotocraftApp, ui: &mut egui::Ui, creature: bool) {
+fn exports(app: &mut PhotocraftApp, ui: &mut egui::Ui, creature: bool, frames: u8) {
+    let is_animation = !creature && frames > 1;
+    let hint = if is_animation {
+        "C:\\Users\\…\\animation.gif"
+    } else if creature {
+        "C:\\Users\\…\\creature.png"
+    } else {
+        "C:\\Users\\…\\drawing.png"
+    };
     ui.label("New output file or folder");
-    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.path).desired_width(f32::INFINITY).hint_text("C:\\Users\\…\\animation.gif"));
+    let response = ui.add(egui::TextEdit::singleline(&mut app.ui.gallery.path).desired_width(f32::INFINITY).hint_text(hint));
     remember(ui, "gallery.path", &response);
     ui.horizontal_wrapped(|ui| {
-        for (label,format) in [("Editable archive","archive"),("PNG image","png"),("PNG frames","sequence"),("Animated GIF","gif")] {
-            let response=ui.add_enabled(!app.session.gallery.busy()&&!app.ui.gallery.path.trim().is_empty()&&(!creature||format!="gif"),egui::Button::new(label));remember(ui,&format!("gallery.export.{format}"),&response);
-            if response.clicked(){run(app,"komaphone.gallery.export",json!({"format":format,"path":app.ui.gallery.path,"chain":app.ui.gallery.chain,"frame":if creature{None}else{Some(app.ui.gallery.frame)},"fps":app.ui.gallery.fps,"looping":app.ui.gallery.looping}));}
+        let mut formats: Vec<(&str, &str)> = vec![("Editable archive", "archive"), ("PNG image", "png")];
+        if creature || frames > 1 {
+            formats.push(("PNG frames", "sequence"));
+        }
+        if is_animation {
+            formats.push(("Animated GIF", "gif"));
+        }
+        for (label, format) in formats {
+            let response = ui.add_enabled(!app.session.gallery.busy() && !app.ui.gallery.path.trim().is_empty(), egui::Button::new(label));
+            remember(ui, &format!("gallery.export.{format}"), &response);
+            if response.clicked() {
+                run(
+                    app,
+                    "komaphone.gallery.export",
+                    json!({
+                        "format": format,
+                        "path": app.ui.gallery.path,
+                        "chain": app.ui.gallery.chain,
+                        "frame": if creature { None } else { Some(app.ui.gallery.frame) },
+                        "fps": app.ui.gallery.fps,
+                        "looping": app.ui.gallery.looping
+                    }),
+                );
+            }
         }
     });
-    ui.small(photocraft_engine::gallery_media::GIF_NOTICE);
+    if is_animation {
+        ui.small(photocraft_engine::gallery_media::GIF_NOTICE);
+    }
 }
 
 fn storage(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.group(|ui| {
-        ui.label("Archive file or new backup folder");let response=ui.text_edit_singleline(&mut app.ui.gallery.path);remember(ui,"gallery.storagePath",&response);
+        ui.label("Archive file or new backup folder");
+        let response = ui.text_edit_singleline(&mut app.ui.gallery.path);
+        remember(ui, "gallery.storagePath", &response);
         ui.horizontal_wrapped(|ui| {
-            button(app,ui,"Import editable archive","komaphone.gallery.import",json!({"path":app.ui.gallery.path}));
-            button(app,ui,"Back up all local originals","komaphone.gallery.backup",json!({"path":app.ui.gallery.path}));
+            button(app, ui, "Import editable archive", "komaphone.gallery.import", json!({"path":app.ui.gallery.path}));
+            button(app, ui, "Back up all local originals", "komaphone.gallery.backup", json!({"path":app.ui.gallery.path}));
         });
-        ui.label("Restore into a new data folder");let response=ui.text_edit_singleline(&mut app.ui.gallery.restore_destination);remember(ui,"gallery.restoreDestination",&response);
-        button(app,ui,"Restore backup to new folder","komaphone.gallery.restore",json!({"path":app.ui.gallery.path,"destination":app.ui.gallery.restore_destination}));
+        ui.label("Restore into a new data folder");
+        let response = ui.text_edit_singleline(&mut app.ui.gallery.restore_destination);
+        remember(ui, "gallery.restoreDestination", &response);
+        button(
+            app,
+            ui,
+            "Restore backup to new folder",
+            "komaphone.gallery.restore",
+            json!({"path":app.ui.gallery.path,"destination":app.ui.gallery.restore_destination}),
+        );
         ui.small("Includes every local draft, retained replay, gallery original and trash entry. Room credentials are excluded; reconnect privately after restoration.");
     });
 }
@@ -665,8 +968,13 @@ fn tick(app: &mut PhotocraftApp, ui: &egui::Ui) {
     }
     let step = (app.ui.gallery.replay_mode && !selected_missing(manifest, app.ui.gallery.chain, app.ui.gallery.frame)).then_some(app.ui.gallery.replay_step);
     let frame = if project && step.is_some() { 0 } else { app.ui.gallery.frame };
-    let key =
-        (app.ui.gallery.chain, frame, step, creature && !app.ui.gallery.replay_mode, app.ui.gallery.gif_preview && !app.ui.gallery.replay_mode && !creature);
+    let key = (
+        app.ui.gallery.chain,
+        frame,
+        step,
+        creature && !app.ui.gallery.replay_mode,
+        app.ui.gallery.gif_preview && !app.ui.gallery.replay_mode && !creature && frames > 1,
+    );
     if !app.session.gallery.busy() && app.ui.gallery.requested != Some(key) {
         if key.4 {
             run(app, "komaphone.gallery.previewGif", json!({"chain":key.0,"frame":key.1,"fps":app.ui.gallery.fps,"looping":app.ui.gallery.looping}));

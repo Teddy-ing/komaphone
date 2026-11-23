@@ -187,6 +187,7 @@ fn workspace_view_state_roundtrips_without_claiming_durability() {
         rename_document: Some(2),
         layer_name: "Ink".into(),
         properties_open: false,
+        saving_to_gallery: false,
     };
     let value = serde_json::to_value(&state).unwrap();
     assert_eq!(serde_json::from_value::<komaphone_workspace::WorkspaceState>(value.clone()).unwrap(), state);

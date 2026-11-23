@@ -234,6 +234,8 @@ impl eframe::App for PhotocraftApp {
             log::error!("Komaphone local save did not finish: {error}");
         }
         #[cfg(not(target_arch = "wasm32"))]
+        self.session.prune_local_projects_on_exit(std::time::Duration::from_secs(2));
+        #[cfg(not(target_arch = "wasm32"))]
         if let Err(error) = self.session.flush_canvases(std::time::Duration::from_secs(30)) {
             log::error!("Komaphone canvas save did not finish: {error}");
         }

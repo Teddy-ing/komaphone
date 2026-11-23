@@ -163,6 +163,11 @@ pub fn specs() -> Vec<CommandSpec> {
         r#"{"entry":id,"draft":bool=false,"title":string?,"favorite":bool?,"trashed":bool?}"#,
         "update"
     );
+    action!("komaphone.gallery.save", "Save drawing to gallery", r#"{"entry":id?,"title":string?}"#, "save_draft");
+    action!("komaphone.gallery.openEditable", "Open saved drawing in Workroom", r#"{"entry":id}"#, "open_editable");
+    action!("komaphone.gallery.delete", "Delete trashed gallery item permanently", r#"{"entry":id,"draft":bool=false}"#, "delete");
+    action!("komaphone.gallery.emptyTrash", "Empty gallery trash permanently", "{}", "empty_trash");
+    action!("komaphone.gallery.clearTemp", "Clear temporary drafts", "{}", "clear_temp");
     action!("komaphone.gallery.thumbnail", "Load gallery thumbnail", r#"{"entry":id,"draft":bool=false}"#, "thumbnail");
     action!(
         "komaphone.gallery.render",

@@ -152,6 +152,18 @@ impl Session {
         i
     }
 
+    /// Add a document recovered from legacy crash recovery. When Komaphone local draft storage
+    /// is active and the document has no external disk path, its initial local baseline binds to
+    /// an existing identical head checkpoint in `drafts.sqlite3` instead of minting a duplicate.
+    pub fn add_recovered_document(&mut self, doc: Document, path: Option<String>) -> usize {
+        let dedup = path.is_none() && self.local_projects.available();
+        let index = self.add_document(doc, path);
+        if dedup && let Some(id) = self.docs.get(index).map(|st| st.doc.id) {
+            self.mark_recovered_document(id);
+        }
+        index
+    }
+
     /// Holds a decoded document back from opening (see `held_opens`); returns its id.
     pub(crate) fn hold_open(&mut self, doc: Document, source_read_only: bool) -> u64 {
         self.next_held_open = self.next_held_open.wrapping_add(1);
@@ -191,6 +203,7 @@ impl Session {
             })
         };
         self.note_active_change();
+        self.prune_closed_local_project(d.doc.id);
         Some(d)
     }
 }

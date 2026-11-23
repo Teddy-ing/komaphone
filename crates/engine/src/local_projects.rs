@@ -1,5 +1,5 @@
 //! Nonblocking local draft coordination. A queued write never counts as a save.
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use photocraft_doc::DocId;
 pub use photocraft_local_store::DraftInfo;
@@ -29,6 +29,13 @@ impl Default for LocalStatus {
     }
 }
 
+struct PendingSave {
+    request: SaveRequest,
+    doc: DocId,
+    editor_revision: u64,
+    dedup_existing: bool,
+}
+
 #[derive(Default)]
 pub struct LocalProjects {
     pub drafts: Vec<DraftInfo>,
@@ -40,9 +47,17 @@ pub struct LocalProjects {
     loading: bool,
     pub(crate) preparing_room: bool,
     pub(crate) frozen_assignment: Option<photocraft_party::AssignmentId>,
+    // Documents admitted from legacy PhotoCraft recovery whose initial baseline save should
+    // bind to an existing identical head checkpoint in `drafts.sqlite3` instead of cloning.
+    recovery_dedup: HashSet<DocId>,
+    // Closed draft identities awaiting best-effort safe pruning on the local-store worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    prune_queue: Vec<ProjectId>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pruning: bool,
     // Retain the exact request on failure, including its idempotency key and pixels.
-    pending: Option<(SaveRequest, DocId, u64)>,
-    failed: HashMap<DocId, (SaveRequest, DocId, u64)>,
+    pending: Option<PendingSave>,
+    failed: HashMap<DocId, PendingSave>,
     failed_bytes: usize,
     writing: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -57,7 +72,7 @@ impl LocalProjects {
         self.failed_bytes = self
             .failed
             .values()
-            .map(|(request, _, _)| crate::local_replay::snapshot_retained_bytes(&request.document).saturating_add(photocraft_local_store::MAX_RECORD_BYTES))
+            .map(|pending| crate::local_replay::snapshot_retained_bytes(&pending.request.document).saturating_add(photocraft_local_store::MAX_RECORD_BYTES))
             .fold(0usize, usize::saturating_add);
     }
     pub(crate) fn owns_document(&self, id: DocId) -> bool {
@@ -211,6 +226,138 @@ impl Session {
         self.local_projects.preparing_room = true;
         Ok(())
     }
+    /// Projects that must not be pruned or permanently deleted right now because they back an
+    /// open Workroom document, a pending/failed local save, or an active party-room game.
+    pub fn active_protected_projects(&self) -> BTreeSet<ProjectId> {
+        let mut protected = BTreeSet::new();
+        for doc in self.documents() {
+            if let Some(project) = self.local_projects.status(doc.doc.id).project {
+                protected.insert(project);
+            }
+        }
+        if let Some(pending) = &self.local_projects.pending {
+            protected.insert(pending.request.project);
+        }
+        for pending in self.local_projects.failed.values() {
+            protected.insert(pending.request.project);
+        }
+        if let Some(project) = self.rooms.submission_project() {
+            protected.insert(project);
+        }
+        if let Some(pin) = &self.rooms.status.freeze_pin {
+            protected.insert(pin.project);
+        }
+        if let Some(room) = &self.rooms.status.room
+            && matches!(room.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer)
+        {
+            if let Some(assignment) = &room.assignment {
+                protected.insert(assignment.assignment.project);
+            }
+            if let Some(drafts) = &self.rooms.status.game_drafts
+                && drafts.room == room.id
+            {
+                protected.extend(drafts.projects.iter().copied());
+            }
+        }
+        protected
+    }
+
+    /// True when `document` belongs to an active (in-progress/submitting) party-room game and
+    /// therefore must not be saved as an independent solo gallery entry or pruned automatically.
+    pub fn is_active_party_document(&self, document: DocId) -> bool {
+        let Some(project) = self.local_projects.status(document).project else {
+            return false;
+        };
+        if self.rooms.submission_project() == Some(project) || self.rooms.status.freeze_pin.as_ref().is_some_and(|pin| pin.project == project) {
+            return true;
+        }
+        self.rooms.status.room.as_ref().is_some_and(|room| {
+            matches!(room.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer)
+                && (room.assignment.as_ref().is_some_and(|assignment| assignment.assignment.project == project)
+                    || self.rooms.status.game_drafts.as_ref().is_some_and(|drafts| drafts.room == room.id && drafts.projects.contains(&project)))
+        })
+    }
+
+    pub(crate) fn mark_recovered_document(&mut self, doc: DocId) {
+        self.local_projects.recovery_dedup.insert(doc);
+    }
+
+    /// Queue a closed, unprotected draft for serialized safe pruning on the local-store worker
+    /// (avoiding any cross-thread race with concurrent `Request::Save` writes).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn queue_safe_local_prune(&mut self, project: ProjectId) {
+        if self.local_projects.available() && !self.active_protected_projects().contains(&project) && !self.local_projects.prune_queue.contains(&project) {
+            self.local_projects.prune_queue.push(project);
+        }
+    }
+
+    pub(crate) fn prune_closed_local_project(&mut self, doc: DocId) {
+        self.local_projects.recovery_dedup.remove(&doc);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !self.local_projects.available() {
+                return;
+            }
+            let status = self.local_projects.status(doc);
+            let Some(project) = status.project else {
+                return;
+            };
+            if status.local_revision == 0
+                || self.local_replay.pending_for(doc) > 0
+                || self.local_projects.pending.as_ref().is_some_and(|pending| pending.doc == doc)
+                || self.local_projects.failed.contains_key(&doc)
+                || self.active_protected_projects().contains(&project)
+            {
+                return;
+            }
+            if !self.local_projects.prune_queue.contains(&project) {
+                self.local_projects.prune_queue.push(project);
+            }
+        }
+    }
+
+    /// Best-effort clean-exit prune: removes untouched blank canvases, round drafts already stored
+    /// in a completed game, and working copies identical to a Saved gallery entry. Never removes
+    /// edited unsaved drawings, active party assignments, or failed saves.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prune_local_projects_on_exit(&mut self, timeout: std::time::Duration) {
+        if !self.local_projects.available() || self.local_projects.error.is_some() {
+            return;
+        }
+        let mut candidates = std::mem::take(&mut self.local_projects.prune_queue);
+        for doc in self.documents() {
+            let id = doc.doc.id;
+            if self.is_active_party_document(id)
+                || self.local_projects.failed.contains_key(&id)
+                || self.local_replay.pending_for(id) > 0
+                || self.local_projects.pending.as_ref().is_some_and(|pending| pending.doc == id)
+            {
+                continue;
+            }
+            let status = self.local_projects.status(id);
+            if status.local_revision > 0
+                && let Some(project) = status.project
+                && !candidates.contains(&project)
+            {
+                candidates.push(project);
+            }
+        }
+        if !candidates.is_empty() {
+            self.local_projects.prune_queue = candidates;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.poll_local_projects();
+            if self.local_projects.error.is_some() || (!self.local_projects.pruning && self.local_projects.prune_queue.is_empty()) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// True only for the current, completed document snapshot after its exact save ACK.
     /// UI callers also check for an unfinished gesture which has not entered the engine.
     pub fn local_document_saved(&self, document: DocId) -> bool {
@@ -222,7 +369,7 @@ impl Session {
             && status.error.is_none()
             && self.local_projects.error.is_none()
             && self.local_replay.pending_for(document) == 0
-            && !self.local_projects.pending.as_ref().is_some_and(|(_, id, _)| *id == document)
+            && !self.local_projects.pending.as_ref().is_some_and(|pending| pending.doc == document)
             && self.local_replay.is_current(state)
     }
 
@@ -309,6 +456,8 @@ impl Session {
             let active_work = self.local_projects.pending.is_some()
                 || self.local_projects.loading
                 || self.local_projects.writing
+                || self.local_projects.pruning
+                || !self.local_projects.prune_queue.is_empty()
                 || self.local_replay.peek_unblocked(&blocked).is_some();
             if !active_work {
                 if let Some(error) = self.local_projects.failed.keys().find_map(|doc| self.local_projects.states.get(doc).and_then(|state| state.error.clone()))

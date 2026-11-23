@@ -224,6 +224,14 @@ fn link_updates(app: &mut PhotocraftApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(wait));
 }
 
+/// Komaphone-managed local drafts are durably saved after every edit in `drafts.sqlite3`.
+/// They must not write redundant upstream PhotoCraft `config/Recovery/` bundles, which would
+/// otherwise trigger startup recovery cloning on relaunch. External disk-backed files and
+/// oversized excluded documents retain upstream recovery autosave unchanged.
+fn is_komaphone_managed_draft(app: &PhotocraftApp, d: &photocraft_engine::DocState) -> bool {
+    app.session.local_projects.available() && d.path.is_none() && app.session.local_replay.excluded_reason(d.doc.id).is_none()
+}
+
 /// Background autosave of documents with unsaved changes every N minutes (File Handling).
 fn autosave(app: &mut PhotocraftApp) {
     let fh = &app.session.prefs().file_handling;
@@ -253,8 +261,16 @@ fn autosave(app: &mut PhotocraftApp) {
         }
     }
     let now = crate::gpu_canvas::now_ms();
-    // Saved or closed documents drop their recovery data.
-    let live: HashMap<DocId, bool> = app.session.documents().iter().map(|d| (d.doc.id, d.is_dirty())).collect();
+    // Saved, closed, or durably acknowledged Komaphone-managed documents drop legacy recovery data.
+    let live: HashMap<DocId, bool> = app
+        .session
+        .documents()
+        .iter()
+        .map(|d| {
+            let needs_legacy_recovery = d.is_dirty() && !(is_komaphone_managed_draft(app, d) && app.session.local_document_saved(d.doc.id));
+            (d.doc.id, needs_legacy_recovery)
+        })
+        .collect();
     let mut stale: Vec<DocId> = app.prefs_rt.autosaved.keys().filter(|id| live.get(id) != Some(&true)).copied().collect();
     stale.extend(app.prefs_rt.autosave_pending.keys().filter(|id| live.get(*id) != Some(&true) && !app.prefs_rt.autosaved.contains_key(*id)).copied());
     for id in stale {
@@ -280,7 +296,12 @@ fn autosave(app: &mut PhotocraftApp) {
         .session
         .documents()
         .iter()
-        .filter(|d| d.is_dirty() && app.prefs_rt.autosaved.get(&d.doc.id) != Some(&d.revision) && !app.prefs_rt.autosave_pending.contains_key(&d.doc.id))
+        .filter(|d| {
+            d.is_dirty()
+                && !is_komaphone_managed_draft(app, d)
+                && app.prefs_rt.autosaved.get(&d.doc.id) != Some(&d.revision)
+                && !app.prefs_rt.autosave_pending.contains_key(&d.doc.id)
+        })
         .map(|d| (d.doc.clone(), d.revision, d.path.clone()))
         .collect();
     for (doc, rev, path) in jobs {

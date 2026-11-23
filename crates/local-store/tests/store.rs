@@ -316,3 +316,93 @@ fn truncated_database_is_retained_and_returns_actionable_error() {
     assert!(error.to_string().contains("retained") || error.to_string().contains("preserved"));
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
+
+#[test]
+fn delete_projects_gcs_orphaned_blobs_while_preserving_shared_chunks_of_other_drafts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drafts.sqlite3");
+    let mut store = Store::open(&path, StoreOptions::default()).unwrap();
+    let first = request(SampleType::U8);
+    store.save(&first).unwrap();
+    let mut first_edit = next(&first, "paint.stroke");
+    first_edit.document.layers[1].name = "Unique to first".into();
+    store.save(&first_edit).unwrap();
+
+    // Second project shares the exact baseline tile bytes with `first` and adds its own edit.
+    let mut second = first.clone();
+    second.project = fresh_project_id().unwrap();
+    second.request_id = fresh_event_id().unwrap();
+    store.save(&second).unwrap();
+    let mut second_edit = next(&second, "paint.stroke");
+    second_edit.document.layers[1].name = "Unique to second".into();
+    store.save(&second_edit).unwrap();
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let objects_before: i64 = db.query_row("SELECT count(*) FROM objects", [], |r| r.get(0)).unwrap();
+    drop(db);
+
+    assert!(store.delete_project(first.project).unwrap());
+    assert!(!store.delete_project(first.project).unwrap(), "deleting missing project returns false");
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(store.list().unwrap()[0].project, second.project);
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let objects_after: i64 = db.query_row("SELECT count(*) FROM objects", [], |r| r.get(0)).unwrap();
+    assert!(objects_after < objects_before, "orphaned objects must be garbage-collected");
+    drop(db);
+
+    // Remaining project and all its revisions reopen intact after reopen.
+    drop(store);
+    let reopened = Store::open(&path, StoreOptions::default()).unwrap();
+    assert_eq!(reopened.load(second.project).unwrap().document, second_edit.document);
+    assert_eq!(reopened.load_revision(second.project, 1).unwrap().0, second.document);
+    assert_eq!(reopened.replay_page(second.project, 0, 16).unwrap().len(), 2);
+}
+
+#[test]
+fn untouched_blank_detection_and_head_checkpoint_dedup_prefer_deepest_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drafts.sqlite3");
+    let mut store = Store::open(&path, StoreOptions::default()).unwrap();
+
+    // 1. Blank `file.new` rev=1 is untouched blank; once edited (`rev=2`), it is not.
+    let blank = request(SampleType::U8);
+    store.save(&blank).unwrap();
+    assert!(store.is_untouched_blank(blank.project).unwrap());
+
+    let mut edited = request(SampleType::U8);
+    store.save(&edited).unwrap();
+    let mut stroke = next(&edited, "paint.stroke");
+    stroke.document.layers[1].name = "Painted".into();
+    store.save(&stroke).unwrap();
+    assert!(!store.is_untouched_blank(edited.project).unwrap());
+
+    // 2. `legacy.import` and `komaphone.gallery.remix` at rev=1 are NOT untouched blanks.
+    let mut imported = request(SampleType::U8);
+    imported.document = stroke.document.clone();
+    imported.event.command = "legacy.import".into();
+    store.save(&imported).unwrap();
+    assert!(!store.is_untouched_blank(imported.project).unwrap());
+
+    let mut remix = request(SampleType::U8);
+    remix.event.command = "komaphone.gallery.remix".into();
+    store.save(&remix).unwrap();
+    assert!(!store.is_untouched_blank(remix.project).unwrap());
+
+    // 3. Checkpoint lookup matches both `edited` (rev 2) and `imported` (rev 1) and prefers `edited` (rev 2).
+    let hash = store.checkpoint_hash_for_document(&stroke.document).unwrap();
+    assert_eq!(store.head_checkpoint_hash(edited.project).unwrap(), Some(hash));
+    assert_eq!(store.find_project_by_head_checkpoint(hash, &[]).unwrap(), Some((edited.project, 2, stroke.event.elapsed_ms)));
+    assert_eq!(store.find_project_by_head_checkpoint(hash, &[edited.project]).unwrap(), Some((imported.project, 1, imported.event.elapsed_ms)));
+    assert_eq!(store.find_project_by_head_checkpoint(hash, &[edited.project, imported.project]).unwrap(), None);
+
+    // 4. ID-normalized matching binds a document whose DocId/LayerIds were regenerated (as in legacy recovery).
+    let mut fresh_ids = stroke.document.clone();
+    fresh_ids.id = photocraft_doc::DocId::fresh();
+    fresh_ids.layers[0].id = photocraft_doc::LayerId::fresh();
+    fresh_ids.layers[1].id = photocraft_doc::LayerId::fresh();
+    assert_eq!(store.find_project_matching_document(&fresh_ids, &[]).unwrap(), Some((edited.project, 2, stroke.event.elapsed_ms)));
+
+    // Prevent unused warning on `edited`.
+    edited.title.clear();
+}

@@ -321,6 +321,205 @@ impl Store {
         }
         Ok(result)
     }
+
+    /// Permanently delete a draft and garbage-collect objects/chunks no longer referenced
+    /// by any remaining project. Shared immutable chunks of other projects remain untouched.
+    pub fn delete_project(&mut self, project: ProjectId) -> Result<bool> {
+        Ok(self.delete_projects(&[project])? > 0)
+    }
+
+    /// Permanently delete a batch of drafts atomically and garbage-collect unreferenced blobs.
+    pub fn delete_projects(&mut self, projects: &[ProjectId]) -> Result<usize> {
+        if projects.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql_error)?;
+        let mut removed = 0usize;
+        for project in projects {
+            tx.execute("DELETE FROM revisions WHERE project=?1", [project.as_str()]).map_err(sql_error)?;
+            let rows = tx.execute("DELETE FROM projects WHERE id=?1", [project.as_str()]).map_err(sql_error)?;
+            removed = removed.saturating_add(rows);
+        }
+        if removed > 0 {
+            tx.execute_batch(
+                "DELETE FROM object_chunks WHERE object IN (
+                    SELECT hash FROM objects
+                    WHERE hash NOT IN (SELECT checkpoint FROM revisions)
+                      AND hash NOT IN (SELECT payload FROM revisions)
+                 );
+                 DELETE FROM objects
+                 WHERE hash NOT IN (SELECT checkpoint FROM revisions)
+                   AND hash NOT IN (SELECT payload FROM revisions);
+                 DELETE FROM chunks
+                 WHERE hash NOT IN (SELECT chunk FROM object_chunks);",
+            )
+            .map_err(sql_error)?;
+        }
+        tx.commit().map_err(sql_error)?;
+        if removed > 0 {
+            let _ = self.db.execute_batch("VACUUM;");
+        }
+        Ok(removed)
+    }
+
+    /// True only when a project has a single healthy baseline revision created by `file.new`
+    /// with zero subsequent edits. Damaged or imported/remixed records always return `false`.
+    pub fn is_untouched_blank(&self, project: ProjectId) -> Result<bool> {
+        let head: Option<i64> =
+            self.db.query_row("SELECT head_revision FROM projects WHERE id=?1", [project.as_str()], |r| r.get(0)).optional().map_err(sql_error)?;
+        if head != Some(1) {
+            return Ok(false);
+        }
+        match verify_revision(&self.db, project, 1) {
+            Ok(verified) => Ok(verified.record.kind == crate::ReplayKind::Baseline && verified.record.command == "file.new"),
+            Err(Error::Corrupt(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The stored `.pcraft` checkpoint hash of the project's head revision, without decoding blobs.
+    pub fn head_checkpoint_hash(&self, project: ProjectId) -> Result<Option<AssetHash>> {
+        let value: Option<String> = self
+            .db
+            .query_row(
+                "SELECT substr(r.checkpoint,1,65) FROM projects p JOIN revisions r ON r.project=p.id AND r.revision=p.head_revision WHERE p.id=?1",
+                [project.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        value.map(|digest| AssetHash::new(&digest).map_err(|e| Error::Corrupt(e.to_string()))).transpose()
+    }
+
+    /// Deterministic `.pcraft` checkpoint hash for `document`, matching `save_observed`.
+    pub fn checkpoint_hash_for_document(&mut self, document: &Document) -> Result<AssetHash> {
+        let (checkpoint, _) = self.writer.save_zip(document, &SaveOptions::default()).map_err(|e| Error::Invalid(e.to_string()))?;
+        AssetHash::new(&hash(&checkpoint)).map_err(|e| Error::Invalid(e.to_string()))
+    }
+
+    /// Locate an existing healthy project whose head revision already matches `checkpoint`,
+    /// preferring the deepest revision history and skipping projects in `exclude`.
+    /// Returns `(project, head_revision, elapsed_ms)`.
+    pub fn find_project_by_head_checkpoint(&self, checkpoint: AssetHash, exclude: &[ProjectId]) -> Result<Option<(ProjectId, u64, u64)>> {
+        let mut statement = self
+            .db
+            .prepare(
+                "SELECT substr(p.id,1,33), p.head_revision, p.elapsed_ms
+                 FROM projects p
+                 JOIN revisions r ON r.project=p.id AND r.revision=p.head_revision
+                 WHERE r.checkpoint=?1
+                 ORDER BY p.head_revision DESC, p.updated_at DESC, p.id
+                 LIMIT 64",
+            )
+            .map_err(sql_error)?;
+        let rows = statement.query_map([checkpoint.as_str()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).map_err(sql_error)?;
+        for row in rows {
+            let (id_str, head, elapsed) = row.map_err(sql_error)?;
+            let Ok(project) = ProjectId::new(&id_str) else { continue };
+            if exclude.contains(&project) {
+                continue;
+            }
+            let Ok(revision) = nonnegative(head, "head revision") else { continue };
+            let Ok(elapsed_ms) = nonnegative(elapsed, "elapsed time") else { continue };
+            if revision == 0 {
+                continue;
+            }
+            if verify_revision(&self.db, project, revision).is_ok() {
+                return Ok(Some((project, revision, elapsed_ms)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find an existing non-excluded project whose head revision matches `document`.
+    /// Tries an O(1) exact checkpoint-hash lookup first, then falls back to an ID-normalized
+    /// full `Document` equality check so documents reloaded through legacy `config/Recovery/`
+    /// (`preserve_ids: false`, which assigns fresh `DocId`/`LayerId` values) still bind cleanly
+    /// to their original multi-revision project without minting duplicates.
+    /// Returns `(project, head_revision, elapsed_ms)`.
+    pub fn find_project_matching_document(&mut self, document: &Document, exclude: &[ProjectId]) -> Result<Option<(ProjectId, u64, u64)>> {
+        if let Ok(exact_hash) = self.checkpoint_hash_for_document(document)
+            && let Some(found) = self.find_project_by_head_checkpoint(exact_hash, exclude)?
+        {
+            return Ok(Some(found));
+        }
+        let target_norm = normalize_document_ids(document);
+        let mut statement = self
+            .db
+            .prepare("SELECT substr(id,1,33), head_revision, elapsed_ms FROM projects ORDER BY head_revision DESC, updated_at DESC, id LIMIT 256")
+            .map_err(sql_error)?;
+        let rows = statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).map_err(sql_error)?;
+        for row in rows {
+            let (raw_id, head, elapsed) = row.map_err(sql_error)?;
+            let Ok(project) = ProjectId::new(&raw_id) else { continue };
+            if exclude.contains(&project) {
+                continue;
+            }
+            let Ok(revision) = nonnegative(head, "head revision") else { continue };
+            let Ok(elapsed_ms) = nonnegative(elapsed, "elapsed time") else { continue };
+            if revision == 0 {
+                continue;
+            }
+            let Ok((candidate, _)) = self.load_revision(project, revision) else { continue };
+            if candidate.size != target_norm.size
+                || candidate.mode != target_norm.mode
+                || candidate.depth != target_norm.depth
+                || candidate.layer_count() != target_norm.layer_count()
+            {
+                continue;
+            }
+            if normalize_document_ids(&candidate) == target_norm {
+                return Ok(Some((project, revision, elapsed_ms)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn normalize_document_ids(document: &Document) -> Document {
+    use photocraft_doc::{DocId, Layer, LayerContent, LayerId};
+    use std::collections::HashMap;
+
+    fn assign_layers(layers: &mut [Layer], next: &mut u64, map: &mut HashMap<LayerId, LayerId>, depth: usize) {
+        if depth > photocraft_format::MAX_GROUP_DEPTH {
+            return;
+        }
+        for layer in layers {
+            let new_id = LayerId(*next);
+            *next = next.saturating_add(1);
+            map.insert(layer.id, new_id);
+            layer.id = new_id;
+            if let LayerContent::Group(group) = &mut layer.content {
+                assign_layers(&mut group.children, next, map, depth.saturating_add(1));
+            }
+        }
+    }
+
+    let mut normalized = document.clone();
+    normalized.id = DocId(1);
+    let mut map = HashMap::new();
+    let mut next = 1u64;
+    assign_layers(&mut normalized.layers, &mut next, &mut map, 0);
+    for comp in normalized.layer_comps.iter_mut().chain(normalized.last_document_state.iter_mut()) {
+        for state in &mut comp.states {
+            if let Some(&mapped) = map.get(&state.layer) {
+                state.layer = mapped;
+            }
+        }
+    }
+    for slice in &mut normalized.slices.list {
+        if let Some(layer) = slice.layer
+            && let Some(&mapped) = map.get(&layer)
+        {
+            slice.layer = Some(mapped);
+        }
+    }
+    for def in &mut normalized.variables.defs {
+        if let Some(&mapped) = map.get(&def.layer) {
+            def.layer = mapped;
+        }
+    }
+    normalized
 }
 
 fn initialize(db: &mut Connection) -> Result<()> {

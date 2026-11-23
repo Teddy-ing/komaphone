@@ -51,8 +51,13 @@ fn item(number: u64, title: &str, author: &str, favorite: bool, trashed: bool) -
         complete: true,
         draft: false,
         revision: 1,
-        state: "Saved locally".into(),
+        state: "Completed game".into(),
         source_projects: vec![id(number)],
+        saved_matches_head: false,
+        has_saved_copy: false,
+        has_unsaved_edits: false,
+        untouched_blank: false,
+        covered_by_game: false,
     }
 }
 fn app(active: bool) -> PhotocraftApp {
@@ -129,31 +134,64 @@ fn click(app: &mut PhotocraftApp, ctx: &egui::Context, name: &str, now: f64) {
 }
 
 #[test]
-fn filters_favorites_and_trash_show_only_the_selected_items() {
+fn gallery_sections_search_and_trash_show_only_the_selected_items() {
     let mut app = app(false);
     let ctx = egui::Context::default();
     PhotocraftApp::setup_context(&ctx, app.ui.theme);
-    app.session.gallery.items =
-        vec![item(1, "Warm sunset", "Ada", true, false), item(2, "Blue moon", "Bob", false, false), item(3, "Old sketch", "Ada", true, true)];
+    app.session.gallery.items = vec![
+        GalleryItem { kind: "project".into(), ..item(1, "Saved portrait", "Ada", false, false) },
+        item(2, "Warm sunset", "Ada", false, false),
+        GalleryItem { kind: "creature".into(), ..item(3, "Blue monster", "Bob", false, false) },
+        GalleryItem { kind: "draft".into(), draft: true, ..item(4, "Work in progress", "You", false, false) },
+        GalleryItem { kind: "draft".into(), draft: true, untouched_blank: true, ..item(5, "Blank canvas", "You", false, false) },
+        GalleryItem { kind: "draft".into(), draft: true, covered_by_game: true, ..item(6, "Room round", "You", false, false) },
+        GalleryItem { kind: "draft".into(), draft: true, saved_matches_head: true, ..item(7, "Synced draft", "You", false, false) },
+        item(8, "Old sketch", "Ada", false, true),
+    ];
     for entry in &app.session.gallery.items {
-        app.session.gallery.thumbnails.insert((entry.id, false), Arc::new(RoomImage { width: 4, height: 4, rgba: vec![255; 64] }));
+        app.session.gallery.thumbnails.insert((entry.id, entry.draft), Arc::new(RoomImage { width: 4, height: 4, rgba: vec![255; 64] }));
     }
+    // Default Saved section shows only explicitly saved solo drawings.
     paint(&mut app, &ctx, 0.0, Vec::new());
     let texts = paint(&mut app, &ctx, 0.1, Vec::new());
-    assert!(texts.iter().any(|t| t == "Warm sunset"));
-    assert!(texts.iter().any(|t| t == "Blue moon"));
+    assert!(texts.iter().any(|t| t == "Saved portrait"));
+    assert!(!texts.iter().any(|t| t == "Warm sunset"));
+    assert!(!texts.iter().any(|t| t == "Work in progress"));
     assert!(!texts.iter().any(|t| t == "Old sketch"));
-    app.ui.gallery.filter = "ada".into();
-    let texts = paint(&mut app, &ctx, 0.2, Vec::new());
+    assert!(crate::komaphone_workspace::control_rect(&ctx, "gallery.draw").is_none(), "redundant Draw button removed");
+
+    // Completed section shows Animation and Exquisite Corpse games with sub-filtering and search.
+    click(&mut app, &ctx, "gallery.section.completed", 0.2);
+    let texts = paint(&mut app, &ctx, 0.25, Vec::new());
     assert!(texts.iter().any(|t| t == "Warm sunset"));
-    assert!(!texts.iter().any(|t| t == "Blue moon"));
-    app.ui.gallery.filter.clear();
-    app.ui.gallery.favorites = true;
+    assert!(texts.iter().any(|t| t == "Blue monster"));
+    assert!(!texts.iter().any(|t| t == "Saved portrait"));
+    assert!(!texts.iter().any(|t| t == "Old sketch"));
+
+    app.ui.gallery.filter = "ada".into();
     let texts = paint(&mut app, &ctx, 0.3, Vec::new());
-    assert!(!texts.iter().any(|t| t == "Blue moon"));
-    app.ui.gallery.trash = true;
+    assert!(texts.iter().any(|t| t == "Warm sunset"));
+    assert!(!texts.iter().any(|t| t == "Blue monster"));
+    app.ui.gallery.filter.clear();
+
+    click(&mut app, &ctx, "gallery.completed.creature", 0.35);
     let texts = paint(&mut app, &ctx, 0.4, Vec::new());
+    assert!(texts.iter().any(|t| t == "Blue monster"));
+    assert!(!texts.iter().any(|t| t == "Warm sunset"));
+
+    // Temp section shows only real unsaved drafts (hiding blanks, covered game rounds, and synced copies).
+    click(&mut app, &ctx, "gallery.section.temp", 0.45);
+    let texts = paint(&mut app, &ctx, 0.5, Vec::new());
+    assert!(texts.iter().any(|t| t == "Work in progress"));
+    assert!(!texts.iter().any(|t| t == "Blank canvas"));
+    assert!(!texts.iter().any(|t| t == "Room round"));
+    assert!(!texts.iter().any(|t| t == "Synced draft"));
+
+    // Trash section shows trashed items with their original section label.
+    click(&mut app, &ctx, "gallery.section.trash", 0.55);
+    let texts = paint(&mut app, &ctx, 0.6, Vec::new());
     assert!(texts.iter().any(|t| t == "Old sketch"));
+    assert!(texts.iter().any(|t| t.contains("From Completed")));
     assert!(!texts.iter().any(|t| t == "Warm sunset"));
 }
 
@@ -325,6 +363,7 @@ fn handoff_notes_are_hidden_until_explicitly_opened_and_reset_for_another_item()
 #[test]
 fn private_or_closed_gallery_releases_preview_and_thumbnail_texture_handles() {
     let mut app = app(true);
+    app.ui.gallery.section = GallerySection::Completed;
     let ctx = egui::Context::default();
     PhotocraftApp::setup_context(&ctx, app.ui.theme);
     let thumbnail = Arc::new(RoomImage { width: 4, height: 4, rgba: vec![255; 64] });
@@ -408,6 +447,7 @@ fn corpse_game_manifest(entry_num: u64, players: u8) -> GalleryManifest {
 #[test]
 fn switching_gallery_creature_or_game_during_playback_resets_part_step_and_timer() {
     let mut app = app(true);
+    app.ui.gallery.section = GallerySection::Completed;
     let game_a = Arc::new(corpse_game_manifest(200, 3));
     let game_b = Arc::new(corpse_game_manifest(201, 2));
     app.session.gallery.active = Some(game_a);

@@ -117,6 +117,15 @@ impl Recorder {
         self.seen.insert(state.doc.id, Seen { document: state.doc.clone(), elapsed_ms, clock: web_time::Instant::now() });
     }
 
+    /// Advance the recorded replay clock floor after deduplicating a recovered document against an
+    /// existing multi-revision project so subsequent edits never regress `elapsed_ms`.
+    pub fn advance_elapsed_ms(&mut self, document: DocId, elapsed_ms: u64) {
+        if let Some(seen) = self.seen.get_mut(&document) {
+            seen.elapsed_ms = seen.elapsed_ms.max(elapsed_ms);
+            seen.clock = web_time::Instant::now();
+        }
+    }
+
     /// Fork a recovered/imported current document without dropping queued original edits.
     pub fn forget(&mut self, document: DocId) {
         self.seen.remove(&document);

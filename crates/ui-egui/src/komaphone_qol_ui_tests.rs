@@ -634,8 +634,13 @@ fn qol015_gallery_card_and_drafts_render_viewer_local_timestamps_without_mutatin
             complete: true,
             draft: false,
             revision: 1,
-            state: "Saved locally".into(),
+            state: "Completed game".into(),
             source_projects: vec![id1],
+            saved_matches_head: false,
+            has_saved_copy: false,
+            has_unsaved_edits: false,
+            untouched_blank: false,
+            covered_by_game: false,
         },
         GalleryItem {
             id: id2,
@@ -648,10 +653,16 @@ fn qol015_gallery_card_and_drafts_render_viewer_local_timestamps_without_mutatin
             complete: true,
             draft: true,
             revision: 1,
-            state: "Saved locally".into(),
+            state: "Temporary draft".into(),
             source_projects: vec![id2],
+            saved_matches_head: false,
+            has_saved_copy: false,
+            has_unsaved_edits: false,
+            untouched_blank: false,
+            covered_by_game: false,
         },
     ];
+    app.ui.gallery.section = crate::komaphone_gallery::GallerySection::Completed;
     app.session.gallery.active = Some(Arc::new(GalleryManifest {
         schema_version: GALLERY_SCHEMA,
         id: id1,
@@ -685,8 +696,13 @@ fn qol015_gallery_card_and_drafts_render_viewer_local_timestamps_without_mutatin
     let pacific_texts = komaphone_time::with_viewer_timezone(komaphone_time::fixture_pacific_12h, || render_gallery(&mut app));
     assert!(pacific_texts.iter().any(|t| t == "Nov 18, 2026, 8:43 PM PST"), "card shows readable Pacific time: {pacific_texts:?}");
     assert!(pacific_texts.iter().any(|t| t == "Updated Nov 18, 2026, 8:43 PM PST"), "detail shows readable Pacific time");
-    assert!(pacific_texts.iter().any(|t| t == komaphone_time::UNAVAILABLE_LABEL), "invalid timestamp shows honest unavailable label");
     assert!(!pacific_texts.iter().any(|t| t.contains(SUPPLIED)), "raw ISO string must not appear directly on card");
+
+    // Temp section renders invalid draft timestamp with the honest unavailable label.
+    app.ui.gallery.section = crate::komaphone_gallery::GallerySection::Temp;
+    let temp_texts = komaphone_time::with_viewer_timezone(komaphone_time::fixture_pacific_12h, || render_gallery(&mut app));
+    assert!(temp_texts.iter().any(|t| t == komaphone_time::UNAVAILABLE_LABEL), "invalid timestamp shows honest unavailable label: {temp_texts:?}");
+    app.ui.gallery.section = crate::komaphone_gallery::GallerySection::Completed;
 
     // Tokyo viewer (24-hour): same stored item renders in JST without altering stored data.
     let tokyo_texts = komaphone_time::with_viewer_timezone(komaphone_time::fixture_tokyo_24h, || render_gallery(&mut app));
@@ -917,6 +933,7 @@ fn capture_qol_small_ui_batch_visual_evidence() {
         let id1 = project_id(1);
         let id2 = project_id(2);
         let id3 = project_id(3);
+        app.ui.gallery.section = crate::komaphone_gallery::GallerySection::Completed;
         app.session.gallery.items = vec![
             GalleryItem {
                 id: id1,
@@ -929,8 +946,13 @@ fn capture_qol_small_ui_batch_visual_evidence() {
                 complete: true,
                 draft: false,
                 revision: 1,
-                state: "Saved locally".into(),
+                state: "Completed game".into(),
                 source_projects: vec![id1],
+                saved_matches_head: false,
+                has_saved_copy: false,
+                has_unsaved_edits: false,
+                untouched_blank: false,
+                covered_by_game: false,
             },
             GalleryItem {
                 id: id2,
@@ -943,8 +965,13 @@ fn capture_qol_small_ui_batch_visual_evidence() {
                 complete: true,
                 draft: false,
                 revision: 1,
-                state: "Saved locally".into(),
+                state: "Completed game".into(),
                 source_projects: vec![id2],
+                saved_matches_head: false,
+                has_saved_copy: false,
+                has_unsaved_edits: false,
+                untouched_blank: false,
+                covered_by_game: false,
             },
             GalleryItem {
                 id: id3,
@@ -957,8 +984,13 @@ fn capture_qol_small_ui_batch_visual_evidence() {
                 complete: true,
                 draft: true,
                 revision: 1,
-                state: "Saved locally".into(),
+                state: "Temporary draft".into(),
                 source_projects: vec![id3],
+                saved_matches_head: false,
+                has_saved_copy: false,
+                has_unsaved_edits: false,
+                untouched_blank: false,
+                covered_by_game: false,
             },
         ];
         app.session.gallery.active = Some(Arc::new(GalleryManifest {

@@ -284,6 +284,181 @@ impl GalleryStore {
         self.insert_observed(bundle, |_| {})
     }
 
+    /// Explicitly save or update a user-authored solo project in the permanent Saved gallery.
+    /// Immutable Game entries can never be overwritten through this path.
+    pub fn save_project(&mut self, bundle: &GalleryBundle, explicit_title: Option<&str>) -> Result<GalleryInfo> {
+        if !matches!(bundle.manifest.content, GalleryContent::Project { .. }) {
+            return Err(invalid("only drawings/projects can be updated via save_project"));
+        }
+        if let Some(title) = explicit_title {
+            photocraft_party::validate_label(title, 96, false).map_err(invalid)?;
+        }
+        validate_native(bundle)?;
+        let now = timestamp();
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        let (entry, replaced) = if let Some(existing) = existing_entry(&tx, bundle.manifest.id)? {
+            if existing.info.kind != GalleryKind::Project {
+                return Err(Error::Conflict);
+            }
+            let mut manifest = bundle.manifest.clone();
+            manifest.notes.clear();
+            manifest.created_at = existing.manifest.created_at.clone();
+            manifest.updated_at = now.clone();
+            manifest.title = explicit_title.map(str::to_owned).unwrap_or_else(|| existing.info.title.clone());
+            manifest.fps = existing.info.fps;
+            manifest.looping = existing.info.looping;
+            let mut info = summary(&manifest)?;
+            info.favorite = existing.info.favorite;
+            info.trashed = false;
+            info.imported_from = existing.info.imported_from;
+            info.source_projects = source_projects(&manifest, info.imported_from);
+            (StoredEntry { manifest, info, notes: Vec::new() }, true)
+        } else {
+            check_entry_capacity(&tx, 1)?;
+            let mut manifest = bundle.manifest.clone();
+            manifest.notes.clear();
+            if let Some(title) = explicit_title {
+                manifest.title = title.into();
+            }
+            manifest.updated_at = now.clone();
+            let info = summary(&manifest)?;
+            (StoredEntry { manifest, info, notes: Vec::new() }, false)
+        };
+        entry.validate()?;
+        for (hash, bytes) in &bundle.objects {
+            store_object(&tx, AssetRef { hash: *hash, bytes: bytes.len() as u64 }, bytes)?;
+        }
+        if replaced {
+            let manifest_bytes = json_bytes(&entry.manifest, MAX_GALLERY_MANIFEST_BYTES)?;
+            let info_bytes = json_bytes(&entry.info, 16 * 1024)?;
+            tx.execute(
+                "UPDATE entries SET manifest=?1,manifest_hash=?2,info=?3,info_hash=?4 WHERE id=?5",
+                params![manifest_bytes, digest(&manifest_bytes), info_bytes, digest(&info_bytes), entry.manifest.id.as_str()],
+            )
+            .map_err(sql)?;
+            tx.execute("DELETE FROM refs WHERE entry=?1", [entry.manifest.id.as_str()]).map_err(sql)?;
+            for asset in entry.manifest.required_assets().map_err(invalid)? {
+                let bytes: Option<i64> = db_object_bytes(&tx, asset.hash)?;
+                if bytes != Some(asset.bytes as i64) {
+                    return Err(invalid("missing or mismatched gallery dependency"));
+                }
+                tx.execute("INSERT INTO refs(entry,hash) VALUES(?1,?2)", params![entry.manifest.id.as_str(), asset.hash.as_str()]).map_err(sql)?;
+            }
+            gc_unreferenced_objects(&tx)?;
+        } else {
+            store_entry(&tx, &entry)?;
+        }
+        tx.commit().map_err(sql)?;
+        if replaced {
+            let _ = self.db.execute_batch("VACUUM;");
+        }
+        Ok(entry.info)
+    }
+
+    /// Permanently delete a single gallery entry that has already been moved to Trash.
+    /// Preserves objects still referenced by other entries (e.g. remixes or siblings).
+    pub fn delete_entry(&mut self, id: ProjectId) -> Result<bool> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        let Some(existing) = existing_entry(&tx, id)? else {
+            return Ok(false);
+        };
+        if !existing.info.trashed {
+            return Err(invalid("move this item to Trash before deleting it permanently"));
+        }
+        tx.execute("DELETE FROM gallery_notes WHERE entry=?1", [id.as_str()]).map_err(sql)?;
+        tx.execute("DELETE FROM refs WHERE entry=?1", [id.as_str()]).map_err(sql)?;
+        let removed = tx.execute("DELETE FROM entries WHERE id=?1", [id.as_str()]).map_err(sql)? > 0;
+        if removed {
+            gc_unreferenced_objects(&tx)?;
+        }
+        tx.commit().map_err(sql)?;
+        if removed {
+            let _ = self.db.execute_batch("VACUUM;");
+        }
+        Ok(removed)
+    }
+
+    /// Permanently delete all currently trashed entries and reclaim unreferenced objects.
+    pub fn delete_trashed_entries(&mut self) -> Result<Vec<ProjectId>> {
+        let trashed: Vec<ProjectId> = self.list(true)?.into_iter().filter(|info| info.trashed).map(|info| info.id).collect();
+        if trashed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        let mut deleted = Vec::new();
+        for id in trashed {
+            let Some(existing) = existing_entry(&tx, id)? else { continue };
+            if !existing.info.trashed {
+                continue;
+            }
+            tx.execute("DELETE FROM gallery_notes WHERE entry=?1", [id.as_str()]).map_err(sql)?;
+            tx.execute("DELETE FROM refs WHERE entry=?1", [id.as_str()]).map_err(sql)?;
+            if tx.execute("DELETE FROM entries WHERE id=?1", [id.as_str()]).map_err(sql)? > 0 {
+                deleted.push(id);
+            }
+        }
+        if !deleted.is_empty() {
+            gc_unreferenced_objects(&tx)?;
+        }
+        tx.commit().map_err(sql)?;
+        if !deleted.is_empty() {
+            let _ = self.db.execute_batch("VACUUM;");
+        }
+        Ok(deleted)
+    }
+
+    /// Remove any draft preference row once a draft has been permanently deleted or promoted.
+    pub fn remove_draft_preference(&mut self, id: ProjectId) -> Result<()> {
+        self.remove_draft_preferences(&[id])
+    }
+
+    pub fn remove_draft_preferences(&mut self, ids: &[ProjectId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        for id in ids {
+            tx.execute("DELETE FROM draft_preferences WHERE id=?1", [id.as_str()]).map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    /// Assignment draft IDs whose submitted artwork is already durably preserved inside
+    /// a non-trashed Completed game in `gallery.sqlite3`.
+    pub fn covered_game_projects(&self) -> Result<BTreeSet<ProjectId>> {
+        let mut covered = BTreeSet::new();
+        for info in self.list(false)? {
+            if info.kind == GalleryKind::Project {
+                continue;
+            }
+            let Some(entry) = existing_entry(&self.db, info.id)? else { continue };
+            if let GalleryContent::Game { room } = entry.manifest.content {
+                for reveal in room.reveal {
+                    if let photocraft_party::room::RevealedEntry::Artwork { assignment, .. } = reveal {
+                        covered.insert(assignment.project);
+                    }
+                }
+            }
+        }
+        Ok(covered)
+    }
+
+    /// Final `.pcraft` checkpoint hashes for non-trashed Saved projects in `gallery.sqlite3`,
+    /// read from metadata only (never decoding artwork blobs).
+    pub fn saved_project_checkpoints(&self) -> Result<BTreeMap<ProjectId, AssetHash>> {
+        let mut result = BTreeMap::new();
+        for info in self.list(false)? {
+            if info.kind != GalleryKind::Project {
+                continue;
+            }
+            let Some(entry) = existing_entry(&self.db, info.id)? else { continue };
+            if let GalleryContent::Project { checkpoint, .. } = entry.manifest.content {
+                result.insert(info.id, checkpoint.hash);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn insert_observed(&mut self, bundle: &GalleryBundle, mut observe: impl FnMut(GalleryStage)) -> Result<GalleryInfo> {
         validate_native(bundle)?;
         let mut entry = StoredEntry { manifest: bundle.manifest.clone(), info: summary(&bundle.manifest)?, notes: bundle.manifest.notes.clone() };
@@ -795,6 +970,20 @@ fn store_object(db: &Connection, asset: AssetRef, bytes: &[u8]) -> Result<()> {
         query.execute(params![asset.hash.as_str(), index as i64, chunk]).map_err(sql)?;
     }
     Ok(())
+}
+
+fn db_object_bytes(db: &Connection, hash: AssetHash) -> Result<Option<i64>> {
+    db.query_row("SELECT bytes FROM objects WHERE hash=?1", [hash.as_str()], |row| row.get(0)).optional().map_err(sql)
+}
+
+fn gc_unreferenced_objects(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "DELETE FROM chunks WHERE hash IN (
+            SELECT hash FROM objects WHERE hash NOT IN (SELECT hash FROM refs)
+         );
+         DELETE FROM objects WHERE hash NOT IN (SELECT hash FROM refs);",
+    )
+    .map_err(sql)
 }
 
 fn verify_existing_object(db: &Connection, asset: AssetRef, bytes: &[u8]) -> Result<()> {
