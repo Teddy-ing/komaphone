@@ -1,18 +1,64 @@
 #!/usr/bin/env python3
 """Read-only content receipts: IDs/counts/hashes, never snapshots or authority."""
 import argparse
+import contextlib
 import copy
 import hashlib
 import json
 import pathlib
 import re
 import sqlite3
+import struct
+import zlib
 
 TABLES = {"rooms": "id", "archives": "room,revision", "objects": "id", "worlds": "id",
           "world_events": "canvas,revision", "world_members": "canvas,profile",
           "world_media_sources": "source_key", "world_blobs": "canvas,hash",
           "world_trash": "canvas", "receipts": "actor,id"}
+SCHEMA6_TABLES = {"world_meta": "canvas", "world_devices": "canvas,device",
+                  "world_strokes_idx": "canvas,stroke", "world_media_idx": "canvas,media",
+                  "world_tours_idx": "canvas,tour", "world_checkpoints": "canvas,revision"}
+EVENT_ZLIB_MAGIC = b"KZ1\x00"
 MAX_CELL = 64 * 1024 * 1024
+
+
+def chain_hash_init(canvas, owner, initial_name):
+    h = hashlib.sha256()
+    h.update(b"komaphone-chain-v1:")
+    h.update(canvas.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(owner.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(initial_name.encode("utf-8"))
+    return h.hexdigest()
+
+
+def chain_hash_step(prev_chain, revision, event_hash):
+    h = hashlib.sha256()
+    h.update(b"komaphone-chain-v1:")
+    h.update(prev_chain.encode("utf-8"))
+    h.update(struct.pack(">Q", revision))
+    h.update(event_hash.encode("utf-8"))
+    return h.hexdigest()
+
+
+def decode_event_body(raw):
+    require(len(raw) <= MAX_CELL, "Canvas event exceeds size limit")
+    if raw.startswith(EVENT_ZLIB_MAGIC):
+        dec = zlib.decompressobj()
+        out = dec.decompress(raw[len(EVENT_ZLIB_MAGIC):], MAX_CELL + 1)
+        require(len(out) <= MAX_CELL and dec.eof and not dec.unconsumed_tail and not dec.unused_data, "Invalid compressed canvas event")
+        return out
+    return raw
+
+
+def world_schema_version(database):
+    has = database.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_schema')").fetchone()[0]
+    if not has:
+        return None
+    rows = database.execute("SELECT version FROM world_schema LIMIT 2").fetchall()
+    require(len(rows) == 1, "Invalid world_schema table")
+    return rows[0][0]
 
 
 def require(value, message):
@@ -77,11 +123,15 @@ def table_receipt(database, table, order):
 def inspect(path, expectations=None, require_populated=False):
     path = pathlib.Path(path).resolve(strict=True)
     require(path.is_file() and path.stat().st_size <= 4 * 1024**3, "Invalid receipt database")
-    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10) as database:
+    with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)) as database:
         database.execute("PRAGMA query_only=ON")
         database.execute("BEGIN")
         require(database.execute("PRAGMA quick_check").fetchone()[0] == "ok", "Database integrity failed")
-        tables = {table: table_receipt(database, table, order) for table, order in TABLES.items()}
+        wschema = world_schema_version(database)
+        active_tables = dict(TABLES)
+        if wschema == 6:
+            active_tables.update(SCHEMA6_TABLES)
+        tables = {table: table_receipt(database, table, order) for table, order in active_tables.items()}
         objects = {}
         complete_bytes = complete_count = 0
         for room, actor, digest, total, received, complete, data in database.execute("SELECT room,actor,hash,total,received,complete,data FROM objects"):
@@ -122,20 +172,68 @@ def inspect(path, expectations=None, require_populated=False):
             if key not in games or games[key]["revision"] < summary["revision"]:
                 games[key] = summary
         canvases = {}
-        for canvas, revision, state_body, digest in database.execute("SELECT id,revision,state,hash FROM worlds ORDER BY id"):
-            require(len(state_body) <= 32 * 1024 * 1024 and sha(state_body) == digest, "Canvas state hash mismatch")
-            state = json.loads(state_body)
-            require(state["canvas"] == canvas and state["revision"] == revision, "Canvas revision mismatch")
-            event_count = 0
-            for event_revision, body, event_hash in database.execute("SELECT revision,body,hash FROM world_events WHERE canvas=? ORDER BY revision", (canvas,)):
-                event_count += 1
-                require(event_revision == event_count and sha(body) == event_hash, "Canvas event history mismatch")
-            require(event_count == revision, "Canvas event revision count mismatch")
-            canvases[canvas] = {"canvas": identifier(canvas), "revision": revision, "state_sha256": digest,
-                                "event_count": event_count, "stroke_count": len(state["strokes"]),
-                                "stroke_ids_sha256": sha(encoded(sorted(state["strokes"]))),
-                                "stroke_metadata_sha256": sha(encoded(state["strokes"])),
-                                "media_count": len(state["media"]), "tour_count": len(state["tours"])}
+        if wschema == 6:
+            for canvas, owner, initial_name, revision, state_body, digest in database.execute(
+                "SELECT id,owner,initial_name,revision,state,hash FROM worlds ORDER BY id"
+            ):
+                require(len(state_body) == 0, "Schema 6 worlds.state must be empty")
+                meta = database.execute(
+                    "SELECT chain_hash,stroke_count,media_count,tour_count FROM world_meta WHERE canvas=?",
+                    (canvas,),
+                ).fetchone()
+                require(meta is not None and meta[0] == digest, "Canvas schema 6 metadata mismatch")
+                meta_chain, stroke_count, media_count, tour_count = meta
+                chain = chain_hash_init(canvas, owner, initial_name)
+                event_count = 0
+                for event_revision, body, event_hash in database.execute(
+                    "SELECT revision,body,hash FROM world_events WHERE canvas=? ORDER BY revision", (canvas,)
+                ):
+                    event_count += 1
+                    decoded = decode_event_body(body)
+                    require(event_revision == event_count and sha(decoded) == event_hash, "Canvas event history mismatch")
+                    chain = chain_hash_step(chain, event_revision, event_hash)
+                require(event_count == revision, "Canvas event revision count mismatch")
+                require(chain == digest and chain == meta_chain, "Canvas chain hash mismatch")
+                stroke_rows = database.execute(
+                    "SELECT stroke,owner,device,points,visible,created_revision,changed_revision FROM world_strokes_idx WHERE canvas=? ORDER BY stroke",
+                    (canvas,),
+                ).fetchall()
+                require(len(stroke_rows) == stroke_count, "Canvas stroke index count mismatch")
+                media_idx_count = database.execute("SELECT COUNT(*) FROM world_media_idx WHERE canvas=?", (canvas,)).fetchone()[0]
+                require(media_idx_count == media_count, "Canvas media index count mismatch")
+                tour_idx_count = database.execute("SELECT COUNT(*) FROM world_tours_idx WHERE canvas=? AND present=1", (canvas,)).fetchone()[0]
+                require(tour_idx_count == tour_count, "Canvas tour index count mismatch")
+                for c_rev, c_sha, c_bytes, c_body in database.execute(
+                    "SELECT revision,compressed_sha256,compressed_bytes,body_zlib FROM world_checkpoints WHERE canvas=? ORDER BY revision",
+                    (canvas,),
+                ):
+                    require(0 < c_rev <= revision and len(c_body) == c_bytes and sha(c_body) == c_sha, "Canvas checkpoint integrity mismatch")
+                canvases[canvas] = {
+                    "canvas": identifier(canvas),
+                    "revision": revision,
+                    "state_sha256": digest,
+                    "event_count": event_count,
+                    "stroke_count": stroke_count,
+                    "stroke_ids_sha256": sha(encoded([r[0] for r in stroke_rows])),
+                    "stroke_metadata_sha256": sha(encoded([list(r) for r in stroke_rows])),
+                    "media_count": media_count,
+                    "tour_count": tour_count,
+                }
+        else:
+            for canvas, revision, state_body, digest in database.execute("SELECT id,revision,state,hash FROM worlds ORDER BY id"):
+                require(len(state_body) <= 32 * 1024 * 1024 and sha(state_body) == digest, "Canvas state hash mismatch")
+                state = json.loads(state_body)
+                require(state["canvas"] == canvas and state["revision"] == revision, "Canvas revision mismatch")
+                event_count = 0
+                for event_revision, body, event_hash in database.execute("SELECT revision,body,hash FROM world_events WHERE canvas=? ORDER BY revision", (canvas,)):
+                    event_count += 1
+                    require(event_revision == event_count and sha(body) == event_hash, "Canvas event history mismatch")
+                require(event_count == revision, "Canvas event revision count mismatch")
+                canvases[canvas] = {"canvas": identifier(canvas), "revision": revision, "state_sha256": digest,
+                                    "event_count": event_count, "stroke_count": len(state["strokes"]),
+                                    "stroke_ids_sha256": sha(encoded(sorted(state["strokes"]))),
+                                    "stroke_metadata_sha256": sha(encoded(state["strokes"])),
+                                    "media_count": len(state["media"]), "tour_count": len(state["tours"])}
         matched_games, matched_canvases = [], []
         if expectations is not None:
             require(expectations.get("schema") == 1, "Unknown expectation schema")
@@ -164,11 +262,12 @@ def inspect(path, expectations=None, require_populated=False):
 
 def compare_restored(source, restored, before, after, allow_reconnect=False):
     """The restore CLI opens Store once: validate its exact Room::restart effects."""
-    for table in TABLES:
+    require(set(before["tables"]) == set(after["tables"]), "Restored content table set differs")
+    for table in before["tables"]:
         if table != "rooms":
             require(before["tables"][table] == after["tables"][table], "Restored content table differs")
-    with sqlite3.connect(pathlib.Path(source).resolve().as_uri() + "?mode=ro", uri=True) as original, \
-         sqlite3.connect(pathlib.Path(restored).resolve().as_uri() + "?mode=ro", uri=True) as recovered:
+    with contextlib.closing(sqlite3.connect(pathlib.Path(source).resolve().as_uri() + "?mode=ro", uri=True)) as original, \
+         contextlib.closing(sqlite3.connect(pathlib.Path(restored).resolve().as_uri() + "?mode=ro", uri=True)) as recovered:
         old_rows = original.execute("SELECT id,snapshot FROM rooms ORDER BY id").fetchall()
         new_rows = recovered.execute("SELECT id,snapshot FROM rooms ORDER BY id").fetchall()
         require(len(old_rows) == len(new_rows), "Restored room count differs")
@@ -196,7 +295,7 @@ def compare_restored(source, restored, before, after, allow_reconnect=False):
                     expected["deadline_ms"] = None
                 expected["paused"] = "restart"
             require(expected == new, "Restored room differs beyond exact restart transition")
-    return {"identical_nonroom_tables": len(TABLES) - 1, "validated_room_restart_transitions": len(old_rows),
+    return {"identical_nonroom_tables": len(before["tables"]) - 1, "validated_room_restart_transitions": len(old_rows),
             "reconnect_presence_transitions_allowed": allow_reconnect,
             "all_room_art_and_permissions_preserved": True}
 
