@@ -425,7 +425,8 @@ impl Outbox {
         if body.len() > MAX_MESSAGE_BYTES || digest(&body) != checksum {
             return Err(Error::Storage("Pending request checksum failed; preserve the database".into()));
         }
-        let mut request = RpcRequest::decode(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+        let mut request = RpcRequest::decode_stored(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+        request.protocol_version = PROTOCOL_VERSION;
         if let Some(key) = secret_key {
             let secret = self
                 .credentials
@@ -579,7 +580,7 @@ impl Outbox {
             if digest(&body) != checksum {
                 return Err(Error::Storage("Pending request checksum failed".into()));
             }
-            let request = RpcRequest::decode(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+            let request = RpcRequest::decode_stored(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
             let Operation::Apply { room, expected_revision, action } = request.operation else {
                 return Ok(None);
             };
@@ -760,7 +761,7 @@ impl Outbox {
             if digest(&body) != checksum {
                 return Err(Error::Storage("Pending request checksum failed".into()));
             }
-            let request = RpcRequest::decode(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+            let request = RpcRequest::decode_stored(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
             if let Operation::Apply { room: target, action, .. } = request.operation
                 && target == room
             {
@@ -840,7 +841,7 @@ impl Outbox {
             if digest(&body) != checksum {
                 return Err(Error::Storage("Pending request checksum failed; preserve this database".into()));
             }
-            let request = RpcRequest::decode(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
+            let request = RpcRequest::decode_stored(&body).map_err(|_| Error::Storage("Invalid pending request".into()))?;
             if let Some(project) = submission_project(&request.operation) {
                 projects.push((request.request_id, project));
             }

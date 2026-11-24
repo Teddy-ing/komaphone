@@ -7,6 +7,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 2;
+pub const MIN_STORED_PROTOCOL_VERSION: u16 = 1;
 pub const CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = MAX_ROOM_SNAPSHOT_BYTES + MAX_MESSAGE_BYTES;
 
@@ -22,6 +23,17 @@ impl RpcRequest {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let request: Self = decode_bounded(bytes)?;
         if request.protocol_version != PROTOCOL_VERSION {
+            return Err(Error::Version(request.protocol_version));
+        }
+        Ok(request)
+    }
+
+    /// Decodes a locally stored client outbox request written by a compatible prior
+    /// protocol version (`MIN_STORED_PROTOCOL_VERSION..=PROTOCOL_VERSION`). Wire
+    /// transport boundaries must continue using strict [`Self::decode`].
+    pub fn decode_stored(bytes: &[u8]) -> Result<Self> {
+        let request: Self = decode_bounded(bytes)?;
+        if !(MIN_STORED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&request.protocol_version) {
             return Err(Error::Version(request.protocol_version));
         }
         Ok(request)

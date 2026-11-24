@@ -18,9 +18,19 @@ fn protocol_requires_exact_known_version_and_fields() {
     let mut value = wire();
     assert!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()).is_ok());
     // Legacy v1 clients and future unknown protocol versions receive explicit Version errors.
-    for incompatible in [1u16, PROTOCOL_VERSION + 1] {
+    for incompatible in [0u16, 1, PROTOCOL_VERSION + 1] {
         value["protocol_version"] = json!(incompatible);
         assert!(matches!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()), Err(Error::Version(v)) if v == incompatible));
+    }
+    // Stored client outbox entries written under v1 remain decodable locally while 0/future versions fail.
+    for stored in [1u16, PROTOCOL_VERSION] {
+        value["protocol_version"] = json!(stored);
+        let decoded = RpcRequest::decode_stored(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.protocol_version, stored);
+    }
+    for bad_stored in [0u16, PROTOCOL_VERSION + 1, u16::MAX] {
+        value["protocol_version"] = json!(bad_stored);
+        assert!(matches!(RpcRequest::decode_stored(&serde_json::to_vec(&value).unwrap()), Err(Error::Version(v)) if v == bad_stored));
     }
     value["protocol_version"] = json!(PROTOCOL_VERSION);
     value["actor"] = json!("33333333333333333333333333333333");

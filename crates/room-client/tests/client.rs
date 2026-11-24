@@ -748,3 +748,116 @@ fn worker_recovers_stale_paused_and_rejected_leave_requests_and_joins_another_ro
     let _ = std::net::TcpStream::connect(endpoint.strip_prefix("http://").unwrap());
     server.join().unwrap();
 }
+
+#[test]
+fn legacy_v1_retained_and_pending_outbox_rows_open_upgrade_and_preserve_audit() {
+    use photocraft_party::{
+        RequestId,
+        protocol::{PROTOCOL_VERSION, RpcRequest},
+    };
+    use photocraft_room_client::{ClientEvent, ClientOptions, Worker};
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rooms.sqlite3");
+    let vault = MemoryCredentials::default();
+    let mut store = paired(&path, vault.clone());
+    let profile = store.status().profile.unwrap();
+    let room_id = RoomId::new("a9f543c2bc7ce7bc22ec44552f1dc7e7").unwrap();
+    let room = Room::new(room_id, profile.clone(), Mode::ExquisiteCorpse, None).unwrap();
+    store.update_poll(room.view(profile.id).unwrap()).unwrap();
+    drop(store);
+
+    // Inject a retained v1 rejected audit row (matching pre-QOL-007 k65-hosted profiles)
+    // and an unsent pending v1 Leave row.
+    let retained_v1 = RpcRequest {
+        protocol_version: 1,
+        request_id: RequestId::new("4bda8028a8aaa9b5a1a82a34bf60734c").unwrap(),
+        operation: Operation::Apply { room: room_id, expected_revision: 3, action: Box::new(Action::Leave) },
+    };
+    let retained_body = serde_json::to_vec(&retained_v1).unwrap();
+    let retained_digest = format!("{:x}", Sha256::digest(&retained_body));
+    let pending_v1 = RpcRequest {
+        protocol_version: 1,
+        request_id: RequestId::new("5cdb9139b9bbb0c6b2b93b450171845d").unwrap(),
+        operation: Operation::Apply { room: room_id, expected_revision: 1, action: Box::new(Action::Leave) },
+    };
+    let pending_body = serde_json::to_vec(&pending_v1).unwrap();
+    let pending_digest = format!("{:x}", Sha256::digest(&pending_body));
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO outbox(seq,request_id,body,digest,secret_key,rejected,retained) VALUES(6,?1,?2,?3,NULL,?4,1)",
+            rusqlite::params![retained_v1.request_id.as_str(), &retained_body, &retained_digest, "conflict: retained local work is unchanged"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO outbox(seq,request_id,body,digest,secret_key,rejected,retained) VALUES(7,?1,?2,?3,NULL,NULL,0)",
+            rusqlite::params![pending_v1.request_id.as_str(), &pending_body, &pending_digest],
+        )
+        .unwrap();
+    }
+
+    // Reopening Outbox succeeds without mutating the historical retained v1 audit row,
+    // and upgrades the pending v1 request to PROTOCOL_VERSION in memory for wire send + ack.
+    let mut reopened = Outbox::open(&path, Box::new(vault.clone())).unwrap();
+    assert_eq!(reopened.status().pending, 1);
+    let next = reopened.next().unwrap().expect("pending legacy v1 request");
+    assert_eq!(next.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(next.request_id, pending_v1.request_id);
+    assert!(next.operation == pending_v1.operation);
+    reopened.acknowledge(&next, &RpcResponse::Disconnected).unwrap();
+    assert_eq!(reopened.status().pending, 0);
+    assert!(reopened.status().room.is_none());
+    drop(reopened);
+
+    // Retained v1 audit bytes and digest remain byte-identical on disk.
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let (stored_body, stored_digest): (Vec<u8>, String) =
+            db.query_row("SELECT body,digest FROM outbox WHERE seq=6 AND retained=1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(stored_body, retained_body);
+        assert_eq!(stored_digest, retained_digest);
+    }
+
+    // Starting the background Worker on the DB with a retained v1 audit row stays alive and publishes status.
+    let worker = Worker::start_with_credentials(path.clone(), ClientOptions::default(), Box::new(vault.clone())).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_status = false;
+    while std::time::Instant::now() < deadline {
+        match worker.poll() {
+            Ok(ClientEvent::Status { status, .. }) => {
+                assert!(status.error.is_none(), "unexpected startup error: {:?}", status.error);
+                saw_status = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("room worker stopped on retained v1 outbox row"),
+        }
+    }
+    assert!(saw_status, "worker should publish healthy startup status");
+    drop(worker);
+
+    // Future or zero protocol versions stored in outbox must still be rejected.
+    for bad_version in [0u16, PROTOCOL_VERSION + 1] {
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad_path = bad_dir.path().join("bad.sqlite3");
+        std::fs::copy(&path, &bad_path).unwrap();
+        let bad_req = RpcRequest {
+            protocol_version: bad_version,
+            request_id: RequestId::new("6dec0240c0ccc1d7c3ca4c561282956e").unwrap(),
+            operation: Operation::Apply { room: room_id, expected_revision: 1, action: Box::new(Action::Leave) },
+        };
+        let bad_body = serde_json::to_vec(&bad_req).unwrap();
+        let bad_digest = format!("{:x}", Sha256::digest(&bad_body));
+        let db = rusqlite::Connection::open(&bad_path).unwrap();
+        db.execute(
+            "INSERT INTO outbox(seq,request_id,body,digest,secret_key,rejected,retained) VALUES(9,?1,?2,?3,NULL,NULL,1)",
+            rusqlite::params![bad_req.request_id.as_str(), &bad_body, &bad_digest],
+        )
+        .unwrap();
+        drop(db);
+        assert!(Outbox::open(&bad_path, Box::new(vault.clone())).is_err(), "bad version {bad_version} must be rejected");
+    }
+}
