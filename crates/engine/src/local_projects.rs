@@ -108,8 +108,13 @@ impl LocalProjects {
     }
 }
 
+pub(crate) enum RoomCanvasPolicy {
+    Fixed(photocraft_doc::Size),
+    CorpseVariableHeight { width: u32, current_height: u32 },
+}
+
 impl Session {
-    pub(crate) fn room_canvas_size(&self) -> Option<photocraft_doc::Size> {
+    pub(crate) fn room_canvas_policy(&self) -> Option<RoomCanvasPolicy> {
         let room = self.rooms.status.room.as_ref()?;
         let assignment = room.assignment.as_ref()?;
         let document = self.active()?;
@@ -117,8 +122,12 @@ impl Session {
             return None;
         }
         Some(match room.mode {
-            photocraft_party::Mode::Animation { .. } => photocraft_doc::Size { width: 1536, height: 1024 },
-            photocraft_party::Mode::ExquisiteCorpse => photocraft_doc::Size { width: 1024, height: 512 },
+            photocraft_party::Mode::Animation { .. } => {
+                RoomCanvasPolicy::Fixed(photocraft_doc::Size { width: photocraft_party::ANIMATION_WIDTH, height: photocraft_party::ANIMATION_HEIGHT })
+            }
+            photocraft_party::Mode::ExquisiteCorpse => {
+                RoomCanvasPolicy::CorpseVariableHeight { width: photocraft_party::CORPSE_WIDTH, current_height: document.doc.size.height }
+            }
         })
     }
     pub fn room_sync_label(&self, document: DocId) -> &'static str {
@@ -198,7 +207,7 @@ impl Session {
         if let Some(reason) = self.room_active_edit_refusal() {
             return Some(reason);
         }
-        if self.room_canvas_size().is_some() && matches!(command, "layer.new.artboard" | "layer.new.artboardFromLayers" | "layer.new.artboardFromGroup") {
+        if self.room_canvas_policy().is_some() && matches!(command, "layer.new.artboard" | "layer.new.artboardFromLayers" | "layer.new.artboardFromGroup") {
             return Some("Artboards are unavailable in a fixed-size party assignment; use layers or groups within this frame or band.".into());
         }
         None

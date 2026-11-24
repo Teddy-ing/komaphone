@@ -46,7 +46,7 @@ async fn https_requires_trust_and_keeps_working_beside_stalled_or_bad_handshakes
         display_name: "HTTPS test".into(),
     };
     let pair = photocraft_party::protocol::RpcRequest {
-        protocol_version: 1,
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
         request_id: photocraft_party::RequestId::new(&"3".repeat(32)).unwrap(),
         operation: photocraft_party::protocol::Operation::Pair { participant: who.clone(), credential: "4".repeat(64) },
     };

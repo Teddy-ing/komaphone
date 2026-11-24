@@ -77,17 +77,33 @@ impl RoomMedia {
             return Err(EngineError::Other("Invalid party image size".into()));
         }
         let mut limits = image::Limits::default();
-        limits.max_image_width = Some(1536);
-        limits.max_image_height = Some(1024);
-        limits.max_alloc = Some(16 * 1024 * 1024);
+        limits.max_image_width = Some(photocraft_party::ANIMATION_WIDTH);
+        limits.max_image_height = Some(photocraft_party::CORPSE_MAX_BAND_HEIGHT);
+        limits.max_alloc = Some(32 * 1024 * 1024);
         let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes.as_slice()), image::ImageFormat::Png);
         reader.limits(limits);
         let decoder = reader.into_decoder().map_err(|e| EngineError::Other(e.to_string()))?;
         let (width, height) = decoder.dimensions();
         let expected = match view.mode {
-            photocraft_party::Mode::Animation { .. } => (1536, 1024),
+            photocraft_party::Mode::Animation { .. } => (photocraft_party::ANIMATION_WIDTH, photocraft_party::ANIMATION_HEIGHT),
             photocraft_party::Mode::ExquisiteCorpse => {
-                if matches!(view.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer) { (1024, 24) } else { (1024, 512) }
+                if matches!(view.phase, photocraft_party::room::Phase::Drawing | photocraft_party::room::Phase::Transfer) {
+                    (photocraft_party::CORPSE_WIDTH, photocraft_party::CORPSE_SEAM_HEIGHT)
+                } else {
+                    let mut matched = None;
+                    for entry in &view.reveal {
+                        if let photocraft_party::room::RevealedEntry::Artwork { image, .. } = entry
+                            && image.hash == asset.hash
+                        {
+                            let ext = entry.resolved_extent(view.mode).map_err(|e| EngineError::Other(e.to_string()))?;
+                            if matched.is_some_and(|prev| prev != (ext.width, ext.height)) {
+                                return Err(EngineError::Other("Conflicting dimensions for revealed party image".into()));
+                            }
+                            matched = Some((ext.width, ext.height));
+                        }
+                    }
+                    matched.ok_or_else(|| EngineError::Other("Party image is not referenced by the revealed game".into()))?
+                }
             }
         };
         if (width, height) != expected || decoder.total_bytes() > 8 * 1024 * 1024 {

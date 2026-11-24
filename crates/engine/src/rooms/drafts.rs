@@ -482,11 +482,11 @@ pub(crate) fn prepare(store: &Store, request: &PrepareRequest) -> std::result::R
         })?;
     }
 
-    let (width, height) = dimensions(request.mode);
     let (baseline_doc, baseline_bytes, baseline_summary) = store.load_revision_bytes(request.project, 1).map_err(|e| e.to_string())?;
-    if (baseline_doc.size.width, baseline_doc.size.height) != (width, height) {
-        return Err("A retained replay step has different canvas dimensions; preserve this local draft for recovery".into());
-    }
+    request
+        .mode
+        .validate_extent(photocraft_party::ImageExtent { width: baseline_doc.size.width, height: baseline_doc.size.height })
+        .map_err(|_| "A retained replay step has unsupported canvas dimensions; preserve this local draft for recovery".to_string())?;
     let baseline = checkpoint_ref_from_verified_bytes(baseline_summary.checkpoint, &baseline_bytes)?;
 
     let (final_doc, final_summary, final_checkpoint, final_bytes) = if request.revision == 1 {
@@ -494,20 +494,23 @@ pub(crate) fn prepare(store: &Store, request: &PrepareRequest) -> std::result::R
         (baseline_doc, None, baseline, bytes)
     } else {
         let (doc, bytes, summary) = store.load_revision_bytes(request.project, request.revision).map_err(|e| e.to_string())?;
-        if (doc.size.width, doc.size.height) != (width, height) {
-            return Err("The assigned drawing's dimensions changed; preserve this draft and restore its required canvas size".into());
-        }
+        request.mode.validate_extent(photocraft_party::ImageExtent { width: doc.size.width, height: doc.size.height }).map_err(|_| {
+            "The assigned drawing's dimensions changed outside the supported assignment bounds; preserve this draft and restore a valid canvas size".to_string()
+        })?;
         let checkpoint_ref = checkpoint_ref_from_verified_bytes(summary.checkpoint, &bytes)?;
         (doc, Some(summary), checkpoint_ref, bytes)
     };
+    let (width, height) = (final_doc.size.width, final_doc.size.height);
 
     let mut composite = photocraft_compose::flatten(&final_doc);
     photocraft_party::canonical_color::to_srgb(&final_doc, &mut composite.px).map_err(|e| e.to_string())?;
     let rendered = composite.to_rgba8();
     let image_bytes = png(width, height, &rendered.pixels)?;
     let seam_bytes = if request.mode == Mode::ExquisiteCorpse {
-        let offset = usize::try_from(u64::from(height - 24) * u64::from(width) * 4).map_err(|_| "Seam bounds")?;
-        Some(png(width, 24, rendered.pixels.get(offset..).ok_or("Seam bounds")?)?)
+        let seam_rows = photocraft_party::CORPSE_SEAM_HEIGHT;
+        let top = height.checked_sub(seam_rows).ok_or("Seam bounds")?;
+        let offset = usize::try_from(u64::from(top) * u64::from(width) * 4).map_err(|_| "Seam bounds")?;
+        Some(png(width, seam_rows, rendered.pixels.get(offset..).ok_or("Seam bounds")?)?)
     } else {
         None
     };
@@ -554,7 +557,7 @@ pub(crate) fn prepare(store: &Store, request: &PrepareRequest) -> std::result::R
             (*cached_ref, cached_bytes.clone(), *cached_json)
         } else {
             let (doc, _) = store.load_revision(request.project, summary.revision).map_err(|e| e.to_string())?;
-            if (doc.size.width, doc.size.height) != (width, height) {
+            if request.mode.validate_extent(photocraft_party::ImageExtent { width: doc.size.width, height: doc.size.height }).is_err() {
                 // Skip intermediate steps with transient non-matching dimensions once the final canvas size is restored.
                 continue;
             }
@@ -637,6 +640,7 @@ pub(crate) fn prepare(store: &Store, request: &PrepareRequest) -> std::result::R
         assets: objects.iter().map(|(hash, bytes)| AssetRef { hash: *hash, bytes: bytes.len() as u64 }).collect(),
         note: request.note.clone(),
         seam,
+        extent: Some(photocraft_party::ImageExtent { width, height }),
     };
     submission.validate().map_err(|e| e.to_string())?;
     artifact.validate(&submission).map_err(|e| e.to_string())?;

@@ -250,6 +250,13 @@ pub(super) fn with_world_hash(app: &PhotocraftApp, ctx: &egui::Context, world_ha
         "corpse.reveal.head",
         "corpse.reveal.torso",
         "corpse.reveal.full",
+        "corpse.height.handle",
+        "corpse.height.input",
+        "corpse.height.apply",
+        "corpse.height.reset",
+        "corpse.height.confirmCrop",
+        "corpse.height.fitArtwork",
+        "corpse.height.cancelCrop",
     ]
     .into_iter()
     .filter_map(|id| crate::komaphone_workspace::control_rect(ctx, id).map(|rect| (id.to_owned(), json!([rect.min.x, rect.min.y, rect.max.x, rect.max.y]))))

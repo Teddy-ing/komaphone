@@ -26,7 +26,7 @@ Success means friends can install it, complete both party modes with a mouse, cl
 | Timing | Untimed rounds by default, Ready/Submit to advance; optional host-set timer and pause. Service enforces phase transitions. |
 | Visual design | Calm, compact, readable UI using existing theme tokens; canvas gets most of the space. No childish decoration or mandatory avatars. |
 | Delivery order | Reliable drawing, private rooms, both party modes, replay/gallery/export, then shared deep zoom. |
-| Canvas defaults | Party drawing 1536 x 1024; corpse 1024 x 1536 with three 512 px bands. sRGB 8-bit defaults only; retain depth/color-general engine APIs. |
+| Canvas defaults | Party drawing 1536 x 1024; corpse width fixed at 1024 px with three 512 px default bands, each independently resizable per player during drawing (`128–2048 px`, assembled total `<= 6144 px`). sRGB 8-bit defaults only; retain depth/color-general engine APIs. |
 | Service operation | GCP selected; aim for total recurring USD $20/month or less, approximately $30 acceptable. Include storage/backups/network/address costs before credits; credits do not justify an expensive steady state. K6 prepares identity/deployment foundations; K6.5 delivers hosted access; K7 hardens it. This planning update does not provision resources. See the [hosting plan](hosting-plan.md) for implementation, spending, and deployment boundaries. |
 
 ## Drawing workspace
@@ -69,13 +69,13 @@ That brush-size rule applies to finite party drawings. In the shared canvas, def
 
 ## Exquisite Corpse
 
-**C1 Parts.** Each player starts one creature. Three rounds produce head, torso/arms, and legs/feet on equally wide, vertically stacked bands. Use the same rotation formula as Animation, for exactly three rounds.
+**C1 Parts.** Each player starts one creature. Three rounds produce head, torso/arms, and legs/feet on equally wide (`1024 px`), vertically stacked bands. Each band defaults to `512 px` tall, and each player may independently shorten or lengthen their own active segment (`128–2048 px`, assembled total `<= 6144 px`) while drawing, keeping the top/reference seam anchored and artwork unscaled. Use the same rotation formula as Animation, for exactly three rounds.
 
 **C2 Small groups.** Three players produce creatures with three authors each. With two players, the head author also draws that creature's legs; this is intentional and explained in the lobby. Both configurations must be tested. This keeps the mode usable with one friend.
 
-**C3 Joining strip.** The head/body editor draws to the bottom edge of their segment. The next editor sees only its last 24 px as a locked reference strip above their own blank segment. The reference does not consume or duplicate output pixels. The strip provides alignment at the neck/waist while hiding the rest. No full prior segment is delivered before reveal.
+**C3 Joining strip.** The head/body editor draws to the bottom edge of their segment. On submission, dimensions and pixels commit together immutably, and the next editor sees only the last 24 px of that actual submitted height as a locked reference strip above their own blank segment. The reference does not consume or duplicate output pixels. The strip provides alignment at the neck/waist while hiding the rest. No full prior segment is delivered before reveal.
 
-**C4 Reveal/export.** Assemble each creature in the correct order at full resolution, without gaps, duplicated seam rows, or an added reference overlay. Allow part-by-part reveal, full view, per-part drawing replay, PNG export, and an editable archive. Preserve author credits separately from artwork.
+**C4 Reveal/export.** Assemble each creature in the correct order at full resolution by summing each accepted segment's height (`1024 × sum_heights`), without stretching, gaps, duplicated seam rows, or an added reference overlay. Allow part-by-part reveal, full view, per-part drawing replay, PNG export, remix, and an editable archive. Preserve author credits separately from artwork and keep legacy fixed-height (`1024 × 512`) games compatible.
 
 ## Saving replay and gallery
 
@@ -145,3 +145,4 @@ Classic prompt/draw/guess, public sharing, social feeds, competitive scoring, vo
 | 2026-11-14 | 1.4 network clarification | Owner explicitly accepted the tested home-broadband plus cellular-hotspot arrangement (phone Wi-Fi off) for K6.5 independent-network acceptance. Fresh friend onboarding from another household remains required in K7. H1's intended experience and all gameplay, authorization, recovery and budget requirements remain unchanged. |
 | 2026-11-22 | 1.4 gallery overhaul (`QOL-016`) | Owner approved restructuring `G1 Gallery` into four sections (`Saved`, `Completed`, `Temp`, `Trash`), removing the redundant in-gallery `Draw` button and `Favorites` filter, adding explicit `Save to gallery` / `Edit in Workroom` / reversible `Clear temp` / two-step permanent Trash deletion (`Delete permanently` and `Empty trash`), fixing upstream `config/Recovery/` cloning and untouched-blank/saved-game-round draft spam, and keeping Shared Canvases and Local Continuous Canvases completely out of Gallery for now. |
 | 2026-11-22 | 1.4 managed Exports (`QOL-010`) | Gallery exports now publish automatically using a validated basename only into the dedicated per-user Komaphone `Exports` folder (non-destructive collision numbering, format-selected extension, inline validation, cooperative cancel, and native `Show in folder` / `Open folder` reveal; no OS folder-picker dialogs). |
+| 2026-11-23 | 1.4 variable corpse height (`QOL-007`) | Updated `C1`/`C3`/`C4` and Canvas defaults for per-player Exquisite Corpse segment height resizing during drawing (`1024 px` fixed width, `512 px` default, `128–2048 px` per segment, `<= 6144 px` total, top seam anchored, unscaled artwork, non-destructive shrink clamp + explicit undoable crop, bottom 24 px seam derived from actual submitted height, variable-height reveal/export/remix, and additive `extent` compatibility preserving legacy fixed-height games). |

@@ -243,6 +243,16 @@ impl Session {
         self.prefs().history_options.make_layer_visibility_changes_undoable
     }
 
+    /// Scoped edit entry for `komaphone.corpse.setSegmentHeight`. Restores the resize guard
+    /// unconditionally even if the inner edit returns an error.
+    pub(crate) fn edit_corpse_segment_height<R>(&mut self, label: &str, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
+        let previous = self.corpse_height_resize_active;
+        self.corpse_height_resize_active = true;
+        let result = self.edit_with(label, true, f);
+        self.corpse_height_resize_active = previous;
+        result
+    }
+
     /// [`Self::edit`], recording a history state only when `record` is set. An unrecorded change
     /// still marks the document modified and leaves the redo states alone.
     pub(crate) fn edit_with<R>(&mut self, label: &str, record: bool, f: impl FnOnce(&mut Document, &mut Option<LayerId>) -> Result<R>) -> Result<R> {
@@ -250,7 +260,8 @@ impl Session {
             return Err(EngineError::Other(reason));
         }
         self.check_local_replay_capacity()?;
-        let assigned_size = self.room_canvas_size();
+        let canvas_policy = self.room_canvas_policy();
+        let corpse_height_resize_active = self.corpse_height_resize_active;
         if record {
             crate::actions_cmds::before_action_edit(self);
         }
@@ -277,8 +288,29 @@ impl Session {
         let mut doc = (*before).clone();
         let mut active = st.active_layer;
         let r = f(&mut doc, &mut active)?;
-        if assigned_size.is_some_and(|size| doc.size != size) {
-            return Err(EngineError::Other("This party assignment has a fixed canvas size. Transform layers within the assigned frame or band.".into()));
+        match canvas_policy {
+            Some(crate::local_projects::RoomCanvasPolicy::Fixed(size)) if doc.size != size => {
+                return Err(EngineError::Other("This party assignment has a fixed canvas size. Transform layers within the assigned frame or band.".into()));
+            }
+            Some(crate::local_projects::RoomCanvasPolicy::CorpseVariableHeight { width, current_height }) => {
+                if corpse_height_resize_active {
+                    if doc.size.width != width
+                        || !(photocraft_party::CORPSE_MIN_BAND_HEIGHT..=photocraft_party::CORPSE_MAX_BAND_HEIGHT).contains(&doc.size.height)
+                    {
+                        return Err(EngineError::Other(format!(
+                            "Exquisite Corpse segments stay {width} px wide with height between {} and {} px.",
+                            photocraft_party::CORPSE_MIN_BAND_HEIGHT,
+                            photocraft_party::CORPSE_MAX_BAND_HEIGHT
+                        )));
+                    }
+                } else if doc.size.width != width || doc.size.height != current_height {
+                    return Err(EngineError::Other(
+                        "This Exquisite Corpse assignment keeps width fixed at 1024 px; use the segment height control or bottom-edge drag handle to change its height."
+                            .into(),
+                    ));
+                }
+            }
+            _ => {}
         }
         if let Some(restrict) = restrict {
             channel_cmds::restrict_to_color(&before, &mut doc, restrict.layer, restrict.colors)?;

@@ -1376,6 +1376,8 @@ fn draw_canvas_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &C
         // it is stale, so no tool cursor or brush outline is painted at it.
     } else if let Some((vertical, _)) = guide_hover {
         ui.ctx().set_cursor_icon(crate::rulers::guide_cursor(xf, vertical));
+    } else if let Some(icon) = crate::komaphone_game_view::corpse_height_cursor(app, xf, response.hover_pos()) {
+        ui.ctx().set_cursor_icon(icon);
     } else if let Some((p, mods, c)) = response.hover_pos().and_then(|p| {
         let mods = crate::workspace_ui::sticky_mods(app, ui.input(|i| i.modifiers));
         let c = crate::transform_tool::cursor(app, xf, xf.to_doc(p), mods)?;
@@ -1761,7 +1763,12 @@ fn sync_view_to_document(app: &PhotocraftApp, ctx: &egui::Context, view: &mut Vi
     let size = [doc.size.width, doc.size.height];
     if view.doc_size != size {
         // Like Photoshop: keep the zoom level, re-centre the resized document.
-        if view.doc_size != [0, 0] {
+        // Exception: an active Exquisite Corpse segment resizes only its bottom edge so the
+        // top/reference seam remains visually anchored at its current screen position.
+        let keep_corpse_anchor = view.doc_size[0] == size[0]
+            && size[0] == photocraft_engine::rooms::corpse::WIDTH
+            && crate::komaphone_game_view::is_active_corpse_document(app, doc.id);
+        if view.doc_size != [0, 0] && !keep_corpse_anchor {
             view.center = [size[0] as f32 / 2.0, size[1] as f32 / 2.0];
         }
         view.doc_size = size;
@@ -2015,6 +2022,16 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         ctx.set_cursor_icon(crate::tool_cursor::hand(&ctx, true));
     } else if primary && !stroke_dismissal && temporary.is_none() && !middle && crate::layer_picker::armed(app).is_some() {
         layer_picker_eyedropper(app, ui, &ctx, &response, &xf);
+    } else if primary
+        && !stroke_dismissal
+        && !under_dialog
+        && temporary.is_none()
+        && !middle
+        && app.drag.is_none()
+        && app.ui.transform.is_none()
+        && crate::komaphone_game_view::corpse_height_drag(app, ui, &response, &xf)
+    {
+        // Bottom-edge Exquisite Corpse height resize handle owned this pointer interaction.
     } else if primary && !stroke_dismissal {
         let input = CanvasToolInput {
             ctx: &ctx,
@@ -2055,7 +2072,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     };
     let (beyond, layer_edges, edge_rect, ants) = painted.unwrap_or_else(|| paint_canvas(app, ui, &display_view, xf, &paint_input));
     if primary {
-        crate::komaphone_game_view::overlay(app, &painter, &xf);
+        crate::komaphone_game_view::overlay(app, &painter, &xf, response.hover_pos());
     }
     // A Hand drag (the tool, Space or the middle button) keeps every overlay on screen, as in
     // Photoshop: the Pen path being drawn, paths, guides, grid, transform box (#6592). Only the

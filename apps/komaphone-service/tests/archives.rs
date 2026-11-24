@@ -42,7 +42,7 @@ impl Fixture {
                 .execute(
                     None,
                     &RpcRequest {
-                        protocol_version: 1,
+                        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                         request_id: RequestId::new(&format!("{n:032x}")).unwrap(),
                         operation: Operation::Pair { participant: person(n), credential: token(n) },
                     },
@@ -55,7 +55,7 @@ impl Fixture {
                 .execute(
                     Some(&token(1)),
                     &RpcRequest {
-                        protocol_version: 1,
+                        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                         request_id: RequestId::new(&format!("{:032x}", 10)).unwrap(),
                         operation: Operation::Create { mode: Mode::Animation { rotations: 1 }, timer_ms: None },
                     },
@@ -74,7 +74,11 @@ impl Fixture {
         self.request += 1;
         self.store.execute(
             Some(&token(n)),
-            &RpcRequest { protocol_version: 1, request_id: RequestId::new(&format!("{:032x}", self.request)).unwrap(), operation },
+            &RpcRequest {
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
+                request_id: RequestId::new(&format!("{:032x}", self.request)).unwrap(),
+                operation,
+            },
             0,
         )
     }
@@ -140,6 +144,7 @@ impl Fixture {
             assets: vec![image, checkpoint.asset],
             note: "metadata outside artwork".into(),
             seam: None,
+            extent: None,
         };
         self.action(1, Action::Submit { epoch: current.epoch, submission: submitted.clone() });
         submitted

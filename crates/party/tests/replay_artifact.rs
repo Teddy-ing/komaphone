@@ -52,6 +52,7 @@ fn fixture() -> (ReplayArtifact, Submission) {
         assets: vec![asset(1), asset(2), asset(3), asset(4)],
         note: String::new(),
         seam: None,
+        extent: None,
     };
     (artifact, submission)
 }

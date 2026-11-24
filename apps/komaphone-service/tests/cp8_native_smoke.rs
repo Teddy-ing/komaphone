@@ -663,7 +663,7 @@ fn cp8_native_drawing_animation_deep_pocket_and_checkpoint_smoke() {
             .execute(
                 None,
                 &RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(&hex(8001)).unwrap(),
                     operation: Operation::Pair {
                         participant: Participant {
@@ -734,7 +734,7 @@ fn cp8_native_drawing_animation_deep_pocket_and_checkpoint_smoke() {
         .post(&rpc_url)
         .bearer_auth(&peer_token)
         .json(&RpcRequest {
-            protocol_version: 1,
+            protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
             request_id: RequestId::new(&hex(8002)).unwrap(),
             operation: Operation::Create { mode: Mode::ExquisiteCorpse, timer_ms: None },
         })
@@ -976,7 +976,7 @@ fn cp8_native_drawing_animation_deep_pocket_and_checkpoint_smoke() {
                 .post(&url_room)
                 .bearer_auth(&tok_room)
                 .json(&RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(&hex(72_000_000 + u128::from(i))).unwrap(),
                     operation: Operation::Poll { room: room_id, after_revision: 0 },
                 })

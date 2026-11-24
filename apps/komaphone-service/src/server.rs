@@ -290,7 +290,12 @@ async fn serve<L: axum::serve::Listener<Addr = SocketAddr>>(
         .route("/v1/canvas", post(world_rpc))
         .route("/v1/auth", post(auth_rpc))
         .route("/v1/auth/config", get(auth_config))
-        .route("/health", get(move || async move { Json(serde_json::json!({"protocol_version":1,"service":"Komaphone","hosted":hosted})) }))
+        .route(
+            "/health",
+            get(move || async move {
+                Json(serde_json::json!({"protocol_version":photocraft_party::protocol::PROTOCOL_VERSION,"service":"Komaphone","hosted":hosted}))
+            }),
+        )
         .with_state(shared);
     let result = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
     // Router has been dropped by serve; wake checkpoint worker, stop authority worker first

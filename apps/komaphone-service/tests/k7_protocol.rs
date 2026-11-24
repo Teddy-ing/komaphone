@@ -22,7 +22,7 @@ async fn canvas_version_mismatch_is_upgrade_required_and_preserves_existing_canv
     let paired = client
         .post(format!("{base}/v1/rpc"))
         .json(&RpcRequest {
-            protocol_version: 1,
+            protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
             request_id: RequestId::new(&format!("{:032x}", 3)).unwrap(),
             operation: Operation::Pair { participant, credential: token.clone() },
         })
@@ -92,5 +92,77 @@ async fn malformed_canvas_requests_remain_invalid_without_reflecting_payloads() 
         assert_eq!(fault.code, "invalid");
         assert!(!fault.message.contains("PRIVATE_INVALID_PAYLOAD"));
     }
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn party_rpc_v1_client_gets_upgrade_required_and_preserves_room() {
+    use photocraft_party::{Mode, protocol::PROTOCOL_VERSION};
+    let directory = tempfile::tempdir().unwrap();
+    let service = server::spawn("127.0.0.1:0".parse().unwrap(), directory.path().join("service.sqlite3"), StoreOptions::default()).await.unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", service.address);
+    let token = "a".repeat(64);
+    let participant = Participant {
+        id: ParticipantId::new(&format!("{:032x}", 10)).unwrap(),
+        device: DeviceId::new(&format!("{:032x}", 11)).unwrap(),
+        display_name: "Protocol v2 fixture".into(),
+    };
+    let health: serde_json::Value = client.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["protocol_version"], PROTOCOL_VERSION);
+    let paired = client
+        .post(format!("{base}/v1/rpc"))
+        .json(&RpcRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::new(&format!("{:032x}", 12)).unwrap(),
+            operation: Operation::Pair { participant, credential: token.clone() },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paired.status(), StatusCode::OK);
+    let created = client
+        .post(format!("{base}/v1/rpc"))
+        .bearer_auth(&token)
+        .json(&RpcRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::new(&format!("{:032x}", 13)).unwrap(),
+            operation: Operation::Create { mode: Mode::ExquisiteCorpse, timer_ms: None },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let before: serde_json::Value = created.json().await.unwrap();
+    let room_id: photocraft_party::RoomId = serde_json::from_value(before["view"]["id"].clone()).unwrap();
+    for bad_version in [0u16, 1, PROTOCOL_VERSION + 1] {
+        let failed = client
+            .post(format!("{base}/v1/rpc"))
+            .bearer_auth(&token)
+            .json(&RpcRequest {
+                protocol_version: bad_version,
+                request_id: RequestId::new(&format!("{:032x}", 20 + u32::from(bad_version))).unwrap(),
+                operation: Operation::Poll { room: room_id, after_revision: 0 },
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::UPGRADE_REQUIRED);
+        let fault: Fault = failed.json().await.unwrap();
+        assert_eq!(fault.code, "version");
+    }
+    let after = client
+        .post(format!("{base}/v1/rpc"))
+        .bearer_auth(&token)
+        .json(&RpcRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::new(&format!("{:032x}", 99)).unwrap(),
+            operation: Operation::Poll { room: room_id, after_revision: 0 },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    assert_eq!(after.json::<serde_json::Value>().await.unwrap()["view"], before["view"]);
     service.shutdown().await.unwrap();
 }

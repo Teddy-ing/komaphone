@@ -96,6 +96,7 @@ pub fn game(mode: Mode) -> GalleryBundle {
                 checkpoint,
                 replay: Box::new(replay),
                 assets: vec![checkpoint.asset, image, manifest],
+                extent: None,
             });
         }
     }

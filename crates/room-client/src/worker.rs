@@ -816,6 +816,7 @@ fn submit(store: &mut Outbox, submission: Submission, assets: Vec<Vec<u8>>, loca
     let (room, expected_revision) = room_and_revision(store)?;
     let status = store.status();
     let view = status.room.ok_or_else(|| Error::Invalid("Room is unavailable".into()))?;
+    submission.resolved_extent(view.mode).map_err(|e| Error::Invalid(e.to_string()))?;
     let assignment = view.assignment.as_ref().ok_or_else(|| Error::Invalid("No assignment is available".into()))?;
     if status.profile.as_ref().map(|p| p.id) != Some(submission.author)
         || assignment.assignment.id != submission.assignment
@@ -1071,6 +1072,7 @@ mod tests {
             assets: vec![image, checkpoint.asset],
             note: String::new(),
             seam: None,
+            extent: None,
         };
         for freeze in [true, false] {
             assert!(submit(&mut store, submission.clone(), vec![b"future artifact".to_vec()], submission.revision, freeze).is_err());
@@ -1128,6 +1130,7 @@ mod tests {
             assets: vec![image, checkpoint.asset, manifest],
             note: String::new(),
             seam: None,
+            extent: None,
         };
         for bad_local in [0, 35, 119, 121] {
             assert!(submit(&mut store, keyframed.clone(), Vec::new(), bad_local, true).is_err(), "accepted bad local_revision {bad_local}");

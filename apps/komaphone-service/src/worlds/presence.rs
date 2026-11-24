@@ -288,7 +288,7 @@ mod tests {
             .execute(
                 None,
                 &RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(profile.as_str()).unwrap(),
                     operation: Operation::Pair {
                         participant: Participant {

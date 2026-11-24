@@ -60,6 +60,7 @@ fn submission(authority: &mut MemoryAuthority, actor: u64) -> Submission {
         assets: vec![checkpoint_asset, image, seam],
         note: "Not pixels".into(),
         seam: Some(seam),
+        extent: None,
     }
 }
 fn submit_action(authority: &MemoryAuthority, submission: Submission) -> Action {

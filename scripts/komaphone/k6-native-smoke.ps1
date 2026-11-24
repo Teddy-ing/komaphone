@@ -256,8 +256,11 @@ function Http-K6([string]$path,$body,[string]$token='',[int]$expected=200){
 }
 function World-K6($actor,$action,[int]$expected=200){Http-K6 '/v1/canvas' @{version=$WorldProtocolVersion;action=$action} $actor.token $expected}
 function Headless-K6([int]$number){
+    $base=if($script:k6HttpEndpoint){$script:k6HttpEndpoint}else{"http://127.0.0.1:$script:k6Port"}
+    $health=(Invoke-WebRequest -Uri ($base+'/health') -TimeoutSec 10).Content|ConvertFrom-Json
+    $rpcVersion=if($health.protocol_version){[int]$health.protocol_version}else{1}
     $actor=@{profile=(Id-K6);device=(Id-K6);token=((Id-K6)+(Id-K6))}
-    Http-K6 '/v1/rpc' @{protocol_version=1;request_id=(Id-K6);operation=@{kind='pair';participant=@{id=$actor.profile;device=$actor.device;display_name="K6 synthetic member $number"};credential=$actor.token}}|Out-Null
+    Http-K6 '/v1/rpc' @{protocol_version=$rpcVersion;request_id=(Id-K6);operation=@{kind='pair';participant=@{id=$actor.profile;device=$actor.device;display_name="K6 synthetic member $number"};credential=$actor.token}}|Out-Null
     $actor
 }
 function Export-K6([string]$format,[string]$name,$extra=@{}){

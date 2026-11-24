@@ -135,6 +135,7 @@ fn make_game_manifest(seed: u64, title: &str, mode: Mode) -> GalleryManifest {
                     duration_ms: 0,
                 }),
                 assets: vec![asset_ref(seed * 100 + 1), asset_ref(seed * 100 + 2)],
+                extent: None,
             });
         }
     }

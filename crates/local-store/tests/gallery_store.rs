@@ -137,6 +137,7 @@ fn game_with_artwork(native: GalleryBundle) -> GalleryBundle {
             duration_ms: 0,
         }),
         assets: vec![image, checkpoint.asset],
+        extent: None,
     };
     game.validate().unwrap();
     game

@@ -143,6 +143,7 @@ fn insert_game_to_gallery(data_dir: &Path, seed: u64, title: &str, mode: Mode) -
                     duration_ms: 0,
                 }),
                 assets: vec![preview, checkpoint.asset],
+                extent: None,
             });
             idx += 1;
         }

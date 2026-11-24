@@ -83,7 +83,7 @@ async fn real_http_hosted_login_admission_party_session_and_revocation() {
     let device = DeviceId::new("00000000000000000000000000000001").unwrap();
     let proof = "4".repeat(64);
     let pair = RpcRequest {
-        protocol_version: 1,
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
         request_id: transaction(),
         operation: Operation::Pair {
             participant: Participant { id: ParticipantId::new(device.as_str()).unwrap(), device, display_name: "Uninvited".into() },
@@ -107,8 +107,11 @@ async fn real_http_hosted_login_admission_party_session_and_revocation() {
     let session_token = session["token"].as_str().unwrap();
     assert_eq!(session["device_credential"], proof);
     assert_eq!(client.post(format!("{endpoint}/v1/auth")).json(&finish).send().await.unwrap().status(), reqwest::StatusCode::FORBIDDEN);
-    let create =
-        RpcRequest { protocol_version: 1, request_id: transaction(), operation: Operation::Create { mode: Mode::Animation { rotations: 1 }, timer_ms: None } };
+    let create = RpcRequest {
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
+        request_id: transaction(),
+        operation: Operation::Create { mode: Mode::Animation { rotations: 1 }, timer_ms: None },
+    };
     let created = client.post(format!("{endpoint}/v1/rpc")).bearer_auth(session_token).json(&create).send().await.unwrap();
     assert_eq!(created.status(), reqwest::StatusCode::OK);
     let denied = client.post(format!("{endpoint}/v1/rpc")).bearer_auth(&proof).json(&create).send().await.unwrap();

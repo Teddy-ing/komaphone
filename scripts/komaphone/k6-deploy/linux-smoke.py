@@ -109,7 +109,7 @@ def main():
                 with urllib.request.urlopen(url, context=context, timeout=1) as response:
                     value = json.load(response)
                     if value.get("service") == "Komaphone":
-                        return
+                        return int(value.get("protocol_version", 1))
             except (OSError, urllib.error.URLError):
                 time.sleep(0.05)
         raise AssertionError("health deadline")
@@ -137,7 +137,7 @@ def main():
             time.sleep(0.05)
         context = ssl.create_default_context(cafile=str(ca))
         base = f"https://localhost:{proxy_port}"
-        wait_health(base + "/health", context, proxy)
+        rpc_version = wait_health(base + "/health", context, proxy)
         try:
             urllib.request.urlopen(base + "/health", timeout=3)
             raise AssertionError("untrusted local CA unexpectedly accepted")
@@ -168,7 +168,7 @@ def main():
             return json.loads(payload)
 
         def room(action, token=None, expected=200):
-            return post("/v1/rpc", {"protocol_version": 1, "request_id": fresh(), "operation": action}, token, expected)
+            return post("/v1/rpc", {"protocol_version": rpc_version, "request_id": fresh(), "operation": action}, token, expected)
 
         def world(action, token, expected=200):
             return post("/v1/canvas", {"version": args.world_version, "action": action}, token, expected)

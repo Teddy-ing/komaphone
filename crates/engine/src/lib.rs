@@ -260,6 +260,9 @@ pub struct Session {
     /// Smart object whose filter mask the running command edits (`"target":"filterMask"`): each
     /// edit re-renders it, in the same history step.
     filter_mask_layer: Option<LayerId>,
+    /// Scoped opt-in set only by `komaphone.corpse.setSegmentHeight` so generic canvas/image
+    /// resize commands remain blocked during active Exquisite Corpse assignments.
+    corpse_height_resize_active: bool,
     /// Edit › Preferences, keyboard shortcuts, menu and toolbar customisation (see `prefs`).
     pub prefs: prefs::PrefsStore,
     /// Release checks use an injected platform transport; no network I/O in the engine.

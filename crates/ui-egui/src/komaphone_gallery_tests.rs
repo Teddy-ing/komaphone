@@ -317,6 +317,7 @@ fn noted_game() -> GalleryManifest {
                     duration_ms: 0,
                 }),
                 assets: vec![asset(1), asset(2)],
+                extent: None,
             });
         }
     }
@@ -422,6 +423,7 @@ fn corpse_game_manifest(entry_num: u64, players: u8) -> GalleryManifest {
                     duration_ms: 0,
                 }),
                 assets: vec![asset(1), asset(2)],
+                extent: None,
             });
         }
     }

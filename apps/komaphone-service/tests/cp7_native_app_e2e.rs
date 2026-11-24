@@ -444,7 +444,7 @@ fn run_cp7_native_app_and_service_end_to_end_verification() {
             .execute(
                 None,
                 &RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(&hex(7001)).unwrap(),
                     operation: Operation::Pair {
                         participant: Participant {
@@ -519,7 +519,7 @@ fn run_cp7_native_app_and_service_end_to_end_verification() {
         .post(&rpc_url)
         .bearer_auth(&helper_token)
         .json(&RpcRequest {
-            protocol_version: 1,
+            protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
             request_id: RequestId::new(&hex(7002)).unwrap(),
             operation: Operation::Create { mode: Mode::ExquisiteCorpse, timer_ms: None },
         })
@@ -747,7 +747,7 @@ fn run_cp7_native_app_and_service_end_to_end_verification() {
                 .post(&url_room)
                 .bearer_auth(&tok_room)
                 .json(&RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(&hex(45_000_000 + u128::from(i))).unwrap(),
                     operation: Operation::Poll { room: room_id, after_revision: 0 },
                 })

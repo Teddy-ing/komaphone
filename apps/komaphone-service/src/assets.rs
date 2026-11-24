@@ -6,7 +6,9 @@ use crate::{
 use image::ImageEncoder;
 use photocraft_party::protocol::{CHUNK_BYTES, RpcResponse};
 use photocraft_party::room::Room;
-use photocraft_party::{AssetHash, AssetRef, Error as DomainError, MAX_ASSET_BYTES, MAX_PROJECT_BYTES, Mode, ParticipantId, RoomId, Submission};
+use photocraft_party::{
+    AssetHash, AssetRef, CORPSE_SEAM_HEIGHT, Error as DomainError, ImageExtent, MAX_ASSET_BYTES, MAX_PROJECT_BYTES, Mode, ParticipantId, RoomId, Submission,
+};
 use rusqlite::{OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -202,21 +204,17 @@ pub(crate) fn validate_submission(tx: &Transaction<'_>, room: &Room, submission:
     let checkpoint = load(tx, room.id(), submission.checkpoint.asset)?;
     let doc = decode_checkpoint(&checkpoint)?;
     let mode = room.view(submission.author)?.mode;
-    let (width, height) = match mode {
-        Mode::Animation { .. } => (1536, 1024),
-        Mode::ExquisiteCorpse => (1024, 512),
-    };
+    let expected = submission.resolved_extent(mode)?;
+    let (width, height) = (expected.width, expected.height);
     if doc.size.width != width || doc.size.height != height {
         return Err(DomainError::Invalid("party checkpoint dimensions").into());
     }
     if submission.replay.baseline.asset != submission.checkpoint.asset {
         let baseline = load(tx, room.id(), submission.replay.baseline.asset)?;
         let baseline = decode_checkpoint(&baseline)?;
-        if baseline.size.width != width || baseline.size.height != height {
-            return Err(DomainError::Invalid("replay baseline dimensions").into());
-        }
+        mode.validate_extent(ImageExtent { width: baseline.size.width, height: baseline.size.height })?;
     }
-    validate_replay(tx, room, submission, (width, height))?;
+    validate_replay(tx, room, submission, mode)?;
     let mut rendered = photocraft_compose::flatten(&doc);
     photocraft_party::canonical_color::to_srgb(&doc, &mut rendered.px)
         .map_err(|_| DomainError::Invalid("checkpoint color profile; preserve the local original"))?;
@@ -229,15 +227,16 @@ pub(crate) fn validate_submission(tx: &Transaction<'_>, room: &Room, submission:
     }
     if let Some(seam) = submission.seam {
         let seam_bytes = load(tx, room.id(), seam)?;
-        let start = usize::try_from(u64::from(height.saturating_sub(24)) * u64::from(width) * 4).map_err(|_| Error::Invalid("seam offset"))?;
+        let top_rows = height.checked_sub(CORPSE_SEAM_HEIGHT).ok_or(Error::Invalid("seam offset"))?;
+        let start = usize::try_from(u64::from(top_rows) * u64::from(width) * 4).map_err(|_| Error::Invalid("seam offset"))?;
         let expected = rendered.pixels.get(start..).ok_or(Error::Invalid("seam bounds"))?;
-        if encode_png(width, 24, expected)? != seam_bytes {
+        if encode_png(width, CORPSE_SEAM_HEIGHT, expected)? != seam_bytes {
             return Err(DomainError::Invalid("seam must use canonical metadata-free PNG encoding").into());
         }
     }
     Ok(())
 }
-fn validate_replay(tx: &Transaction<'_>, room: &Room, submission: &Submission, dimensions: (u32, u32)) -> Result<()> {
+fn validate_replay(tx: &Transaction<'_>, room: &Room, submission: &Submission, mode: Mode) -> Result<()> {
     let Some(manifest) = submission.replay.manifest else {
         if submission.replay.event_count != 0 || submission.revision != 1 || submission.replay.baseline != submission.checkpoint {
             return Err(DomainError::Invalid("complete replay package is required").into());
@@ -265,7 +264,7 @@ fn validate_replay(tx: &Transaction<'_>, room: &Room, submission: &Submission, d
             if wanted.get(&checkpoint.hash) != Some(&checkpoint.bytes) || !checked.insert(checkpoint.hash) {
                 return Err(DomainError::Invalid("duplicate or unrelated packed checkpoint").into());
             }
-            validate_checkpoint_dimensions(bytes, dimensions)?;
+            validate_checkpoint_dimensions(bytes, mode)?;
         }
     }
     for checkpoint in replay.checkpoints() {
@@ -276,15 +275,13 @@ fn validate_replay(tx: &Transaction<'_>, room: &Room, submission: &Submission, d
             return Err(DomainError::Invalid("missing packed checkpoint").into());
         }
         let bytes = load(tx, room.id(), checkpoint)?;
-        validate_checkpoint_dimensions(&bytes, dimensions)?;
+        validate_checkpoint_dimensions(&bytes, mode)?;
     }
     Ok(())
 }
-fn validate_checkpoint_dimensions(bytes: &[u8], dimensions: (u32, u32)) -> Result<()> {
+fn validate_checkpoint_dimensions(bytes: &[u8], mode: Mode) -> Result<()> {
     let document = decode_checkpoint(bytes)?;
-    if (document.size.width, document.size.height) != dimensions {
-        return Err(DomainError::Invalid("replay checkpoint dimensions").into());
-    }
+    mode.validate_extent(ImageExtent { width: document.size.width, height: document.size.height })?;
     Ok(())
 }
 

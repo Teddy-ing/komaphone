@@ -58,6 +58,7 @@ fn submission(room: &Room, author: ParticipantId) -> Submission {
         assets: vec![asset(1), asset(2)],
         note: "Private prior frame note".into(),
         seam: None,
+        extent: None,
     }
 }
 

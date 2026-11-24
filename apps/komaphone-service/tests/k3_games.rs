@@ -163,6 +163,7 @@ async fn submission(client: &Client, room: RoomId, index: u16, mode: Mode) -> Su
         assets,
         note: format!("private note {index}"),
         seam,
+        extent: Some(photocraft_party::ImageExtent { width, height }),
     }
 }
 
@@ -325,5 +326,114 @@ async fn full_two_and_three_player_games_keep_each_handoff_private_and_survive_r
             assert_eq!(archived.reveal, final_view.reveal);
             restarted.shutdown().await.unwrap();
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn variable_height_corpse_http_two_and_three_players_with_disconnect_retry_and_restart() {
+    use photocraft_doc::{Color, ColorMode, Document, Rect, SampleType, Size};
+    use photocraft_party::ImageExtent;
+    for count in [2u16, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("service.sqlite3");
+        let service = server::spawn("127.0.0.1:0".parse().unwrap(), &database, StoreOptions::default()).await.unwrap();
+        let (mut clients, room) = room_with(&service, count, Mode::ExquisiteCorpse).await;
+        let round_heights: [[u32; 3]; 3] = [[192, 512, 1024], [768, 128, 1536], [1280, 384, 640]];
+        let mut expected_heights: std::collections::BTreeMap<(u8, u8), u32> = std::collections::BTreeMap::new();
+        let mut expected_seam_rgb: std::collections::BTreeMap<(u8, u8), [u8; 3]> = std::collections::BTreeMap::new();
+
+        for round in 0..3usize {
+            let mut submissions = Vec::new();
+            for (idx, client) in clients.iter().enumerate() {
+                let view = client.poll(room).await;
+                let assigned = view.assignment.as_ref().unwrap();
+                let chain = assigned.assignment.id.chain;
+                if round > 0 {
+                    let Some(Reference::Seam { image: seam_ref, width: 1024, height: 24 }) = assigned.reference else {
+                        panic!("missing seam reference");
+                    };
+                    let seam_bytes = fetch(client, room, seam_ref).await;
+                    let decoded = image::load_from_memory(&seam_bytes).unwrap().into_rgba8();
+                    assert_eq!(decoded.dimensions(), (1024, 24));
+                    let want = expected_seam_rgb[&(chain, (round - 1) as u8)];
+                    assert_eq!(&decoded.as_raw()[..4], &[want[0], want[1], want[2], 255]);
+                }
+                let h = round_heights[round][idx];
+                let top = [40 + (idx as u8) * 30, 50 + (round as u8) * 20, 90];
+                let seam_col = [110 + chain * 35, 130 + (round as u8) * 30, 190 + (idx as u8) * 20];
+                expected_heights.insert((chain, round as u8), h);
+                expected_seam_rgb.insert((chain, round as u8), seam_col);
+                let mut doc = Document::with_background(
+                    "HTTP variable corpse",
+                    Size { width: 1024, height: h },
+                    ColorMode::Rgb,
+                    SampleType::U8,
+                    Color::rgb(f32::from(top[0]) / 255.0, f32::from(top[1]) / 255.0, f32::from(top[2]) / 255.0),
+                );
+                let strip = [seam_col[0], seam_col[1], seam_col[2], 255].repeat((1024 * 24) as usize);
+                doc.layers[0].surface_mut().unwrap().write_interleaved(Rect::from_xywh(0, (h - 24) as i32, 1024, 24), &strip);
+                let cp_bytes = photocraft_format::save_to_bytes(&doc, &Default::default()).unwrap();
+                let mut rendered = photocraft_compose::flatten(&doc);
+                photocraft_party::canonical_color::to_srgb(&doc, &mut rendered.px).unwrap();
+                let rendered = rendered.to_rgba8();
+                let img_asset = client.upload(room, &png(1024, h, &rendered.pixels)).await;
+                let cp_asset = client.upload(room, &cp_bytes).await;
+                let seam_asset = client.upload(room, &png(1024, 24, &rendered.pixels[((h - 24) * 1024 * 4) as usize..])).await;
+                let checkpoint = CheckpointRef { id: CheckpointId::new(&cp_asset.hash.as_str()[..32]).unwrap(), asset: cp_asset };
+                let sub = Submission {
+                    id: SubmissionId::new(&format!("{:032x}", 9000 + round * 10 + idx)).unwrap(),
+                    assignment: assigned.assignment.id,
+                    author: client.profile.id,
+                    project: assigned.assignment.project,
+                    revision: 1,
+                    image: img_asset,
+                    checkpoint,
+                    replay: ReplayRef {
+                        id: ReplayId::new(&format!("{:032x}", 9500 + round * 10 + idx)).unwrap(),
+                        baseline: checkpoint,
+                        end_event: None,
+                        event_count: 0,
+                        duration_ms: 0,
+                        manifest: None,
+                    },
+                    assets: vec![img_asset, cp_asset, seam_asset],
+                    note: String::new(),
+                    seam: Some(seam_asset),
+                    extent: Some(ImageExtent { width: 1024, height: h }),
+                };
+                submissions.push(sub);
+            }
+            // Simulate disconnect/retry: send same Submit request twice (and reject mismatched extent retry).
+            let base = clients[0].poll(room).await;
+            for (client, sub) in clients.iter().zip(&submissions) {
+                let req = request(Operation::Apply {
+                    room,
+                    expected_revision: base.revision,
+                    action: Box::new(Action::Submit { epoch: base.epoch, submission: sub.clone() }),
+                });
+                client.send(&req).await;
+                // Idempotent retry after disconnect preserves exact dimensions and pixels.
+                client.send(&req).await;
+            }
+        }
+        let final_view = clients[0].poll(room).await;
+        assert_eq!(final_view.phase, Phase::Reveal);
+        for entry in &final_view.reveal {
+            let RevealedEntry::Artwork { assignment, image, .. } = entry else { panic!("artwork") };
+            let ext = entry.resolved_extent(Mode::ExquisiteCorpse).unwrap();
+            let want_h = expected_heights[&(assignment.id.chain, assignment.id.round)];
+            assert_eq!(ext, ImageExtent { width: 1024, height: want_h });
+            let bytes = fetch(&clients[0], room, *image).await;
+            let decoded = image::load_from_memory(&bytes).unwrap().into_rgba8();
+            assert_eq!(decoded.dimensions(), (1024, want_h));
+        }
+        // Restart service and verify variable-height reveal persists intact.
+        service.shutdown().await.unwrap();
+        let restarted = server::spawn("127.0.0.1:0".parse().unwrap(), &database, StoreOptions::default()).await.unwrap();
+        for client in &mut clients {
+            client.endpoint = format!("http://{}/v1/rpc", restarted.address);
+            assert_eq!(client.poll(room).await.reveal, final_view.reveal);
+        }
+        restarted.shutdown().await.unwrap();
     }
 }

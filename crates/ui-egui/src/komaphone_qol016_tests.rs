@@ -505,6 +505,7 @@ fn gallery_fixture_items() -> (Vec<GalleryItem>, GalleryManifest, GalleryManifes
                     duration_ms: 0,
                 }),
                 assets: vec![asset_ref(1), asset_ref(2)],
+                extent: None,
             });
         }
     }

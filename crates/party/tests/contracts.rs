@@ -54,6 +54,7 @@ fn submission() -> Submission {
         assets: vec![asset(5, 4096), asset(7, 4096), asset(9, 4096), asset(10, 4096)],
         note: "Follow the blue line".into(),
         seam: Some(asset(9, 4096)),
+        extent: None,
     }
 }
 

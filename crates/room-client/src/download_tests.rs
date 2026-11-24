@@ -260,6 +260,7 @@ fn explicit_notes_response_carries_the_requested_game_identity_to_its_consumer()
             duration_ms: 0,
         }),
         assets: vec![asset],
+        extent: None,
     }];
     view.assignment = None;
     store.update_poll(view.clone()).unwrap();

@@ -1,15 +1,12 @@
 //! Versioned private-service wire contract. Credentials never belong in URLs or logs.
 use crate::{
-    Result,
-    contracts::{
-        AssetHash, AssetRef, AssignmentId, GameId, MAX_MESSAGE_BYTES, MAX_ROOM_SNAPSHOT_BYTES, Mode, Participant, RequestId, RoomId, decode_bounded,
-        validate_version,
-    },
+    Error, Result,
+    contracts::{AssetHash, AssetRef, AssignmentId, GameId, MAX_MESSAGE_BYTES, MAX_ROOM_SNAPSHOT_BYTES, Mode, Participant, RequestId, RoomId, decode_bounded},
     room::{Action, ApplyOutcome, RoomView},
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = MAX_ROOM_SNAPSHOT_BYTES + MAX_MESSAGE_BYTES;
 
@@ -24,7 +21,9 @@ pub struct RpcRequest {
 impl RpcRequest {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let request: Self = decode_bounded(bytes)?;
-        validate_version(request.protocol_version)?;
+        if request.protocol_version != PROTOCOL_VERSION {
+            return Err(Error::Version(request.protocol_version));
+        }
         Ok(request)
     }
 }

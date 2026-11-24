@@ -136,7 +136,7 @@ impl Fixture {
                 .execute(
                     None,
                     &RpcRequest {
-                        protocol_version: 1,
+                        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                         request_id: RequestId::new(&hex(u64::from(actor))).unwrap(),
                         operation: Operation::Pair { participant: person(actor), credential: token(actor) },
                     },
@@ -148,7 +148,11 @@ impl Fixture {
             store
                 .execute(
                     Some(&token(1)),
-                    &RpcRequest { protocol_version: 1, request_id: RequestId::new(&hex(10)).unwrap(), operation: Operation::Create { mode, timer_ms: None } },
+                    &RpcRequest {
+                        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
+                        request_id: RequestId::new(&hex(10)).unwrap(),
+                        operation: Operation::Create { mode, timer_ms: None },
+                    },
                     0,
                 )
                 .unwrap(),
@@ -172,7 +176,11 @@ impl Fixture {
     fn call(&mut self, actor: u8, operation: Operation) -> RpcResponse {
         self.next += 1;
         self.store
-            .execute(Some(&token(actor)), &RpcRequest { protocol_version: 1, request_id: RequestId::new(&hex(self.next)).unwrap(), operation }, 0)
+            .execute(
+                Some(&token(actor)),
+                &RpcRequest { protocol_version: photocraft_party::protocol::PROTOCOL_VERSION, request_id: RequestId::new(&hex(self.next)).unwrap(), operation },
+                0,
+            )
             .unwrap()
     }
     fn view(&mut self, actor: u8) -> RoomView {
@@ -258,6 +266,7 @@ impl Fixture {
             assets,
             note: "private note never rendered or copied into provenance".into(),
             seam,
+            extent: Some(photocraft_party::ImageExtent { width, height }),
         };
         self.action(actor, RoomAction::Submit { epoch: view.epoch, submission });
     }
@@ -521,4 +530,66 @@ fn world_v1_migration_keeps_a_verified_backup_and_all_existing_grants_events() {
             .count(),
         1
     );
+}
+
+#[test]
+fn variable_height_corpse_remix_assembles_exact_summed_dimensions_and_single_part() {
+    let mut f = Fixture::new(Mode::ExquisiteCorpse, 2);
+    let heights = [256u32, 768, 1280];
+    let colors = [Color::rgb(0.8, 0.2, 0.2), Color::rgb(0.2, 0.8, 0.2), Color::rgb(0.2, 0.2, 0.8)];
+    for round in 0..3usize {
+        for actor in 1..=2u8 {
+            let view = f.view(actor);
+            let assignment = view.assignment.unwrap().assignment;
+            let height = if assignment.id.chain == 0 { heights[round] } else { 512 };
+            let document = Document::with_background("Variable remix", Size::new(1024, height), ColorMode::Rgb, SampleType::U8, colors[round]);
+            let native = photocraft_format::save_to_bytes(&document, &Default::default()).unwrap();
+            let mut rendered = photocraft_compose::flatten(&document);
+            photocraft_party::canonical_color::to_srgb(&document, &mut rendered.px).unwrap();
+            let rendered = rendered.to_rgba8();
+            let png = photocraft_sync::encode_png(1024, height, &rendered.pixels).unwrap();
+            let checkpoint = CheckpointRef { id: CheckpointId::new(&hex(f.next + 10000)).unwrap(), asset: f.upload(actor, &native) };
+            let image = f.upload(actor, &png);
+            let seam_png = photocraft_sync::encode_png(1024, 24, &rendered.pixels[((height - 24) * 1024 * 4) as usize..]).unwrap();
+            let seam = f.upload(actor, &seam_png);
+            let assets = vec![checkpoint.asset, image, seam];
+            let submission = Submission {
+                id: SubmissionId::new(&hex(f.next + 20000)).unwrap(),
+                assignment: assignment.id,
+                author: person(actor).id,
+                project: assignment.project,
+                revision: 1,
+                image,
+                checkpoint,
+                replay: ReplayRef {
+                    id: ReplayId::new(&hex(f.next + 30000)).unwrap(),
+                    manifest: None,
+                    baseline: checkpoint,
+                    end_event: None,
+                    event_count: 0,
+                    duration_ms: 0,
+                },
+                assets,
+                note: String::new(),
+                seam: Some(seam),
+                extent: Some(photocraft_party::ImageExtent { width: 1024, height }),
+            };
+            f.action(actor, RoomAction::Submit { epoch: view.epoch, submission });
+        }
+    }
+    let whole_source = f.source(None);
+    let whole = prepared(&mut f.store, 1, 100, whole_source);
+    f.place(&whole, 1, 5000);
+    assert_eq!(whole.frames.len(), 1);
+    let assembled = image::load_from_memory(&fetch(&mut f.store, 1, 100, whole.frames[0].hash)).unwrap().into_rgba8();
+    assert_eq!(assembled.dimensions(), (1024, 256 + 768 + 1280));
+    assert!(assembled.get_pixel(10, 0)[0] > 180 && assembled.get_pixel(10, 255)[0] > 180);
+    assert!(assembled.get_pixel(10, 256)[1] > 180 && assembled.get_pixel(10, 256 + 767)[1] > 180);
+    assert!(assembled.get_pixel(10, 256 + 768)[2] > 180 && assembled.get_pixel(10, 256 + 768 + 1279)[2] > 180);
+    let part_source = f.source(Some(1));
+    let part = prepared(&mut f.store, 1, 100, part_source);
+    f.place(&part, 2, 5001);
+    assert_eq!(part.frames.len(), 1);
+    let middle = image::load_from_memory(&fetch(&mut f.store, 1, 100, part.frames[0].hash)).unwrap().into_rgba8();
+    assert_eq!(middle.dimensions(), (1024, 768));
 }

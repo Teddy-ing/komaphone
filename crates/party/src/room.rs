@@ -2,8 +2,8 @@
 //! This module neither authenticates a transport nor promises durable storage.
 
 use crate::contracts::{
-    AssetHash, AssetRef, AssignmentId, CheckpointRef, GameId, MAX_PLAYERS, MAX_ROOM_SNAPSHOT_BYTES, MAX_TIMER_MS, Mode, Participant, ParticipantId, ProjectId,
-    ReplayRef, RoomId, Submission, TRANSFER_GRACE_MS,
+    AssetHash, AssetRef, AssignmentId, CheckpointRef, GameId, ImageExtent, MAX_PLAYERS, MAX_ROOM_SNAPSHOT_BYTES, MAX_TIMER_MS, Mode, Participant,
+    ParticipantId, ProjectId, ReplayRef, RoomId, Submission, TRANSFER_GRACE_MS,
 };
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -172,11 +172,38 @@ pub struct AssignmentView {
     pub reference: Option<Reference>,
 }
 
+#[allow(clippy::large_enum_variant)] // Artwork is the common variant in a bounded reveal list (<= 36 entries).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevealedEntry {
-    Artwork { assignment: Assignment, revision: u64, image: AssetRef, checkpoint: CheckpointRef, replay: Box<ReplayRef>, assets: Vec<AssetRef> },
-    Missing { assignment: Assignment, reason: String },
+    Artwork {
+        assignment: Assignment,
+        revision: u64,
+        image: AssetRef,
+        checkpoint: CheckpointRef,
+        replay: Box<ReplayRef>,
+        assets: Vec<AssetRef>,
+        /// Committed canonical pixel dimensions; legacy records omit this and resolve to `mode.default_extent()`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extent: Option<ImageExtent>,
+    },
+    Missing {
+        assignment: Assignment,
+        reason: String,
+    },
+}
+
+impl RevealedEntry {
+    pub fn resolved_extent(&self, mode: Mode) -> Result<ImageExtent> {
+        match self {
+            Self::Artwork { extent, .. } => {
+                let resolved = extent.unwrap_or_else(|| mode.default_extent());
+                mode.validate_extent(resolved)?;
+                Ok(resolved)
+            }
+            Self::Missing { .. } => Ok(mode.default_extent()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +440,7 @@ impl Room {
                     return Err(Error::Phase); // Authority must process the due tick first.
                 }
                 submission.validate()?;
+                submission.resolved_extent(self.state.mode)?;
                 if self.phase() == Phase::Transfer && !self.state.frozen.iter().any(|frozen| frozen == &submission) {
                     return Err(Error::Conflict);
                 }
@@ -438,6 +466,7 @@ impl Room {
                     return Err(Error::Phase);
                 }
                 submission.validate()?;
+                submission.resolved_extent(self.state.mode)?;
                 let assignment = self.current_assignment(actor)?;
                 if submission.assignment != assignment.id || submission.author != actor || submission.project != assignment.project {
                     return Err(Error::Unauthorized);
@@ -634,6 +663,7 @@ impl Room {
                         checkpoint: value.checkpoint,
                         replay: Box::new(value.replay),
                         assets: value.assets.clone(),
+                        extent: value.extent,
                     }),
                     Some(Entry::Missing { reason, .. }) => reveal.push(RevealedEntry::Missing { assignment: assignment.clone(), reason: reason.clone() }),
                     None => return Err(Error::Invalid("incomplete terminal state")),
@@ -774,6 +804,7 @@ impl Room {
         let mut frozen_assignments = BTreeSet::new();
         for frozen in &state.frozen {
             frozen.validate()?;
+            frozen.resolved_extent(state.mode)?;
             let assignment = self.current_assignment(frozen.author)?;
             if frozen.assignment != assignment.id || frozen.project != assignment.project || !frozen_assignments.insert(frozen.assignment) {
                 return Err(Error::Invalid("frozen manifest ownership"));
@@ -793,6 +824,7 @@ impl Room {
             match entry {
                 Entry::Submitted { value, accepted_revision } => {
                     value.validate()?;
+                    value.resolved_extent(state.mode)?;
                     if value.author != assignment.player
                         || id.round > state.round
                         || value.project != assignment.project

@@ -138,7 +138,7 @@ fn artifact(bundle: &GalleryBundle, chain: u8, frame: u8) -> Result<Option<Repla
         }
         return Ok(replay.as_deref().cloned());
     }
-    let RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets } = entry(bundle, chain, frame)? else {
+    let RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets, extent } = entry(bundle, chain, frame)? else {
         return Err(error("This part is explicitly missing; there is no drawing history to replay"));
     };
     let submission = Submission {
@@ -153,6 +153,7 @@ fn artifact(bundle: &GalleryBundle, chain: u8, frame: u8) -> Result<Option<Repla
         assets: assets.clone(),
         note: String::new(),
         seam: None,
+        extent: *extent,
     };
     let Some(manifest) = replay.manifest else {
         return Ok(None);
@@ -215,9 +216,9 @@ fn replay_step_with(bundle: &GalleryBundle, artifact: &ReplayArtifact, index: us
     let step = artifact.steps.get(index).ok_or_else(|| error("Replay step is outside the retained history"))?;
     let document = load(checkpoint(bundle, artifact, step.checkpoint.asset)?, true)?;
     if let GalleryContent::Game { room } = &bundle.manifest.content
-        && (document.size.width, document.size.height) != dimensions(room.mode)
+        && room.mode.validate_extent(photocraft_party::ImageExtent { width: document.size.width, height: document.size.height }).is_err()
     {
-        return Err(error("A replay checkpoint has different assignment dimensions"));
+        return Err(error("A replay checkpoint has unsupported assignment dimensions"));
     }
     render_document(&document)
 }
@@ -242,10 +243,17 @@ pub fn render_frame(bundle: &GalleryBundle, chain: u8, frame: u8) -> Result<Room
         }
         return render_document(&document);
     }
-    let expected = dimensions(game(bundle)?.mode);
-    match entry(bundle, chain, frame)? {
-        RevealedEntry::Artwork { image, .. } => decode_png(object(bundle, *image)?, expected),
-        RevealedEntry::Missing { .. } => Ok(RoomImage { width: expected.0, height: expected.1, rgba: vec![0; expected.0 as usize * expected.1 as usize * 4] }),
+    let mode = game(bundle)?.mode;
+    let item = entry(bundle, chain, frame)?;
+    match item {
+        RevealedEntry::Artwork { image, .. } => {
+            let ext = item.resolved_extent(mode).map_err(other)?;
+            decode_png(object(bundle, *image)?, (ext.width, ext.height))
+        }
+        RevealedEntry::Missing { .. } => {
+            let expected = dimensions(mode);
+            Ok(RoomImage { width: expected.0, height: expected.1, rgba: vec![0; expected.0 as usize * expected.1 as usize * 4] })
+        }
     }
 }
 
@@ -267,8 +275,9 @@ pub fn validate_originals(bundle: &GalleryBundle) -> Result<()> {
         GalleryContent::Game { room } => {
             for item in &room.reveal {
                 if let RevealedEntry::Artwork { assignment, checkpoint, .. } = item {
+                    let expected = item.resolved_extent(room.mode).map_err(other)?;
                     let doc = load(object(bundle, checkpoint.asset)?, true)?;
-                    if (doc.size.width, doc.size.height) != dimensions(room.mode) {
+                    if (doc.size.width, doc.size.height) != (expected.width, expected.height) {
                         return Err(error("An accepted checkpoint has different assignment dimensions"));
                     }
                     let canonical = render_document(&doc)?;
@@ -489,14 +498,30 @@ fn remix_game(bundle: &GalleryBundle, room: &RoomView, chain: u8, frame: Option<
 }
 
 fn remix_creature(bundle: &GalleryBundle, chain: u8) -> Result<Document> {
-    let mut doc = Document::new("Remixed creature", Size { width: 1024, height: 1536 }, ColorMode::Rgb, SampleType::U8);
+    let parts = [render_frame(bundle, chain, 0)?, render_frame(bundle, chain, 1)?, render_frame(bundle, chain, 2)?];
+    let mut total_height = 0u32;
+    for image in &parts {
+        if image.width != photocraft_party::CORPSE_WIDTH
+            || !(photocraft_party::CORPSE_MIN_BAND_HEIGHT..=photocraft_party::CORPSE_MAX_BAND_HEIGHT).contains(&image.height)
+        {
+            return Err(error("A creature part has unsupported dimensions"));
+        }
+        total_height = total_height.checked_add(image.height).ok_or_else(|| error("Creature height overflow"))?;
+    }
+    if total_height > photocraft_party::CORPSE_MAX_TOTAL_HEIGHT {
+        return Err(error("Assembled creature exceeds the maximum supported height"));
+    }
+    let mut doc = Document::new("Remixed creature", Size { width: photocraft_party::CORPSE_WIDTH, height: total_height }, ColorMode::Rgb, SampleType::U8);
     doc.icc_profile = Some(photocraft_cms::Builtin::Srgb.profile().to_bytes());
-    for part in 0..3u8 {
-        let image = render_frame(bundle, chain, part)?;
-        let mut layer = Layer::raster(crate::rooms::corpse::part_name(part), doc.pixel_format());
-        let surface = image_surface(&image)?;
-        layer.content = LayerContent::Raster(surface.translated(0, i32::from(part) * 512, photocraft_geom::Rect::new(0, 0, 1024, 512)));
+    let mut y_offset = 0i32;
+    for (part, image) in parts.iter().enumerate() {
+        let mut layer = Layer::raster(crate::rooms::corpse::part_name(part as u8), doc.pixel_format());
+        let surface = image_surface(image)?;
+        let w = i32::try_from(image.width).map_err(|_| error("Creature part width overflow"))?;
+        let h = i32::try_from(image.height).map_err(|_| error("Creature part height overflow"))?;
+        layer.content = LayerContent::Raster(surface.translated(0, y_offset, photocraft_geom::Rect::new(0, 0, w, h)));
         doc.layers.push(layer);
+        y_offset = y_offset.checked_add(h).ok_or_else(|| error("Creature height overflow"))?;
     }
     Ok(doc)
 }

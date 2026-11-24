@@ -63,6 +63,7 @@ fn submission(room: &Room, actor: ParticipantId) -> Submission {
         assets,
         note: format!("private-note-{n}"),
         seam,
+        extent: None,
     }
 }
 
@@ -372,4 +373,65 @@ fn archived_snapshot_cannot_invent_a_submitted_future_round() {
     forged.project = future.project;
     snapshot["entries"][2] = serde_json::json!({"kind": "submitted", "value": forged, "accepted_revision": room.revision()});
     assert!(Room::from_snapshot(&serde_json::to_vec(&snapshot).unwrap()).is_err());
+}
+
+#[test]
+fn variable_height_corpse_submissions_validate_bounds_and_preserve_legacy_snapshots() {
+    use photocraft_party::{CORPSE_DEFAULT_BAND_HEIGHT, CORPSE_MAX_BAND_HEIGHT, CORPSE_MIN_BAND_HEIGHT, CORPSE_WIDTH, ImageExtent};
+    // 1. Complete 2-player game mixing short, default, and tall heights (plus legacy None).
+    let (mut room, members) = started(2, Mode::ExquisiteCorpse, None);
+    let heights = [[Some(CORPSE_MIN_BAND_HEIGHT), Some(CORPSE_MAX_BAND_HEIGHT)], [None, Some(768)], [Some(1200), Some(256)]];
+    for (round, round_heights) in heights.iter().enumerate() {
+        for (idx, member) in members.iter().enumerate() {
+            let mut value = submission(&room, member.id);
+            // Invalid dimensions must be rejected cleanly without advancing room state.
+            for bad in [
+                ImageExtent { width: CORPSE_WIDTH, height: 0 },
+                ImageExtent { width: CORPSE_WIDTH, height: CORPSE_MIN_BAND_HEIGHT - 1 },
+                ImageExtent { width: CORPSE_WIDTH, height: CORPSE_MAX_BAND_HEIGHT + 1 },
+                ImageExtent { width: CORPSE_WIDTH - 1, height: CORPSE_DEFAULT_BAND_HEIGHT },
+                ImageExtent { width: 1536, height: 1024 },
+            ] {
+                let mut invalid = value.clone();
+                invalid.extent = Some(bad);
+                let epoch = room.epoch();
+                assert!(room.apply(member.id, room.revision(), 0, Action::Submit { epoch, submission: invalid }).is_err());
+            }
+            value.extent = round_heights[idx].map(|height| ImageExtent { width: CORPSE_WIDTH, height });
+            let accepted = submit(&mut room, member.id, value.clone());
+            assert!(!accepted.duplicate);
+            // Exact retry is idempotent; retry with altered dimensions is a Conflict.
+            let epoch = room.epoch();
+            let dup = room.apply(member.id, room.revision(), 0, Action::Submit { epoch, submission: value.clone() }).unwrap();
+            assert!(dup.duplicate);
+            let mut altered = value;
+            altered.extent = Some(ImageExtent { width: CORPSE_WIDTH, height: 600 });
+            assert_eq!(room.apply(member.id, room.revision(), 0, Action::Submit { epoch, submission: altered }), Err(Error::Conflict));
+            let _ = round;
+        }
+    }
+    assert_eq!(room.phase(), Phase::Reveal);
+    let restored = Room::from_snapshot(&room.snapshot_bytes().unwrap()).unwrap();
+    assert_eq!(restored, room);
+    let view = restored.view(members[0].id).unwrap();
+    // Legacy None entry resolves to 512; explicit entries retain their committed heights.
+    let mut resolved = std::collections::BTreeMap::new();
+    for entry in &view.reveal {
+        if let RevealedEntry::Artwork { assignment, extent, .. } = entry {
+            resolved.insert((assignment.id.chain, assignment.id.round), (*extent, entry.resolved_extent(Mode::ExquisiteCorpse).unwrap()));
+        }
+    }
+    assert_eq!(resolved[&(0, 0)], (Some(ImageExtent { width: 1024, height: 128 }), ImageExtent { width: 1024, height: 128 }));
+    assert_eq!(resolved[&(1, 0)], (Some(ImageExtent { width: 1024, height: 2048 }), ImageExtent { width: 1024, height: 2048 }));
+    assert_eq!(resolved[&(1, 1)], (None, ImageExtent { width: 1024, height: 512 }));
+    assert_eq!(resolved[&(0, 1)], (Some(ImageExtent { width: 1024, height: 768 }), ImageExtent { width: 1024, height: 768 }));
+    assert_eq!(resolved[&(0, 2)], (Some(ImageExtent { width: 1024, height: 1200 }), ImageExtent { width: 1024, height: 1200 }));
+    assert_eq!(resolved[&(1, 2)], (Some(ImageExtent { width: 1024, height: 256 }), ImageExtent { width: 1024, height: 256 }));
+
+    // 2. Animation mode still strictly enforces fixed 1536 × 1024 dimensions.
+    let (mut anim, anim_members) = started(2, Mode::Animation { rotations: 1 }, None);
+    let mut bad_anim = submission(&anim, anim_members[0].id);
+    bad_anim.extent = Some(ImageExtent { width: 1536, height: 768 });
+    let epoch = anim.epoch();
+    assert!(anim.apply(anim_members[0].id, anim.revision(), 0, Action::Submit { epoch, submission: bad_anim }).is_err());
 }

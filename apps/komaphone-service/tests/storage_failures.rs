@@ -5,7 +5,7 @@ use photocraft_party::{
 use photocraft_sync::{Store, StoreOptions};
 use sha2::{Digest, Sha256};
 fn req(id: u64, operation: Operation) -> RpcRequest {
-    RpcRequest { protocol_version: 1, request_id: RequestId::new(&format!("{id:032x}")).unwrap(), operation }
+    RpcRequest { protocol_version: photocraft_party::protocol::PROTOCOL_VERSION, request_id: RequestId::new(&format!("{id:032x}")).unwrap(), operation }
 }
 fn token() -> String {
     format!("{:064x}", 42)

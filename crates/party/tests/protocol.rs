@@ -17,8 +17,11 @@ fn wire() -> serde_json::Value {
 fn protocol_requires_exact_known_version_and_fields() {
     let mut value = wire();
     assert!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()).is_ok());
-    value["protocol_version"] = json!(2);
-    assert!(matches!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()), Err(Error::Version(2))));
+    // Legacy v1 clients and future unknown protocol versions receive explicit Version errors.
+    for incompatible in [1u16, PROTOCOL_VERSION + 1] {
+        value["protocol_version"] = json!(incompatible);
+        assert!(matches!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()), Err(Error::Version(v)) if v == incompatible));
+    }
     value["protocol_version"] = json!(PROTOCOL_VERSION);
     value["actor"] = json!("33333333333333333333333333333333");
     assert!(RpcRequest::decode(&serde_json::to_vec(&value).unwrap()).is_err(), "body cannot claim a principal");

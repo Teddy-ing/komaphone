@@ -69,6 +69,7 @@ fn frozen_baseline(room: &Room, author: ParticipantId) -> Submission {
         assets: vec![asset(1), asset(2), asset(3)],
         note: String::new(),
         seam: Some(asset(3)),
+        extent: None,
     }
 }
 

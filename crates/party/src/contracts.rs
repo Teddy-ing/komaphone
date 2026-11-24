@@ -18,6 +18,14 @@ pub const MAX_TIMER_MS: u64 = 3_600_000;
 pub const TRANSFER_GRACE_MS: u64 = 30_000;
 pub const MAX_IMAGE_SIDE: u32 = 8192;
 pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
+pub const ANIMATION_WIDTH: u32 = 1536;
+pub const ANIMATION_HEIGHT: u32 = 1024;
+pub const CORPSE_WIDTH: u32 = 1024;
+pub const CORPSE_DEFAULT_BAND_HEIGHT: u32 = 512;
+pub const CORPSE_MIN_BAND_HEIGHT: u32 = 128;
+pub const CORPSE_MAX_BAND_HEIGHT: u32 = 2048;
+pub const CORPSE_SEAM_HEIGHT: u32 = 24;
+pub const CORPSE_MAX_TOTAL_HEIGHT: u32 = CORPSE_MAX_BAND_HEIGHT * 3;
 
 // Fixed arrays keep typed values bounded even when constructed outside JSON.
 macro_rules! opaque_id {
@@ -109,6 +117,31 @@ impl Mode {
         match self {
             Self::Animation { rotations } => Ok(*rotations * players as u8),
             Self::ExquisiteCorpse => Ok(3),
+        }
+    }
+    pub fn default_extent(&self) -> ImageExtent {
+        match self {
+            Self::Animation { .. } => ImageExtent { width: ANIMATION_WIDTH, height: ANIMATION_HEIGHT },
+            Self::ExquisiteCorpse => ImageExtent { width: CORPSE_WIDTH, height: CORPSE_DEFAULT_BAND_HEIGHT },
+        }
+    }
+    pub fn validate_extent(&self, extent: ImageExtent) -> Result<()> {
+        extent.decoded_bytes(4)?;
+        match self {
+            Self::Animation { .. } => {
+                if extent.width == ANIMATION_WIDTH && extent.height == ANIMATION_HEIGHT {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid("animation frame dimensions"))
+                }
+            }
+            Self::ExquisiteCorpse => {
+                if extent.width == CORPSE_WIDTH && (CORPSE_MIN_BAND_HEIGHT..=CORPSE_MAX_BAND_HEIGHT).contains(&extent.height) {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid("corpse segment dimensions (width 1024, height 128..=2048)"))
+                }
+            }
         }
     }
 }
@@ -223,12 +256,24 @@ pub struct Submission {
     pub note: String,
     /// Service-generated, verified bottom 24px derivative; never a client-supplied permission grant.
     pub seam: Option<AssetRef>,
+    /// Committed canonical pixel dimensions. Legacy schema-1 records omit this field and resolve
+    /// to the mode's default extent (`1536 × 1024` for Animation, `1024 × 512` for Exquisite Corpse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<ImageExtent>,
 }
 impl Submission {
+    pub fn resolved_extent(&self, mode: Mode) -> Result<ImageExtent> {
+        let extent = self.extent.unwrap_or_else(|| mode.default_extent());
+        mode.validate_extent(extent)?;
+        Ok(extent)
+    }
     pub fn validate(&self) -> Result<()> {
         self.assignment.validate()?;
         if self.revision == 0 {
             return Err(Error::Invalid("durable revision"));
+        }
+        if let Some(extent) = self.extent {
+            extent.decoded_bytes(4)?;
         }
         self.checkpoint.asset.validate()?;
         self.replay.validate()?;

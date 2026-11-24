@@ -69,6 +69,8 @@ try:
                 if time.monotonic() >= deadline:
                     raise AssertionError("hosted readiness deadline")
                 time.sleep(0.1)
+        health = probe.get_json(base, "/health")
+        rpc_version = int(health.get("protocol_version", 1))
         result["real_hosted_readiness"] = True
         device = uuid.uuid4().hex
         challenge = post("/v1/auth", {"action": "begin", "device": device}, 200)
@@ -80,10 +82,10 @@ try:
         denial = post("/v1/auth", {"action": "finish", "transaction": challenge["transaction"], "id_token": "invalid.jwt.signature",
                                   "device_proof": "1" * 64, "label": "Synthetic actor"}, 403)
         assert denial["code"] == "unauthorized"
-        pair = {"protocol_version": 1, "request_id": uuid.uuid4().hex,
+        pair = {"protocol_version": rpc_version, "request_id": uuid.uuid4().hex,
                 "operation": {"kind": "pair", "participant": {"id": uuid.uuid4().hex, "device": device, "display_name": "Synthetic actor"}, "credential": "2" * 64}}
         assert post("/v1/rpc", pair, 403)["code"] == "unauthorized"
-        create = {"protocol_version": 1, "request_id": uuid.uuid4().hex, "operation": {"kind": "create", "mode": {"kind": "animation", "rotations": 1}, "timer_ms": None}}
+        create = {"protocol_version": rpc_version, "request_id": uuid.uuid4().hex, "operation": {"kind": "create", "mode": {"kind": "animation", "rotations": 1}, "timer_ms": None}}
         assert post("/v1/rpc", create, 401, "2" * 64)["code"] == "session"
         post("/v1/auth", {"action": "begin", "device": device}, 403, origin="https://untrusted.invalid")
         result["legacy_pair_bad_token_and_cross_origin_denied"] = True

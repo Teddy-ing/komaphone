@@ -149,7 +149,10 @@ async fn run() -> photocraft_sync::Result<()> {
             None => photocraft_sync::server::spawn(args.bind, database, options).await?,
         }
     };
-    println!("{}", serde_json::json!({"ready":true,"address":service.address.to_string(),"protocol_version":1,"tls":encrypted,"hosted":hosted}));
+    println!(
+        "{}",
+        serde_json::json!({"ready":true,"address":service.address.to_string(),"protocol_version":photocraft_party::protocol::PROTOCOL_VERSION,"tls":encrypted,"hosted":hosted})
+    );
     tokio::signal::ctrl_c().await?;
     service.shutdown().await
 }

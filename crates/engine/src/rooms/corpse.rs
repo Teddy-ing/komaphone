@@ -1,13 +1,20 @@
-//! Exquisite Corpse presentation boundaries. A joining strip is a read-only derivative;
-//! it is never one of the three output bands or a source of editable document pixels.
+//! Exquisite Corpse presentation boundaries and per-segment height resizing.
+//! A joining strip is a read-only derivative; it is never one of the three output
+//! bands or a source of editable document pixels.
 use super::media::RoomImage;
-use crate::{EngineError, Result};
+use crate::{EngineError, Result, Session};
+use photocraft_doc::{Document, LayerContent};
+use photocraft_geom::Rect;
 use photocraft_party::room::{Phase, Reference, RevealedEntry, RoomView};
 use photocraft_party::{AssetRef, AssignmentId, GameId, Mode, ParticipantId};
+use serde_json::{Value, json};
 
-pub const WIDTH: u32 = 1024;
-pub const BAND_HEIGHT: u32 = 512;
-pub const SEAM_HEIGHT: u32 = 24;
+pub const WIDTH: u32 = photocraft_party::CORPSE_WIDTH;
+pub const BAND_HEIGHT: u32 = photocraft_party::CORPSE_DEFAULT_BAND_HEIGHT;
+pub const MIN_BAND_HEIGHT: u32 = photocraft_party::CORPSE_MIN_BAND_HEIGHT;
+pub const MAX_BAND_HEIGHT: u32 = photocraft_party::CORPSE_MAX_BAND_HEIGHT;
+pub const MAX_TOTAL_HEIGHT: u32 = photocraft_party::CORPSE_MAX_TOTAL_HEIGHT;
+pub const SEAM_HEIGHT: u32 = photocraft_party::CORPSE_SEAM_HEIGHT;
 pub const HEIGHT: u32 = BAND_HEIGHT * 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +50,7 @@ pub struct CorpsePart {
     pub assignment: AssignmentId,
     pub author: ParticipantId,
     pub author_name: String,
+    pub height: u32,
     pub image: Option<AssetRef>,
     /// A service-labeled missing submission, displayed separately from image pixels.
     pub missing: Option<String>,
@@ -54,6 +62,11 @@ pub struct CorpseChain {
     pub chain: u8,
     /// Head, torso/arms, legs/feet. The order never depends on payload arrival order.
     pub parts: [CorpsePart; 3],
+}
+impl CorpseChain {
+    pub fn total_height(&self) -> u32 {
+        self.parts.iter().fold(0u32, |sum, part| sum.saturating_add(part.height))
+    }
 }
 
 pub fn part_name(round: u8) -> &'static str {
@@ -78,9 +91,12 @@ pub fn reveal_chain(room: &RoomView, chain: u8) -> Result<CorpseChain> {
     let mut parts: [Option<CorpsePart>; 3] = [None, None, None];
     let mut game = None;
     for entry in &room.reveal {
-        let (assignment, image, missing) = match entry {
-            RevealedEntry::Artwork { assignment, image, .. } => (assignment, Some(*image), None),
-            RevealedEntry::Missing { assignment, reason } => (assignment, None, Some(reason.clone())),
+        let (assignment, image, missing, height) = match entry {
+            RevealedEntry::Artwork { assignment, image, .. } => {
+                let extent = entry.resolved_extent(room.mode).map_err(|e| invalid(e.to_string()))?;
+                (assignment, Some(*image), None, extent.height)
+            }
+            RevealedEntry::Missing { assignment, reason } => (assignment, None, Some(reason.clone()), BAND_HEIGHT),
         };
         if assignment.id.chain != chain {
             continue;
@@ -102,10 +118,17 @@ pub fn reveal_chain(room: &RoomView, chain: u8) -> Result<CorpseChain> {
         if let Some(image) = image {
             image.validate().map_err(|e| invalid(e.to_string()))?;
         }
-        *slot = Some(CorpsePart { assignment: assignment.id, author: assignment.player, author_name: author.participant.display_name.clone(), image, missing });
+        *slot = Some(CorpsePart {
+            assignment: assignment.id,
+            author: assignment.player,
+            author_name: author.participant.display_name.clone(),
+            height,
+            image,
+            missing,
+        });
     }
     let [head, torso, legs] = parts;
-    Ok(CorpseChain {
+    let chain = CorpseChain {
         game: game.ok_or_else(|| invalid("This creature has not been revealed"))?,
         chain,
         parts: [
@@ -113,45 +136,251 @@ pub fn reveal_chain(room: &RoomView, chain: u8) -> Result<CorpseChain> {
             torso.ok_or_else(|| invalid("The revealed torso is missing from the service response"))?,
             legs.ok_or_else(|| invalid("The revealed legs are missing from the service response"))?,
         ],
-    })
-}
-
-/// Concatenate already color-managed service derivatives. Alpha is unchanged and a
-/// labeled missing part is transparent. Notes, labels and joining strips have no input.
-pub fn assemble(parts: [Option<&RoomImage>; 3]) -> Result<RoomImage> {
-    for image in parts.iter().flatten() {
-        if image.width != WIDTH || image.height != BAND_HEIGHT {
-            return Err(invalid("Each revealed creature part must be exactly 1024 × 512 pixels"));
-        }
+    };
+    if chain.total_height() > MAX_TOTAL_HEIGHT {
+        return Err(invalid("Assembled creature exceeds the maximum supported height"));
     }
-    Ok(RoomImage { width: WIDTH, height: HEIGHT, rgba: assemble_samples(parts.map(|image| image.map(|image| image.rgba.as_slice())), 4)? })
+    Ok(chain)
 }
 
-/// The copying operation is independent of sample depth and color model. Its fixed
-/// geometry bounds allocation; callers supply channel-interleaved samples unchanged.
+/// Concatenate already color-managed service derivatives using each part's accepted height.
+/// Alpha is unchanged and a labeled missing part is transparent at the default band height.
+/// Notes, labels and joining strips have no input.
+pub fn assemble(parts: [Option<&RoomImage>; 3]) -> Result<RoomImage> {
+    let mut total_height = 0u32;
+    for image in &parts {
+        let height = if let Some(image) = image {
+            if image.width != WIDTH || !(MIN_BAND_HEIGHT..=MAX_BAND_HEIGHT).contains(&image.height) {
+                return Err(invalid(format!("Each revealed creature part must be {WIDTH} px wide and {MIN_BAND_HEIGHT}–{MAX_BAND_HEIGHT} px tall")));
+            }
+            image.height
+        } else {
+            BAND_HEIGHT
+        };
+        total_height = total_height.checked_add(height).ok_or_else(|| invalid("Creature image size overflow"))?;
+    }
+    if total_height > MAX_TOTAL_HEIGHT {
+        return Err(invalid("Assembled creature exceeds the maximum supported height"));
+    }
+    let rgba = assemble_samples_with_heights(parts.map(|image| image.map(|image| (image.height, image.rgba.as_slice()))), 4)?;
+    Ok(RoomImage { width: WIDTH, height: total_height, rgba })
+}
+
+/// The copying operation is independent of sample depth and color model. Its bounded
+/// geometry caps allocation; callers supply channel-interleaved samples unchanged.
 pub fn assemble_samples<T: Clone + Default>(parts: [Option<&[T]>; 3], channels: usize) -> Result<Vec<T>> {
+    assemble_samples_with_heights(parts.map(|part| part.map(|samples| (BAND_HEIGHT, samples))), channels)
+}
+
+/// Depth- and colour-general concatenation of three Exquisite Corpse parts with variable heights.
+pub fn assemble_samples_with_heights<T: Clone + Default>(parts: [Option<(u32, &[T])>; 3], channels: usize) -> Result<Vec<T>> {
     if !(1..=16).contains(&channels) || std::mem::size_of::<T>() > 16 {
         return Err(invalid("Unsupported creature sample layout"));
     }
-    let band = usize::try_from(WIDTH)
-        .ok()
-        .and_then(|width| usize::try_from(BAND_HEIGHT).ok().and_then(|height| width.checked_mul(height)))
-        .and_then(|pixels| pixels.checked_mul(channels))
-        .ok_or_else(|| invalid("Creature image size overflow"))?;
-    if parts.iter().flatten().any(|samples| samples.len() != band) {
-        return Err(invalid("Creature sample count does not match its band dimensions"));
+    let row_samples = usize::try_from(WIDTH).ok().and_then(|width| width.checked_mul(channels)).ok_or_else(|| invalid("Creature image size overflow"))?;
+    let mut total_height = 0u32;
+    let mut total_samples = 0usize;
+    let mut band_counts = [0usize; 3];
+    for (slot, part) in parts.iter().enumerate() {
+        let height = match part {
+            Some((height, samples)) => {
+                if !(MIN_BAND_HEIGHT..=MAX_BAND_HEIGHT).contains(height) {
+                    return Err(invalid(format!("Creature segment height must be {MIN_BAND_HEIGHT}–{MAX_BAND_HEIGHT} px")));
+                }
+                let expected = usize::try_from(*height).ok().and_then(|h| row_samples.checked_mul(h)).ok_or_else(|| invalid("Creature image size overflow"))?;
+                if samples.len() != expected {
+                    return Err(invalid("Creature sample count does not match its band dimensions"));
+                }
+                *height
+            }
+            None => BAND_HEIGHT,
+        };
+        total_height = total_height.checked_add(height).ok_or_else(|| invalid("Creature image size overflow"))?;
+        let count = usize::try_from(height).ok().and_then(|h| row_samples.checked_mul(h)).ok_or_else(|| invalid("Creature image size overflow"))?;
+        if let Some(target) = band_counts.get_mut(slot) {
+            *target = count;
+        }
+        total_samples = total_samples.checked_add(count).ok_or_else(|| invalid("Creature image size overflow"))?;
     }
-    let total = band.checked_mul(3).ok_or_else(|| invalid("Creature image size overflow"))?;
+    if total_height > MAX_TOTAL_HEIGHT {
+        return Err(invalid("Assembled creature exceeds the maximum supported height"));
+    }
     let mut assembled = Vec::new();
-    assembled.try_reserve_exact(total).map_err(|_| invalid("Not enough memory to assemble this creature"))?;
-    for samples in parts {
-        if let Some(samples) = samples {
+    assembled.try_reserve_exact(total_samples).map_err(|_| invalid("Not enough memory to assemble this creature"))?;
+    for (part, count) in parts.into_iter().zip(band_counts) {
+        if let Some((_, samples)) = part {
             assembled.extend_from_slice(samples);
         } else {
-            assembled.resize(assembled.len().saturating_add(band), T::default());
+            assembled.resize(assembled.len().saturating_add(count), T::default());
         }
     }
     Ok(assembled)
+}
+
+/// Lowest row (`y1`, in `0..=doc.size.height`) containing non-blank artwork on any layer,
+/// independent of bit depth and colour model. Locked solid-white Background pixels are treated
+/// as blank canvas; painted marks on the Background or any other layer extend this bound.
+pub fn content_bottom(doc: &Document) -> u32 {
+    let canvas = doc.bounds();
+    if canvas.is_empty() {
+        return 0;
+    }
+    let mut bottom = 0u32;
+    let mut stack: Vec<(&photocraft_doc::Layer, u8)> = doc.layers.iter().map(|layer| (layer, 0)).collect();
+    while let Some((layer, depth)) = stack.pop() {
+        if depth > 64 {
+            continue;
+        }
+        match &layer.content {
+            LayerContent::Group(group) => {
+                for child in &group.children {
+                    stack.push((child, depth.saturating_add(1)));
+                }
+            }
+            LayerContent::Raster(surface) if doc.is_background(layer.id) => {
+                bottom = bottom.max(background_content_bottom(surface, canvas, bottom));
+            }
+            LayerContent::Raster(surface) => {
+                let mut bounds = surface.content_bounds();
+                if !bounds.is_empty() && photocraft_compose::effects::has_effects(layer) {
+                    bounds = bounds.inflate(photocraft_compose::effects::margin(layer));
+                }
+                let clipped = bounds.intersect(&canvas);
+                if !clipped.is_empty() && clipped.y1 > 0 {
+                    bottom = bottom.max(clipped.y1 as u32);
+                }
+            }
+            LayerContent::Adjustment(_) => {}
+            LayerContent::Fill(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => {
+                let mut bounds = photocraft_compose::layer_bounds(layer, canvas);
+                if !bounds.is_empty() && photocraft_compose::effects::has_effects(layer) {
+                    bounds = bounds.inflate(photocraft_compose::effects::margin(layer));
+                }
+                let clipped = bounds.intersect(&canvas);
+                if !clipped.is_empty() && clipped.y1 > 0 {
+                    bottom = bottom.max(clipped.y1 as u32);
+                }
+            }
+        }
+        if bottom >= doc.size.height {
+            return doc.size.height;
+        }
+    }
+    bottom.min(doc.size.height)
+}
+
+fn background_content_bottom(surface: &photocraft_raster::Surface, canvas: Rect, current_bottom: u32) -> u32 {
+    let fmt = surface.format();
+    let bpp = fmt.bytes_per_pixel();
+    if bpp == 0 {
+        return current_bottom;
+    }
+    let white = photocraft_raster::from_rgba(&fmt, [1.0, 1.0, 1.0, 1.0]);
+    let mut white_bytes = vec![0u8; bpp];
+    photocraft_raster::encode_pixel(&fmt, &white, &mut white_bytes);
+    let ts = photocraft_geom::TILE_SIZE as usize;
+    let blank_row = white_bytes.repeat(ts);
+    let row_stride = ts.saturating_mul(bpp);
+    let mut bottom = current_bottom;
+    for (&coord, tile) in surface.tiles() {
+        let origin = coord.rect();
+        let clipped = origin.intersect(&canvas);
+        if clipped.is_empty() || clipped.y1 <= 0 || (clipped.y1 as u32) <= bottom {
+            continue;
+        }
+        let Ok(bytes) = tile.try_bytes() else {
+            return canvas.height();
+        };
+        let lx0 = ((clipped.x0 - origin.x0) as usize).saturating_mul(bpp);
+        let lx1 = ((clipped.x1 - origin.x0) as usize).saturating_mul(bpp);
+        let Some(blank_slice) = blank_row.get(lx0..lx1) else {
+            continue;
+        };
+        let min_y = clipped.y0.max(bottom as i32);
+        for y in (min_y..clipped.y1).rev() {
+            let ly = (y - origin.y0) as usize;
+            let row_start = ly.saturating_mul(row_stride);
+            let Some(row_slice) = bytes.get(row_start.saturating_add(lx0)..row_start.saturating_add(lx1)) else {
+                continue;
+            };
+            if row_slice != blank_slice {
+                bottom = bottom.max((y + 1) as u32);
+                break;
+            }
+        }
+    }
+    bottom
+}
+
+/// Minimum height the current Exquisite Corpse segment can shrink to without clipping existing
+/// marks (`MIN_BAND_HEIGHT..=doc.size.height.max(MIN_BAND_HEIGHT)`).
+pub fn safe_min_height(doc: &Document) -> u32 {
+    content_bottom(doc).clamp(MIN_BAND_HEIGHT, doc.size.height.max(MIN_BAND_HEIGHT))
+}
+
+/// Whether the active document is the player's editable current Exquisite Corpse segment.
+pub fn can_resize_segment(session: &Session) -> std::result::Result<(), String> {
+    let room = session.rooms.status.room.as_ref().ok_or("Join an Exquisite Corpse room first")?;
+    if room.mode != Mode::ExquisiteCorpse {
+        return Err("Segment height resizing is only available in Exquisite Corpse".into());
+    }
+    if room.phase != Phase::Drawing {
+        return Err("This Exquisite Corpse segment cannot be resized after drawing ends".into());
+    }
+    let actor = session.rooms.status.profile.as_ref().ok_or("Connect your profile first")?.id;
+    let assignment = room.assignment.as_ref().ok_or("No active Exquisite Corpse assignment")?;
+    if assignment.assignment.player != actor || assignment.assignment.id.round != room.round {
+        return Err("This segment does not belong to your current assignment".into());
+    }
+    if assignment.submitted {
+        return Err("Submitted segments are locked and cannot be resized".into());
+    }
+    let document = session.active().ok_or("Open your assigned Exquisite Corpse drawing first")?;
+    if session.local_projects.status(document.doc.id).project != Some(assignment.assignment.project) {
+        return Err("Open your current Exquisite Corpse segment to resize its height".into());
+    }
+    if let Some(reason) = session.room_active_edit_refusal() {
+        return Err(reason);
+    }
+    if document.doc.size.width != WIDTH {
+        return Err(format!("Exquisite Corpse segment width must remain {WIDTH} px"));
+    }
+    Ok(())
+}
+
+/// Resize only the current Exquisite Corpse segment's height while keeping the top/reference
+/// seam anchored (`y = 0`) and artwork unscaled. Shrinking below `safe_min_height` is refused
+/// unless `allow_crop` is explicitly true (still fully undoable).
+pub fn resize_segment_height(session: &mut Session, height: u32, allow_crop: bool) -> Result<Value> {
+    can_resize_segment(session).map_err(invalid)?;
+    if !(MIN_BAND_HEIGHT..=MAX_BAND_HEIGHT).contains(&height) {
+        return Err(invalid(format!("Segment height must be between {MIN_BAND_HEIGHT} and {MAX_BAND_HEIGHT} px")));
+    }
+    let (current_height, safe_min) = {
+        let state = session.active().ok_or(EngineError::NoDocument)?;
+        (state.doc.size.height, safe_min_height(&state.doc))
+    };
+    if height == current_height {
+        return Ok(json!({"width": WIDTH, "height": height, "changed": false, "safeMinHeight": safe_min, "cropped": false}));
+    }
+    if height < safe_min && !allow_crop {
+        return Err(invalid(format!("Cannot shrink below {safe_min} px without cropping existing artwork. Confirm crop to resize to {height} px (undoable).")));
+    }
+    let cropped = height < safe_min;
+    let rect = Rect::from_xywh(0, 0, WIDTH, height);
+    session.edit_corpse_segment_height("Resize Segment Height", |doc, _| {
+        crate::image_cmds::crop_doc(doc, "komaphone.corpse.setSegmentHeight", rect, cropped, [1.0, 1.0, 1.0, 1.0])?;
+        if !cropped
+            && height < current_height
+            && let Some(bg) = doc.background_mut()
+            && let LayerContent::Raster(surface) = &mut bg.content
+        {
+            *surface = photocraft_algo::resample::crop_surface(surface, rect);
+        }
+        Ok(())
+    })?;
+    let next_safe = session.active().map_or(MIN_BAND_HEIGHT, |state| safe_min_height(&state.doc));
+    Ok(json!({"width": WIDTH, "height": height, "changed": true, "safeMinHeight": next_safe, "cropped": cropped}))
 }
 
 fn invalid(message: impl Into<String>) -> EngineError {

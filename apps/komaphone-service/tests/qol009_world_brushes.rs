@@ -32,7 +32,7 @@ fn pair(store: &mut Store, n: u128) {
         .execute(
             None,
             &RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&hex(n + 3000)).unwrap(),
                 operation: Operation::Pair {
                     participant: Participant {
@@ -258,7 +258,7 @@ async fn two_clients_http_brush_sync_presence_undo_offline_restart_and_v2_reject
         async move {
             let rpc = format!("http://{addr}/v1/rpc");
             let req = RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&hex(4000 + n)).unwrap(),
                 operation: Operation::Pair {
                     participant: Participant {

@@ -62,6 +62,7 @@ fn reveal(round: u8, image: AssetRef) -> RevealedEntry {
             duration_ms: 0,
         }),
         assets: vec![asset(50), asset(60), asset(70)],
+        extent: None,
     }
 }
 

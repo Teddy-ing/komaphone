@@ -42,6 +42,19 @@ fn copy(session: &mut Session, params: &Value) -> Result<Value> {
     let layer = crate::rooms::animation::copy_previous_frame(session, &bytes)?;
     Ok(json!({"layer":layer.0}))
 }
+fn set_corpse_segment_height(session: &mut Session, params: &Value) -> Result<Value> {
+    fields(params, &["height", "allowCrop"])?;
+    let raw_height = params.get("height").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("height must be a positive integer in pixels".into()))?;
+    let height = u32::try_from(raw_height).map_err(|_| {
+        EngineError::Other(format!("Segment height must be between {} and {} px", crate::rooms::corpse::MIN_BAND_HEIGHT, crate::rooms::corpse::MAX_BAND_HEIGHT))
+    })?;
+    let allow_crop = match params.get("allowCrop") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(EngineError::Other("allowCrop must be true or false".into())),
+    };
+    crate::rooms::corpse::resize_segment_height(session, height, allow_crop)
+}
 fn save_note(session: &mut Session, params: &Value) -> Result<Value> {
     fields(params, &["note"])?;
     let note = params.get("note").and_then(Value::as_str).ok_or_else(|| EngineError::Other("note must be text".into()))?;
@@ -119,6 +132,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: "{}",
             enabled: crate::rooms::animation::can_copy_previous,
             run: copy,
+            journal: true,
+        },
+        CommandSpec {
+            id: "komaphone.corpse.setSegmentHeight",
+            label: "Resize Exquisite Corpse segment height",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"height":integer,"allowCrop":bool?}"#,
+            enabled: crate::rooms::corpse::can_resize_segment,
+            run: set_corpse_segment_height,
             journal: true,
         },
         CommandSpec {

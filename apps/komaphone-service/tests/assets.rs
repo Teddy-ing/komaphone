@@ -20,7 +20,7 @@ fn person(n: u8) -> Participant {
     }
 }
 fn request(n: u64, operation: Operation) -> RpcRequest {
-    RpcRequest { protocol_version: 1, request_id: RequestId::new(&format!("{n:032x}")).unwrap(), operation }
+    RpcRequest { protocol_version: photocraft_party::protocol::PROTOCOL_VERSION, request_id: RequestId::new(&format!("{n:032x}")).unwrap(), operation }
 }
 fn room(response: RpcResponse) -> RoomView {
     match response {
@@ -128,6 +128,7 @@ impl Fixture {
             assets,
             note: format!("private note {n}"),
             seam,
+            extent: Some(photocraft_party::ImageExtent { width, height }),
         }
     }
 }
@@ -495,5 +496,145 @@ fn packed_replay_accepts_three_hundred_distinct_edits_and_rejects_missing_member
         assert!(s.assets.len() < 10);
         let epoch = f.view(1).epoch;
         assert_eq!(f.action(1, Action::Submit { epoch, submission: s }).is_ok(), !missing);
+    }
+}
+
+#[test]
+fn variable_height_corpse_submissions_derive_exact_bottom_seam_and_reject_mismatches() {
+    use photocraft_doc::Rect;
+    use photocraft_party::{
+        EventId, ImageExtent,
+        replay_artifact::{ReplayArtifact, ReplayArtifactStep, pack_checkpoints},
+        room::RevealedEntry,
+    };
+    let mut f = Fixture::new(3, Mode::ExquisiteCorpse);
+    let heights_by_round: [[u32; 3]; 3] = [
+        [192, 512, 1024], // round 0: players 1, 2, 3
+        [768, 2048, 128], // round 1
+        [1536, 384, 640], // round 2
+    ];
+    let paint_band = |height: u32, top_rgb: [u8; 3], seam_rgb: [u8; 3]| -> Document {
+        let mut doc = Document::with_background(
+            format!("corpse-{height}"),
+            Size { width: 1024, height },
+            ColorMode::Rgb,
+            SampleType::U8,
+            Color::rgb(f32::from(top_rgb[0]) / 255.0, f32::from(top_rgb[1]) / 255.0, f32::from(top_rgb[2]) / 255.0),
+        );
+        let seam_px = [seam_rgb[0], seam_rgb[1], seam_rgb[2], 255].repeat((1024 * 24) as usize);
+        doc.layers[0].surface_mut().unwrap().write_interleaved(Rect::from_xywh(0, (height - 24) as i32, 1024, 24), &seam_px);
+        doc
+    };
+    // Reject mismatched declared extent vs checkpoint/PNG before accepting valid submission.
+    let bad_doc = paint_band(768, [20, 40, 60], [200, 100, 50]);
+    let mut bad_sub = f.submission_from_document(1, &bad_doc);
+    bad_sub.extent = Some(ImageExtent { width: 1024, height: 512 });
+    let epoch = f.view(1).epoch;
+    assert!(f.action(1, Action::Submit { epoch, submission: bad_sub }).is_err());
+    // Reject out-of-range segment heights (127 and 2049).
+    for invalid_h in [127u32, 2049] {
+        let invalid_doc = Document::with_background("bad", Size { width: 1024, height: invalid_h }, ColorMode::Rgb, SampleType::U8, Color::WHITE);
+        let invalid_sub = f.submission_from_document(1, &invalid_doc);
+        assert!(f.action(1, Action::Submit { epoch, submission: invalid_sub }).is_err());
+    }
+    // Complete all 3 rounds with mixed heights + multi-height replay history on round 0 player 1.
+    let mut expected_seam_rgb: std::collections::BTreeMap<(u8, u8), [u8; 3]> = std::collections::BTreeMap::new();
+    let mut expected_heights: std::collections::BTreeMap<(u8, u8), u32> = std::collections::BTreeMap::new();
+    for (round, round_heights) in heights_by_round.iter().enumerate() {
+        for player in 1..=3u8 {
+            let view = f.view(player);
+            let assigned = view.assignment.as_ref().unwrap();
+            let chain = assigned.assignment.id.chain;
+            if round > 0 {
+                // Verify seam matches previous round's actual bottom 24 rows, not row 512 - 24.
+                let Some(Reference::Seam { image: seam_ref, width: 1024, height: 24 }) = assigned.reference else {
+                    panic!("expected seam reference for round {round}");
+                };
+                let RpcResponse::AssetChunk { bytes, total } = f.call(player, Operation::Fetch { room: f.id, hash: seam_ref.hash, offset: 0 }).unwrap() else {
+                    panic!("asset chunk");
+                };
+                assert_eq!(bytes.len() as u64, total);
+                let decoded = image::load_from_memory(&bytes).unwrap().into_rgba8();
+                assert_eq!(decoded.dimensions(), (1024, 24));
+                let want = expected_seam_rgb[&(chain, (round - 1) as u8)];
+                assert_eq!(&decoded.as_raw()[..4], &[want[0], want[1], want[2], 255]);
+                assert_eq!(&decoded.as_raw()[decoded.as_raw().len() - 4..], &[want[0], want[1], want[2], 255]);
+            }
+            let h = round_heights[(player - 1) as usize];
+            let top_rgb = [30 + player * 20, 40 + (round as u8) * 30, 80];
+            let seam_rgb = [100 + chain * 40, 120 + (round as u8) * 35, 180 + player * 15];
+            expected_seam_rgb.insert((chain, round as u8), seam_rgb);
+            expected_heights.insert((chain, round as u8), h);
+            let doc = paint_band(h, top_rgb, seam_rgb);
+            let mut sub = f.submission_from_document(player, &doc);
+            if round == 0 && player == 2 {
+                // Legacy omission (`extent: None`) still accepted for 1024x512.
+                assert_eq!(h, 512);
+                sub.extent = None;
+            }
+            if round == 0 && player == 1 {
+                // Include a baseline (512 px) -> intermediate (800 px) -> final (192 px) replay.
+                let base_doc = Document::with_background("base-512", Size { width: 1024, height: 512 }, ColorMode::Rgb, SampleType::U8, Color::WHITE);
+                let base_bytes = photocraft_format::save_to_bytes(&base_doc, &Default::default()).unwrap();
+                let base_asset = f.upload(player, &base_bytes);
+                let base_cp = CheckpointRef { id: CheckpointId::new(&base_asset.hash.as_str()[..32]).unwrap(), asset: base_asset };
+                let mid_doc = Document::with_background("mid-800", Size { width: 1024, height: 800 }, ColorMode::Rgb, SampleType::U8, Color::WHITE);
+                let mid_bytes = photocraft_format::save_to_bytes(&mid_doc, &Default::default()).unwrap();
+                let mid_digest = format!("{:x}", Sha256::digest(&mid_bytes));
+                let mid_asset = AssetRef { hash: AssetHash::new(&mid_digest).unwrap(), bytes: mid_bytes.len() as u64 };
+                let mid_cp = CheckpointRef { id: CheckpointId::new(&mid_digest[..32]).unwrap(), asset: mid_asset };
+                let pack = f.upload(player, &pack_checkpoints(&[(mid_asset, mid_bytes)]).unwrap());
+                let steps = vec![
+                    ReplayArtifactStep {
+                        event: EventId::new(&format!("{:032x}", 80001)).unwrap(),
+                        revision: 1,
+                        elapsed_ms: 0,
+                        command: "file.new".into(),
+                        params: serde_json::json!({}),
+                        kind: "baseline".into(),
+                        checkpoint: base_cp,
+                    },
+                    ReplayArtifactStep {
+                        event: EventId::new(&format!("{:032x}", 80002)).unwrap(),
+                        revision: 2,
+                        elapsed_ms: 50,
+                        command: "komaphone.corpse.setSegmentHeight".into(),
+                        params: serde_json::json!({}),
+                        kind: "checkpoint".into(),
+                        checkpoint: mid_cp,
+                    },
+                    ReplayArtifactStep {
+                        event: EventId::new(&format!("{:032x}", 80003)).unwrap(),
+                        revision: 3,
+                        elapsed_ms: 100,
+                        command: "komaphone.corpse.setSegmentHeight".into(),
+                        params: serde_json::json!({}),
+                        kind: "checkpoint".into(),
+                        checkpoint: sub.checkpoint,
+                    },
+                ];
+                sub.revision = 3;
+                sub.replay.baseline = base_cp;
+                sub.replay.event_count = 2;
+                sub.replay.duration_ms = 100;
+                sub.replay.end_event = Some(steps[2].event);
+                sub.assets.push(base_asset);
+                sub.assets.push(pack);
+                let artifact = ReplayArtifact { schema_version: 1, replay: sub.replay.id, project: sub.project, packs: vec![pack], steps };
+                let manifest = f.upload(player, &serde_json::to_vec(&artifact).unwrap());
+                sub.assets.push(manifest);
+                sub.replay.manifest = Some(manifest);
+            }
+            let epoch = view.epoch;
+            f.action(player, Action::Submit { epoch, submission: sub }).unwrap();
+        }
+    }
+    let revealed = f.view(1);
+    assert_eq!(revealed.phase, Phase::Reveal);
+    assert_eq!(revealed.reveal.len(), 9);
+    for entry in &revealed.reveal {
+        let RevealedEntry::Artwork { assignment, .. } = entry else { panic!("expected artwork") };
+        let extent = entry.resolved_extent(Mode::ExquisiteCorpse).unwrap();
+        assert_eq!(extent, ImageExtent { width: 1024, height: expected_heights[&(assignment.id.chain, assignment.id.round)] });
     }
 }

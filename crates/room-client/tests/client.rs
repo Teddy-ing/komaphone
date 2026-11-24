@@ -395,7 +395,7 @@ fn oversized_service_response_is_rejected_before_allocation() {
     let root = tempfile::tempdir().unwrap();
     let store = paired(&root.path().join("rooms.sqlite3"), MemoryCredentials::default());
     let request = photocraft_party::protocol::RpcRequest {
-        protocol_version: 1,
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
         request_id: photocraft_party::RequestId::new(&"a".repeat(32)).unwrap(),
         operation: Operation::Poll { room: RoomId::new(&"b".repeat(32)).unwrap(), after_revision: 0 },
     };
@@ -462,6 +462,7 @@ fn transfer_freeze_is_prepended_once_and_survives_client_restart() {
         assets: vec![checkpoint_asset, image],
         note: String::new(),
         seam: None,
+        extent: None,
     };
     store.update_poll(view.clone()).unwrap();
     let pin = photocraft_room_client::FreezePin { room: view.id, epoch: view.epoch, assignment: assigned.id, project: assigned.project, revision: 2 };

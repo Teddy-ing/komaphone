@@ -165,9 +165,11 @@ impl GalleryManifest {
                 let game = self.game().ok_or(Error::Invalid("empty gallery game"))?;
                 let mut assignments = BTreeSet::new();
                 let mut projects = BTreeSet::new();
+                let mut chain_heights = [0u32; 3];
                 for entry in &room.reveal {
+                    let extent = entry.resolved_extent(room.mode)?;
                     let assignment = match entry {
-                        RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets } => {
+                        RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets, .. } => {
                             if *revision == 0 {
                                 return Err(Error::Invalid("gallery durable revision"));
                             }
@@ -196,6 +198,11 @@ impl GalleryManifest {
                         || !projects.insert(assignment.project)
                     {
                         return Err(Error::Invalid("gallery assignment"));
+                    }
+                    if room.mode == crate::Mode::ExquisiteCorpse {
+                        let sum = chain_heights.get_mut(usize::from(assignment.id.chain)).ok_or(Error::Invalid("gallery assignment"))?;
+                        *sum =
+                            sum.checked_add(extent.height).filter(|&total| total <= crate::CORPSE_MAX_TOTAL_HEIGHT).ok_or(Error::Limit("creature height"))?;
                     }
                 }
             }
@@ -318,7 +325,7 @@ impl GalleryBundle {
             GalleryContent::Project { replay: Some(replay), .. } => self.validate_replay_objects(replay)?,
             GalleryContent::Game { room } => {
                 for entry in &room.reveal {
-                    if let RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets } = entry
+                    if let RevealedEntry::Artwork { assignment, revision, image, checkpoint, replay, assets, extent } = entry
                         && let Some(manifest) = replay.manifest
                     {
                         let submission = crate::Submission {
@@ -333,6 +340,7 @@ impl GalleryBundle {
                             assets: assets.clone(),
                             note: String::new(),
                             seam: None,
+                            extent: *extent,
                         };
                         let replay = ReplayArtifact::decode(self.object(manifest)?, &submission)?;
                         self.validate_replay_objects(&replay)?;

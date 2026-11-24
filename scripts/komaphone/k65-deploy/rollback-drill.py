@@ -59,6 +59,7 @@ def main():
               "scope": "real SQLite and loopback service; injected incompatible schema; no production/systemd/Google login"}
     processes, handles = [], []
     base = None
+    rpc_version = 1
 
     def cli(*arguments, success=True):
         response = subprocess.run([str(service), *map(str, arguments)], capture_output=True, timeout=30)
@@ -66,7 +67,7 @@ def main():
         return response
 
     def start(directory, name, hosted=False):
-        nonlocal base
+        nonlocal base, rpc_version
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -83,7 +84,9 @@ def main():
             assert process.poll() is None, "Service failed before readiness"
             try:
                 with urllib.request.urlopen(base + "/health", timeout=1) as response:
-                    assert json.load(response)["service"] == "Komaphone"
+                    health = json.load(response)
+                    assert health["service"] == "Komaphone"
+                    rpc_version = int(health.get("protocol_version", 1))
                     return process
             except (OSError, urllib.error.URLError):
                 time.sleep(0.05)
@@ -109,7 +112,7 @@ def main():
         return json.loads(payload)
 
     def room(action, token=None):
-        return post("/v1/rpc", {"protocol_version": 1, "request_id": fresh(), "operation": action}, token)
+        return post("/v1/rpc", {"protocol_version": rpc_version, "request_id": fresh(), "operation": action}, token)
 
     def world(action, token, expected=200):
         return post("/v1/canvas", {"version": args.world_version, "action": action}, token, expected)

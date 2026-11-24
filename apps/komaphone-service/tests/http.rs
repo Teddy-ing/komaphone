@@ -163,6 +163,7 @@ async fn submission(client: &Client, room: RoomId, index: u16, mode: Mode) -> Su
         assets,
         note: format!("private note {index}"),
         seam,
+        extent: Some(photocraft_party::ImageExtent { width, height }),
     }
 }
 

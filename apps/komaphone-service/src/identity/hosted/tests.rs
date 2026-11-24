@@ -57,7 +57,7 @@ fn hosted_pair_is_denied_and_expired_or_canceled_admission_cannot_enroll() {
     let (_dir, mut store) = fixture();
     let participant = Participant { id: ParticipantId::new(&format!("{:032x}", 1)).unwrap(), device: device(1), display_name: "Alice".into() };
     let request = RpcRequest {
-        protocol_version: 1,
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
         request_id: RequestId::new(&format!("{:032x}", 1)).unwrap(),
         operation: Operation::Pair { participant, credential: "1".repeat(64) },
     };

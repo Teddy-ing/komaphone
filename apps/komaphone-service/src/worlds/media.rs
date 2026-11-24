@@ -260,11 +260,7 @@ fn build(
     if source.frame.is_some_and(|n| n >= u16::from(rounds)) {
         return Err(invalid());
     }
-    let dimensions = match view.mode {
-        Mode::Animation { .. } => (1536, 1024),
-        Mode::ExquisiteCorpse => (1024, 512),
-    };
-    let mut images = Vec::new();
+    let mut parts: Vec<((u32, u32), Vec<u8>)> = Vec::new();
     let mut used = 0_u64;
     for round in 0..rounds {
         if source.frame.is_some_and(|n| n != u16::from(round)) {
@@ -279,10 +275,12 @@ fn build(
                 }
             })
             .ok_or(Error::Storage)?;
+        let extent = entry.resolved_extent(view.mode)?;
+        let dims = (extent.width, extent.height);
         let png = match entry {
-            RevealedEntry::Artwork { image, .. } => load_png(tx, profile, view, source, *image, dimensions)?,
+            RevealedEntry::Artwork { image, .. } => load_png(tx, profile, view, source, *image, dims)?,
             RevealedEntry::Missing { .. } if source.frame.is_none() => {
-                crate::assets::encode_png(dimensions.0, dimensions.1, &vec![0; dimensions.0 as usize * dimensions.1 as usize * 4])?
+                crate::assets::encode_png(dims.0, dims.1, &vec![0; dims.0 as usize * dims.1 as usize * 4])?
             }
             RevealedEntry::Missing { .. } => return Err(Error::Invalid("the selected source frame is missing")),
         };
@@ -290,21 +288,30 @@ fn build(
         if used > MAX_MEDIA_BYTES {
             return Err(invalid());
         }
-        images.push(png);
+        parts.push((dims, png));
     }
     let whole_creature = view.mode == Mode::ExquisiteCorpse && source.frame.is_none();
-    let output_dimensions = if whole_creature { (1024, 1536) } else { dimensions };
-    if whole_creature {
-        if images.len() != 3 {
+    let (output_dimensions, images) = if whole_creature {
+        if parts.len() != 3 {
             return Err(Error::Storage);
         }
-        let mut pixels = Vec::with_capacity(1024 * 1536 * 4);
-        // Three full native bands, not the 24-pixel seam derivatives.
-        for bytes in images {
-            pixels.extend_from_slice(&decode(&bytes, dimensions)?);
+        let total_height = parts.iter().try_fold(0u32, |sum, ((w, h), _)| {
+            if *w != photocraft_party::CORPSE_WIDTH {
+                return Err(Error::Storage);
+            }
+            sum.checked_add(*h).filter(|&n| n <= photocraft_party::CORPSE_MAX_TOTAL_HEIGHT).ok_or(Error::Storage)
+        })?;
+        let capacity = usize::try_from(u64::from(photocraft_party::CORPSE_WIDTH) * u64::from(total_height) * 4).map_err(|_| Error::Storage)?;
+        let mut pixels = Vec::with_capacity(capacity);
+        // Three full native bands at their accepted heights, not the 24-pixel seam derivatives.
+        for (dims, bytes) in parts {
+            pixels.extend_from_slice(&decode(&bytes, dims)?);
         }
-        images = vec![crate::assets::encode_png(1024, 1536, &pixels)?];
-    }
+        ((photocraft_party::CORPSE_WIDTH, total_height), vec![crate::assets::encode_png(photocraft_party::CORPSE_WIDTH, total_height, &pixels)?])
+    } else {
+        let dims = parts.first().map(|(d, _)| *d).ok_or(Error::Storage)?;
+        (dims, parts.into_iter().map(|(_, bytes)| bytes).collect())
+    };
     let animated = matches!(view.mode, Mode::Animation { .. }) && source.frame.is_none();
     let mut frames = Vec::new();
     let mut blobs = BTreeMap::new();

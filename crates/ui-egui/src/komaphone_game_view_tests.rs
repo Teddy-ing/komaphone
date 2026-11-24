@@ -523,6 +523,7 @@ fn corpse_room_with_artwork(game_byte: u8, players: u8) -> (RoomView, Vec<(Asset
                     duration_ms: 0,
                 }),
                 assets: vec![image_ref, ckpt_ref],
+                extent: None,
             });
             images.push((image_ref.hash, Arc::new(synthetic_corpse_band(chain, round))));
         }

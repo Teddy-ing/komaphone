@@ -63,6 +63,53 @@ fn is_assigned(app: &PhotocraftApp) -> bool {
         .zip(app.session.active())
         .is_some_and(|(assignment, document)| app.session.local_projects.status(document.doc.id).project == Some(assignment.assignment.project))
 }
+pub fn is_active_corpse_document(app: &PhotocraftApp, doc_id: photocraft_engine::doc::DocId) -> bool {
+    app.session.rooms.status.room.as_ref().is_some_and(|room| {
+        room.mode == Mode::ExquisiteCorpse
+            && matches!(room.phase, Phase::Drawing | Phase::Transfer)
+            && room.assignment.as_ref().is_some_and(|assignment| app.session.local_projects.status(doc_id).project == Some(assignment.assignment.project))
+    })
+}
+fn apply_corpse_height(app: &mut PhotocraftApp, action: crate::komaphone_corpse::CorpseHeightAction) {
+    let crate::komaphone_corpse::CorpseHeightAction::Apply { height, allow_crop } = action;
+    run(app, "komaphone.corpse.setSegmentHeight", json!({"height": height, "allowCrop": allow_crop}));
+}
+pub fn corpse_height_drag(app: &mut PhotocraftApp, ui: &egui::Ui, response: &egui::Response, xf: &crate::canvas::ViewXform) -> bool {
+    if !is_assigned(app) {
+        app.ui.rooms.corpse_view.cancel_height_drag();
+        return false;
+    }
+    let Some(room) = app.session.rooms.status.room.as_ref() else {
+        app.ui.rooms.corpse_view.cancel_height_drag();
+        return false;
+    };
+    if room.mode != Mode::ExquisiteCorpse || !matches!(room.phase, Phase::Drawing | Phase::Transfer) {
+        app.ui.rooms.corpse_view.cancel_height_drag();
+        return false;
+    }
+    let enabled = app.session.is_enabled("komaphone.corpse.setSegmentHeight");
+    let Some(doc) = app.session.active().map(|d| d.doc.clone()) else {
+        app.ui.rooms.corpse_view.cancel_height_drag();
+        return false;
+    };
+    let (consumed, action) = crate::komaphone_corpse::handle_height_drag(ui, response, xf, &doc, enabled, &mut app.ui.rooms.corpse_view);
+    if let Some(action) = action {
+        apply_corpse_height(app, action);
+    }
+    consumed
+}
+pub fn corpse_height_cursor(app: &PhotocraftApp, xf: &crate::canvas::ViewXform, hover: Option<egui::Pos2>) -> Option<egui::CursorIcon> {
+    if !is_assigned(app) {
+        return None;
+    }
+    let room = app.session.rooms.status.room.as_ref()?;
+    if room.mode != Mode::ExquisiteCorpse || !matches!(room.phase, Phase::Drawing | Phase::Transfer) {
+        return None;
+    }
+    let height = app.session.active()?.doc.size.height;
+    let enabled = app.session.is_enabled("komaphone.corpse.setSegmentHeight");
+    crate::komaphone_corpse::height_handle_cursor(&app.ui.rooms.corpse_view, xf, height, hover, enabled)
+}
 pub fn submission_note(app: &PhotocraftApp, room: &RoomView) -> String {
     if !matches!(room.mode, Mode::Animation { .. }) {
         return String::new();
@@ -127,11 +174,24 @@ pub fn reference_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                             run(app, "komaphone.animation.copyPrevious", json!({}));
                         }
                     }
-                    Mode::ExquisiteCorpse => crate::komaphone_corpse::seam_caption(
-                        ui,
-                        room.round,
-                        matches!(room.assignment.as_ref().and_then(|a| a.reference.as_ref()), Some(Reference::Missing)),
-                    ),
+                    Mode::ExquisiteCorpse => {
+                        let current_height = app.session.active().map_or(photocraft_engine::rooms::corpse::BAND_HEIGHT, |d| d.doc.size.height);
+                        crate::komaphone_corpse::seam_caption(
+                            ui,
+                            room.round,
+                            matches!(room.assignment.as_ref().and_then(|a| a.reference.as_ref()), Some(Reference::Missing)),
+                            current_height,
+                        );
+                        if let Some(doc) = app.session.active().map(|d| d.doc.clone()) {
+                            let disabled_reason = app.session.disabled_reason("komaphone.corpse.setSegmentHeight");
+                            let enabled = disabled_reason.is_none();
+                            if let Some(action) =
+                                crate::komaphone_corpse::segment_height_controls(ui, &mut app.ui.rooms.corpse_view, &doc, enabled, disabled_reason.as_deref())
+                            {
+                                apply_corpse_height(app, action);
+                            }
+                        }
+                    }
                 }
             }
             note_editor(app, ui, &room);
@@ -204,12 +264,17 @@ pub fn note_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, room: &RoomView) 
     ui.weak(if saved { "Note saved locally · excluded from artwork" } else { "Saving note locally…" });
 }
 
-pub fn overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &crate::canvas::ViewXform) {
+pub fn overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &crate::canvas::ViewXform, hover_pos: Option<egui::Pos2>) {
     if !is_assigned(app) {
+        crate::komaphone_workspace::forget_rect(painter.ctx(), "corpse.height.handle");
         return;
     }
-    let Some(room) = app.session.rooms.status.room.as_ref() else { return };
+    let Some(room) = app.session.rooms.status.room.as_ref() else {
+        crate::komaphone_workspace::forget_rect(painter.ctx(), "corpse.height.handle");
+        return;
+    };
     if !matches!(room.phase, Phase::Drawing | Phase::Transfer) {
+        crate::komaphone_workspace::forget_rect(painter.ctx(), "corpse.height.handle");
         return;
     }
     match room.assignment.as_ref().and_then(|a| a.reference.as_ref()) {
@@ -224,6 +289,14 @@ pub fn overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &crate::canvas:
             }
         }
         _ => {}
+    }
+    if room.mode == Mode::ExquisiteCorpse
+        && let Some(doc) = app.session.active()
+    {
+        let enabled = app.session.is_enabled("komaphone.corpse.setSegmentHeight");
+        crate::komaphone_corpse::height_handle_overlay(painter.ctx(), painter, xf, doc.doc.size.height, enabled, &app.ui.rooms.corpse_view, hover_pos);
+    } else {
+        crate::komaphone_workspace::forget_rect(painter.ctx(), "corpse.height.handle");
     }
 }
 

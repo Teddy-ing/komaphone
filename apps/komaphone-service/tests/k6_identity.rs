@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 fn request(id: u64, operation: Operation) -> RpcRequest {
-    RpcRequest { protocol_version: 1, request_id: RequestId::new(&format!("{id:032x}")).unwrap(), operation }
+    RpcRequest { protocol_version: photocraft_party::protocol::PROTOCOL_VERSION, request_id: RequestId::new(&format!("{id:032x}")).unwrap(), operation }
 }
 
 fn fixture(path: &std::path::Path) -> (Participant, String) {
@@ -24,7 +24,7 @@ fn fixture(path: &std::path::Path) -> (Participant, String) {
         .execute(
             None,
             &RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&format!("{:032x}", 1)).unwrap(),
                 operation: Operation::Pair { participant: person.clone(), credential: token.clone() },
             },

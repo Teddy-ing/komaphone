@@ -784,7 +784,8 @@ fn validate_native(bundle: &GalleryBundle) -> Result<()> {
     bundle.validate().map_err(invalid)?;
     let mut native = BTreeSet::new();
     let mut replays = Vec::new();
-    let mut expected_size = None;
+    let mut game_mode = None;
+    let mut expected_final_sizes = BTreeMap::new();
     match &bundle.manifest.content {
         GalleryContent::Project { checkpoint, replay, .. } => {
             native.insert(checkpoint.hash);
@@ -793,12 +794,14 @@ fn validate_native(bundle: &GalleryBundle) -> Result<()> {
             }
         }
         GalleryContent::Game { room } => {
-            expected_size = Some(match room.mode {
-                Mode::Animation { .. } => photocraft_doc::Size { width: 1536, height: 1024 },
-                Mode::ExquisiteCorpse => photocraft_doc::Size { width: 1024, height: 512 },
-            });
+            game_mode = Some(room.mode);
             for entry in &room.reveal {
                 if let photocraft_party::room::RevealedEntry::Artwork { checkpoint, replay, .. } = entry {
+                    let extent = entry.resolved_extent(room.mode).map_err(invalid)?;
+                    let size = photocraft_doc::Size { width: extent.width, height: extent.height };
+                    if expected_final_sizes.insert(checkpoint.asset.hash, size).is_some_and(|prev| prev != size) {
+                        return Err(invalid("conflicting game checkpoint dimensions"));
+                    }
                     native.insert(checkpoint.asset.hash);
                     native.insert(replay.baseline.asset.hash);
                     if let Some(manifest) = replay.manifest {
@@ -840,7 +843,11 @@ fn validate_native(bundle: &GalleryBundle) -> Result<()> {
         if document.layer_count() > 4096 {
             return Err(invalid("native checkpoint exceeds 4096 layers"));
         }
-        if expected_size.is_some_and(|expected| document.size != expected) {
+        if let Some(mode) = game_mode {
+            mode.validate_extent(photocraft_party::ImageExtent { width: document.size.width, height: document.size.height })
+                .map_err(|_| invalid("game checkpoint dimensions do not match the assigned drawing"))?;
+        }
+        if expected_final_sizes.get(&hash).is_some_and(|expected| document.size != *expected) {
             return Err(invalid("game checkpoint dimensions do not match the assigned drawing"));
         }
     }

@@ -11,7 +11,7 @@ fn pair(store: &mut Store, n: u64) -> (Participant, String) {
         .execute(
             None,
             &RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&format!("{n:032x}")).unwrap(),
                 operation: Operation::Pair { participant: participant.clone(), credential: token.clone() },
             },
@@ -120,7 +120,7 @@ fn same_account_cannot_reuse_a_device_writer_without_its_possession_proof() {
     // writer or leave an orphan that makes the next service restart fail.
     let attempted = Participant { id: ParticipantId::new(&format!("{:032x}", 500)).unwrap(), device: device(501), display_name: "collision".into() };
     let request = RpcRequest {
-        protocol_version: 1,
+        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
         request_id: RequestId::new(&format!("{:032x}", 501)).unwrap(),
         operation: Operation::Pair { participant: attempted, credential: new_session.device_credential().into() },
     };

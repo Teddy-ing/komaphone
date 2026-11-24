@@ -17,6 +17,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--base-url", default="http://127.0.0.1:43127")
 args = parser.parse_args()
 probe.check(args.base_url, probe.CLIENT_ID)
+health = probe.get_json(args.base_url, "/health")
+rpc_protocol_version = int(health.get("protocol_version", 1))
 
 def post(path, body, expected, token=None, origin=None):
     headers = {"Content-Type": "application/json"}
@@ -44,10 +46,10 @@ assert len(challenge["nonce"]) == 64
 post("/v1/auth", {"action": "cancel", "transaction": challenge["transaction"], "nonce": challenge["nonce"]}, 200)
 assert post("/v1/auth", {"action": "finish", "transaction": challenge["transaction"], "id_token": "invalid.jwt.signature",
                          "device_proof": "1" * 64, "label": "Synthetic denied actor"}, 403)["code"] == "unauthorized"
-pair = {"protocol_version": 1, "request_id": uuid.uuid4().hex,
+pair = {"protocol_version": rpc_protocol_version, "request_id": uuid.uuid4().hex,
         "operation": {"kind": "pair", "participant": {"id": uuid.uuid4().hex, "device": device, "display_name": "Synthetic denied actor"}, "credential": "2" * 64}}
 assert post("/v1/rpc", pair, 403)["code"] == "unauthorized"
-create = {"protocol_version": 1, "request_id": uuid.uuid4().hex,
+create = {"protocol_version": rpc_protocol_version, "request_id": uuid.uuid4().hex,
           "operation": {"kind": "create", "mode": {"kind": "animation", "rotations": 1}, "timer_ms": None}}
 assert post("/v1/rpc", create, 401, "2" * 64)["code"] == "session"
 post("/v1/auth", {"action": "begin", "device": device}, 403, origin="https://untrusted.invalid")

@@ -51,9 +51,10 @@ def main():
               "scope": "real loopback Rust service and SQLite; no desktop UI, cloud or full-disk test"}
     processes, logs = [], []
     base = None
+    rpc_version = 1
 
     def start(quota):
-        nonlocal base
+        nonlocal base, rpc_version
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -68,7 +69,9 @@ def main():
             assert process.poll() is None, "Service exited before readiness"
             try:
                 with urllib.request.urlopen(base + "/health", timeout=1) as response:
-                    assert json.load(response)["service"] == "Komaphone"
+                    health = json.load(response)
+                    assert health["service"] == "Komaphone"
+                    rpc_version = int(health.get("protocol_version", 1))
                 return process
             except (OSError, urllib.error.URLError):
                 time.sleep(0.05)
@@ -95,7 +98,7 @@ def main():
         return (status, json.loads(body)) if observe else json.loads(body)
 
     def rpc(action):
-        return {"protocol_version": 1, "request_id": fresh(), "operation": action}
+        return {"protocol_version": rpc_version, "request_id": fresh(), "operation": action}
 
     def receipt():
         # Capture exact rows; reads do not mutate the authority or its receipt log.

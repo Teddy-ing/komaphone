@@ -52,14 +52,25 @@ struct ControlRect {
 }
 
 pub(crate) fn remember(ui: &egui::Ui, name: &str, response: &Response) {
+    remember_rect(ui.ctx(), ui.clip_rect(), name, response.rect);
+}
+
+pub(crate) fn remember_rect(ctx: &egui::Context, clip: egui::Rect, name: &str, rect: egui::Rect) {
     let key = egui::Id::unique(("komaphone-control", name));
-    let frame = ui.ctx().cumulative_frame_nr();
-    ui.ctx().data_mut(|data| {
-        if ui.clip_rect().contains(response.rect.center()) {
-            data.insert_temp(key, ControlRect { rect: response.rect.intersect(ui.clip_rect()), frame });
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        if clip.contains(rect.center()) {
+            data.insert_temp(key, ControlRect { rect: rect.intersect(clip), frame });
         } else {
             data.remove::<ControlRect>(key);
         }
+    });
+}
+
+pub(crate) fn forget_rect(ctx: &egui::Context, name: &str) {
+    let key = egui::Id::unique(("komaphone-control", name));
+    ctx.data_mut(|data| {
+        data.remove::<ControlRect>(key);
     });
 }
 
@@ -526,6 +537,7 @@ pub(crate) fn editing_in_progress(app: &PhotocraftApp) -> bool {
         || app.ui.text_edit.is_some()
         || app.ui.transform.is_some()
         || app.ui.pen.is_some()
+        || app.ui.rooms.corpse_view.height_drag.is_some()
         || crate::tools::gradient_ui::editing(app)
 }
 

@@ -248,6 +248,7 @@ fn untouched_blanks_completed_game_rounds_and_clear_temp_keep_gallery_clean() {
             duration_ms: 0,
         }),
         assets: vec![preview, checkpoint.asset],
+        extent: None,
     };
     let other_p1 = ProjectId::new(&"11".repeat(16)).unwrap();
     let other_p2 = ProjectId::new(&"22".repeat(16)).unwrap();

@@ -294,6 +294,7 @@ fn minimal_submission_for_document(
         assets,
         note: String::new(),
         seam,
+        extent: None,
     }
 }
 
@@ -663,6 +664,7 @@ fn small_drawings_and_historical_full_history_bundles_remain_compatible() {
         assets: vec![base_asset, final_cp.asset, pack_asset, manifest_asset, img_asset, seam_asset],
         note: String::new(),
         seam: Some(seam_asset),
+        extent: None,
     };
     assert_matches_live_k7_service_validation(&room, &hist_sub, &objects);
     room.apply(host.id, room.revision(), 1, Action::Submit { epoch: room.epoch(), submission: hist_sub }).unwrap();
@@ -884,7 +886,7 @@ fn submission_preparation_error_persists_across_250ms_room_polls_and_clears_on_d
                 let n = match stream.read(&mut chunk) {
                     Ok(0) | Err(_) => {
                         break RpcRequest {
-                            protocol_version: 1,
+                            protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                             request_id: RequestId::new(&"1".repeat(32)).unwrap(),
                             operation: Operation::Disconnect { room: server_view.id },
                         };

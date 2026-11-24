@@ -47,7 +47,7 @@ fn restore_cli_automatically_quarantines_profiles_preserving_original() {
         .execute(
             None,
             &RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&format!("{:032x}", 3)).unwrap(),
                 operation: Operation::Pair { participant: participant.clone(), credential: "1".repeat(64) },
             },

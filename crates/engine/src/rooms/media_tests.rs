@@ -55,6 +55,7 @@ fn status(game: GameId) -> photocraft_room_client::ClientStatus {
                         duration_ms: 0,
                     }),
                     assets: vec![checkpoint.asset],
+                    extent: None,
                 },
                 RevealedEntry::Missing { assignment: assignment(game, 1), reason: "Explicit skip".into() },
             ],

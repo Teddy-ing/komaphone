@@ -38,7 +38,7 @@ fn pair_direct(store: &mut Store, n: u128) {
         .execute(
             None,
             &RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&hex(n + 3000)).unwrap(),
                 operation: Operation::Pair {
                     participant: Participant {
@@ -97,7 +97,7 @@ async fn pinned_checkpoint_transfer_rotation_revocation_http_426_and_backup_rest
         let resp = http
             .post(format!("http://{}/v1/rpc", service.address))
             .json(&RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&hex(4000 + n)).unwrap(),
                 operation: Operation::Pair {
                     participant: Participant {
@@ -644,7 +644,7 @@ async fn live_http_requests_stay_unblocked_during_rev_10240_background_checkpoin
             .post(&u3)
             .bearer_auth(token(3))
             .json(&RpcRequest {
-                protocol_version: 1,
+                protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                 request_id: RequestId::new(&hex(6_300_000)).unwrap(),
                 operation: Operation::Create { mode: photocraft_party::Mode::ExquisiteCorpse, timer_ms: None },
             })
@@ -663,7 +663,7 @@ async fn live_http_requests_stay_unblocked_during_rev_10240_background_checkpoin
                 .post(&u3)
                 .bearer_auth(token(3))
                 .json(&RpcRequest {
-                    protocol_version: 1,
+                    protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                     request_id: RequestId::new(&hex(6_300_000 + u128::from(i))).unwrap(),
                     operation: Operation::Poll { room: view.id, after_revision: 0 },
                 })

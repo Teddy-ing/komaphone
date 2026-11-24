@@ -116,7 +116,7 @@ impl Fixture {
                 .execute(
                     None,
                     &RpcRequest {
-                        protocol_version: 1,
+                        protocol_version: photocraft_party::protocol::PROTOCOL_VERSION,
                         request_id: RequestId::new(&hex(n)).unwrap(),
                         operation: Operation::Pair {
                             participant: Participant {
