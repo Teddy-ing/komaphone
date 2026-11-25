@@ -1,28 +1,16 @@
 # Regenerate the standalone launcher's notices from its locked local Cargo sources.
 [CmdletBinding()]
-param()
+param([string] $CargoExe)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repository = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../..')).Path
-$previous = @{}
-$environment = @{
-    CARGO_HOME=(Join-Path $repository 'target/k0-tools/cargo')
-    RUSTUP_HOME=(Join-Path $repository 'target/k0-tools/rustup')
-    PATH=((Join-Path $repository 'target/k0-tools/cargo/bin') + [IO.Path]::PathSeparator + $env:PATH)
-}
-try {
-    foreach ($name in $environment.Keys) {
-        $previous[$name]=[Environment]::GetEnvironmentVariable($name,'Process')
-        [Environment]::SetEnvironmentVariable($name,$environment[$name],'Process')
-    }
-    $raw = & (Join-Path $environment.CARGO_HOME 'bin/cargo.exe') metadata --manifest-path (Join-Path $PSScriptRoot 'Cargo.toml') --locked --offline --format-version 1
+. (Join-Path $PSScriptRoot 'build-environment.ps1')
+$cargoEnv = Resolve-K65CargoEnvironment -WorkspaceRoot $repository -CargoExe $CargoExe
+$metadata = $null
+Invoke-K65BuildEnvironment -Variables $cargoEnv.Variables -Body {
+    $raw = & $cargoEnv.CargoExe metadata --manifest-path (Join-Path $PSScriptRoot 'Cargo.toml') --locked --offline --format-version 1
     if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the exact locked launcher dependency graph.' }
-    $metadata = ($raw -join "`n") | ConvertFrom-Json
-} finally {
-    foreach ($name in $previous.Keys) {
-        if ($null -eq $previous[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
-        else { [Environment]::SetEnvironmentVariable($name,$previous[$name],'Process') }
-    }
+    $script:metadata = ($raw -join "`n") | ConvertFrom-Json
 }
 $lockHash = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'Cargo.lock') -Algorithm SHA256).Hash
 $text = [Text.StringBuilder]::new()

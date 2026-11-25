@@ -6,6 +6,68 @@ function Get-K65LauncherCompilerEnvironment {
     }
 }
 
+function Resolve-K65CargoEnvironment {
+    param(
+        [Parameter(Mandatory)] [string] $WorkspaceRoot,
+        [string] $CargoExe
+    )
+    $toolCargo = Join-Path $WorkspaceRoot 'target/k0-tools/cargo'
+    $toolRustup = Join-Path $WorkspaceRoot 'target/k0-tools/rustup'
+    $toolCargoExe = Join-Path $toolCargo 'bin/cargo.exe'
+    $useWorkspaceTools = $false
+    $resolvedCargo = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($CargoExe)) {
+        $resolvedCargo = [IO.Path]::GetFullPath($CargoExe)
+        if ($resolvedCargo.Equals([IO.Path]::GetFullPath($toolCargoExe), [StringComparison]::OrdinalIgnoreCase) -and
+            (Test-Path -LiteralPath $toolCargo -PathType Container) -and
+            (Test-Path -LiteralPath $toolRustup -PathType Container)) {
+            $useWorkspaceTools = $true
+        }
+    } elseif ((Test-Path -LiteralPath $toolCargoExe -PathType Leaf) -and
+              (Test-Path -LiteralPath $toolRustup -PathType Container)) {
+        $resolvedCargo = [IO.Path]::GetFullPath($toolCargoExe)
+        $useWorkspaceTools = $true
+    } else {
+        $fromPath = Get-Command 'cargo.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($fromPath) {
+            $resolvedCargo = $fromPath.Source
+        } else {
+            $cargoHome = [Environment]::GetEnvironmentVariable('CARGO_HOME')
+            $userProfile = [Environment]::GetEnvironmentVariable('USERPROFILE')
+            $defaultCargo = if (-not [string]::IsNullOrWhiteSpace($cargoHome)) {
+                Join-Path $cargoHome 'bin/cargo.exe'
+            } elseif (-not [string]::IsNullOrWhiteSpace($userProfile)) {
+                Join-Path $userProfile '.cargo/bin/cargo.exe'
+            } else {
+                $null
+            }
+            if ($defaultCargo -and (Test-Path -LiteralPath $defaultCargo -PathType Leaf)) {
+                $resolvedCargo = [IO.Path]::GetFullPath($defaultCargo)
+            }
+        }
+    }
+
+    if (-not $resolvedCargo -or -not (Test-Path -LiteralPath $resolvedCargo -PathType Leaf)) {
+        throw 'Could not locate cargo.exe (checked target/k0-tools/cargo/bin, PATH, and standard ~/.cargo/bin). Install Rust (rustup) or pass -CargoExe.'
+    }
+
+    $cargoBin = [IO.Path]::GetDirectoryName($resolvedCargo)
+    $currentPath = [Environment]::GetEnvironmentVariable('PATH')
+    $vars = @{
+        PATH = if ([string]::IsNullOrEmpty($currentPath)) { $cargoBin } else { $cargoBin + [IO.Path]::PathSeparator + $currentPath }
+    }
+    if ($useWorkspaceTools) {
+        $vars.CARGO_HOME = [IO.Path]::GetFullPath($toolCargo)
+        $vars.RUSTUP_HOME = [IO.Path]::GetFullPath($toolRustup)
+    }
+    return [pscustomobject]@{
+        CargoExe = $resolvedCargo
+        UsesWorkspaceTools = $useWorkspaceTools
+        Variables = $vars
+    }
+}
+
 function Invoke-K65BuildEnvironment {
     param([Parameter(Mandatory)] [hashtable] $Variables,
           [Parameter(Mandatory)] [scriptblock] $Body)

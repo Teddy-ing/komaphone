@@ -124,17 +124,14 @@ $manifestHash = (Get-FileHash -LiteralPath (Join-Path $candidate 'SHA256SUMS') -
 $launcherRoot = Join-Path $scriptRoot 'k65-launcher'
 . (Join-Path $launcherRoot 'build-environment.ps1')
 $targetPath = Join-Path $workspaceRoot 'target/agent-k65-launcher'
-$toolCargo = Join-Path $workspaceRoot 'target/k0-tools/cargo'
-$toolRustup = Join-Path $workspaceRoot 'target/k0-tools/rustup'
-if (-not $CargoExe) { $CargoExe = Join-Path $toolCargo 'bin/cargo.exe' }
-$cargoPath = Get-LanFile $CargoExe
+$cargoEnv = Resolve-K65CargoEnvironment -WorkspaceRoot $workspaceRoot -CargoExe $CargoExe
+$cargoPath = Get-LanFile $cargoEnv.CargoExe
 $buildLog = Join-Path $parentPath ('.komaphone-k65-launcher-' + [Guid]::NewGuid().ToString('N') + '.log')
 $environment = @{
-    CARGO_HOME=$toolCargo; RUSTUP_HOME=$toolRustup
-    PATH=((Join-Path $toolCargo 'bin') + [IO.Path]::PathSeparator + $env:PATH)
     CARGO_TARGET_DIR=$targetPath; CARGO_BUILD_JOBS='2'; CARGO_INCREMENTAL='0'; CARGO_NET_OFFLINE='true'
     KOMAPHONE_PACKAGE_MANIFEST_SHA=$manifestHash; KOMAPHONE_PACKAGE_APP_SHA=$AppSha256; KOMAPHONE_PACKAGE_PROFILE=$ProfileName
 }
+$environment += $cargoEnv.Variables
 $environment += Get-K65LauncherCompilerEnvironment
 Invoke-K65BuildEnvironment -Variables $environment -Body {
     $manifestPath = Join-Path $launcherRoot 'Cargo.toml'
